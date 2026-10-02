@@ -221,24 +221,19 @@ impl BlockTree {
     /// Order is iteration order of the underlying slab.
     #[must_use]
     pub fn leaf_node_ids(&self) -> Vec<NodeId> {
-        let mut parents: hashbrown::HashSet<u32> = hashbrown::HashSet::new();
+        let mut parents: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
         for (_index, node) in &self.nodes {
-            if let Some(parent_id) = node.parent
-                && let Some(parent_index) = parent_id.index()
-            {
-                // NodeId stores a u32; track parent indices to skip them later.
-                if let Ok(idx_u32) = u32::try_from(parent_index) {
-                    parents.insert(idx_u32);
-                }
+            if let Some(parent_index) = node.parent.and_then(NodeId::index) {
+                parents.insert(parent_index);
             }
         }
 
         let mut leaves = Vec::new();
         for (index, _node) in &self.nodes {
-            if let Ok(idx_u32) = u32::try_from(index)
-                && !parents.contains(&idx_u32)
+            if !parents.contains(&index)
+                && let Ok(id_u32) = u32::try_from(index)
             {
-                leaves.push(NodeId::new(idx_u32));
+                leaves.push(NodeId::new(id_u32));
             }
         }
         leaves
