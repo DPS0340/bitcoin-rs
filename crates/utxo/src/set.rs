@@ -121,7 +121,7 @@ pub struct UtxoCoin {
 }
 
 /// Result of scanning a stable UTXO-set view.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct UtxoScan {
     /// Number of live coins visited during the scan.
     pub txouts: usize,
@@ -160,7 +160,7 @@ pub struct UtxoSet {
 /// What it cannot see — allocator size-class rounding, fragmentation, and
 /// allocator metadata — is exactly the residual against process RSS, which is
 /// the point.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct UtxoMemoryReport {
     /// Transaction-level records held.
     pub records: usize,

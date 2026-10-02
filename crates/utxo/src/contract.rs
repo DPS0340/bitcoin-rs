@@ -20,7 +20,7 @@ use crate::undo_codec;
 pub use crate::undo_codec::UndoCodecError;
 
 /// One UTXO output to add, owning a `TxOut` or borrowing it from a block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UtxoAdd<T = TxOut> {
     /// Outpoint being created.
     pub outpoint: OutPoint,
