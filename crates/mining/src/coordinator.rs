@@ -567,9 +567,11 @@ impl MiningService {
             flight.result = Some(returned.clone());
         }
         self.wake.notify_all();
-        if state.in_flight.as_ref().is_some_and(|flight| {
-            flight.key == key && flight.id == flight_id && flight.result.is_some()
-        }) {
+        if state
+            .in_flight
+            .as_ref()
+            .is_some_and(|flight| flight.id == flight_id)
+        {
             state.in_flight = None;
         }
         flight_guard.armed = false;
