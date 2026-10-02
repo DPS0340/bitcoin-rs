@@ -848,7 +848,10 @@ mod tests {
         txs: &[Tx],
         resolved: Vec<Vec<Option<TxOut>>>,
     ) -> crate::block_view::BlockView<'_> {
-        let mut view = crate::block_view::BlockView::new(txs, txs.iter().map(Tx::txid).collect());
+        let mut view = crate::block_view::BlockView::from_facts(
+            txs,
+            crate::block_view::BlockFacts::from_txids(txs, txs.iter().map(Tx::txid).collect()),
+        );
         view.set_resolved(resolved);
         view
     }
