@@ -99,7 +99,7 @@ rustix.workspace = true
 bitcoin-rs-script.workspace = true
 bitcoin-rs-mempool = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-mining = { workspace = true, features = ["test-seam"] }
-bitcoin-rs-index = { workspace = true, features = ["test-seam"] }
+bitcoin-rs-index.workspace = true
 
 [[bench]]
 name = "sync_pipeline"
