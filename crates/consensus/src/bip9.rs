@@ -124,7 +124,7 @@ pub trait DeploymentContext {
     fn block_version(&self, height: u32) -> Option<i32>;
 
     /// Returns the median-time-past at `height` over the 11-block
-    /// [`crate::bip113::MEDIAN_TIME_PAST_WINDOW`], or `None` if unknown.
+    /// [`crate::MEDIAN_TIME_PAST_WINDOW`], or `None` if unknown.
     ///
     /// Implementations must use exactly that window: BIP9 transitions are
     /// consensus-critical, and a different window yields different states.
