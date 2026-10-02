@@ -18,7 +18,7 @@ pub mod runtime;
 /// Stable electrs-shaped row types.
 pub mod types;
 /// Object-safe, fenced access to the durable index writer.
-pub mod writer;
+mod writer;
 
 pub use capabilities::{
     CapabilitySnapshot, CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource,

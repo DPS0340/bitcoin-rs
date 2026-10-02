@@ -437,11 +437,11 @@ pub struct DerivedIndexWorker {
 /// Result of opening the txindex store: writer, reader, and batch limits.
 pub struct OpenDerivedIndex {
     /// Fenced durable writer.
-    pub writer: Arc<dyn TxIndexWriter>,
+    pub(crate) writer: Arc<dyn TxIndexWriter>,
     /// Snapshot-capable reader for the query engine.
-    pub reader: Arc<dyn crate::IndexReader>,
+    pub(crate) reader: Arc<dyn crate::IndexReader>,
     /// Batch limits selected by the composing backend.
-    pub batch_limits: PreparedBatchLimits,
+    pub(crate) batch_limits: PreparedBatchLimits,
 }
 
 /// Sink for index-ahead rollback evidence.
