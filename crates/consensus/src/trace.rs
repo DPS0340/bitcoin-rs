@@ -46,25 +46,6 @@ fn address_of(buffer: *const u8) -> u64 {
     u64::try_from(buffer.addr()).unwrap_or(0)
 }
 
-/// Prepared arguments of `validation:block_connected`.
-///
-/// `(block_hash, height, transactions, inputs, sigops_cost, elapsed_ns)`.
-/// `block_hash` must address 32 bytes that outlive the probe call; callers
-/// pass the hash's own byte array.
-pub type BlockConnectedArgs = (*const u8, i32, u64, i32, i64, i64);
-
-/// Prepared arguments of `mempool:added`.
-///
-/// `(txid, vsize, fee)`. `txid` must address 32 bytes that outlive the probe
-/// call; callers pass the hash's own byte array.
-pub type AddedArgs = (*const u8, i32, i64);
-
-/// Prepared arguments of `mempool:removed`.
-///
-/// `(txid, reason, vsize, fee, entry_time)`. `txid` must address 32 bytes
-/// that outlive the probe call.
-pub type RemovedArgs = (*const u8, &'static str, i32, i64, u64);
-
 /// Prepared arguments of `net:inbound_message` / `net:outbound_message`.
 ///
 /// `(node_id, addr, conn_type, msg_type, payload_size, payload)`. `payload`
@@ -75,9 +56,11 @@ pub type MessageArgs = (i64, String, String, String, u64, *const u8);
 /// Fires `validation:block_connected` if probes are compiled in.
 ///
 /// Arguments follow Bitcoin Core's `validation:block_connected` ABI (see
-/// `probes.d` and `docs/tracing.md`). `prepare` runs only while a consumer
-/// is attached.
-pub fn block_connected(prepare: impl FnOnce() -> BlockConnectedArgs) {
+/// `probes.d` and `docs/tracing.md`): `(block_hash, height, transactions,
+/// inputs, sigops_cost, elapsed_ns)`, where `block_hash` must address 32
+/// bytes that outlive the probe call; callers pass the hash's own byte
+/// array. `prepare` runs only while a consumer is attached.
+pub fn block_connected(prepare: impl FnOnce() -> (*const u8, i32, u64, i32, i64, i64)) {
     #[cfg(feature = "usdt")]
     generated::validation::block_connected!(|| {
         let (hash, height, txs, inputs, sigops, elapsed_ns) = prepare();
@@ -89,8 +72,10 @@ pub fn block_connected(prepare: impl FnOnce() -> BlockConnectedArgs) {
 
 /// Fires `mempool:added` if probes are compiled in.
 ///
+/// Arguments follow Bitcoin Core's `mempool:added` ABI: `(txid, vsize,
+/// fee)`, where `txid` must address 32 bytes that outlive the probe call.
 /// `prepare` runs only while a consumer is attached.
-pub fn added(prepare: impl FnOnce() -> AddedArgs) {
+pub fn added(prepare: impl FnOnce() -> (*const u8, i32, i64)) {
     #[cfg(feature = "usdt")]
     generated::mempool::added!(|| {
         let (txid, vsize, fee) = prepare();
@@ -102,8 +87,11 @@ pub fn added(prepare: impl FnOnce() -> AddedArgs) {
 
 /// Fires `mempool:removed` if probes are compiled in.
 ///
-/// `prepare` runs only while a consumer is attached.
-pub fn removed(prepare: impl FnOnce() -> RemovedArgs) {
+/// Arguments follow Bitcoin Core's `mempool:removed` ABI: `(txid, reason,
+/// vsize, fee, entry_time)`, where `txid` must address 32 bytes that
+/// outlive the probe call. `prepare` runs only while a consumer is
+/// attached.
+pub fn removed(prepare: impl FnOnce() -> (*const u8, &'static str, i32, i64, u64)) {
     #[cfg(feature = "usdt")]
     generated::mempool::removed!(|| {
         let (txid, reason, vsize, fee, entry_time) = prepare();
