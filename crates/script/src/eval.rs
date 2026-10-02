@@ -348,14 +348,6 @@ pub(crate) fn eval_script(
     validation_weight_left: &mut Option<i64>,
     tapleaf_hash: Option<&Hash256>,
 ) -> Result<(), ScriptError> {
-    debug_assert!(
-        matches!(
-            sigversion,
-            SigVersion::Base | SigVersion::WitnessV0 | SigVersion::Tapscript
-        ),
-        "taproot key-path admits no script execution"
-    );
-
     // BIP342: OP_SUCCESSx opcodes make the script unconditionally valid.
     // This scan runs before any other check (including stack element size
     // limits) and overrides everything. Mirrors Core's ExecuteWitnessScript.
@@ -1276,7 +1268,6 @@ fn eval_checksig(
                     success = checker.check_schnorr_signature(
                         sig,
                         pubkey,
-                        sigversion,
                         tapleaf_hash,
                         codeseparator_pos,
                     )?;
@@ -1288,7 +1279,6 @@ fn eval_checksig(
             }
             Ok(success)
         }
-        SigVersion::Taproot => Ok(false),
     }
 }
 

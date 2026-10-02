@@ -21,8 +21,6 @@ pub enum SigVersion {
     Base,
     /// Segwit v0 signatures (BIP143).
     WitnessV0,
-    /// Taproot key-path signatures (BIP341).
-    Taproot,
     /// Taproot script-path signatures (BIP342).
     Tapscript,
 }
@@ -210,10 +208,10 @@ impl<'a> TxSignatureChecker<'a> {
                     )
                     .map_err(|e| sighash_to_script_error(&e))?
             }
-            SigVersion::Taproot | SigVersion::Tapscript => {
-                // ECDSA is not used in taproot/tapscript; this is a caller error.
+            SigVersion::Tapscript => {
+                // ECDSA is not used in tapscript; this is a caller error.
                 return Err(ScriptError::Verification(
-                    "ECDSA signature check requested for taproot/tapscript".to_owned(),
+                    "ECDSA signature check requested for tapscript".to_owned(),
                 ));
             }
         };
@@ -234,11 +232,12 @@ impl<'a> TxSignatureChecker<'a> {
         Ok(verified)
     }
 
-    /// Verifies a Schnorr signature against the BIP341/BIP342 sighash.
+    /// Verifies a Schnorr signature against the BIP342 tapscript sighash.
+    /// Key-path spends do not go through the checker.
     ///
-    /// `leaf_hash` is `Some` for tapscript (script-path) spends and `None` for
-    /// key-path spends. `codesep_pos` is the position of the last
-    /// `OP_CODESEPARATOR` (or `CODESEPARATOR_POSITION` when none executed).
+    /// `leaf_hash` is the tapscript leaf hash. `codesep_pos` is the position
+    /// of the last `OP_CODESEPARATOR` (or `CODESEPARATOR_POSITION` when none
+    /// executed).
     ///
     /// Returns `Ok(true)` when valid, `Ok(false)` when the signature is empty
     /// (tapscript empty-sig convention), and `Err` for size/hashtype/verification
@@ -247,26 +246,12 @@ impl<'a> TxSignatureChecker<'a> {
         &mut self,
         sig: &[u8],
         pubkey: &[u8],
-        sigversion: SigVersion,
         leaf_hash: Option<&Hash256>,
         codesep_pos: u32,
     ) -> Result<bool, ScriptError> {
-        // Schnorr is only valid for taproot/tapscript.
-        if sigversion != SigVersion::Taproot && sigversion != SigVersion::Tapscript {
-            return Err(ScriptError::Verification(
-                "Schnorr signature check requires taproot or tapscript version".to_owned(),
-            ));
-        }
-
-        // Empty signature: in tapscript this is a clean false (invalid but not
-        // an error); in key-path it's an error (wrong size).
+        // Empty signature: a clean false in tapscript (invalid but not an error).
         if sig.is_empty() {
-            if sigversion == SigVersion::Tapscript {
-                return Ok(false);
-            }
-            return Err(ScriptError::Invalid {
-                code: ScriptErrCode::SchnorrSigSize,
-            });
+            return Ok(false);
         }
 
         // Schnorr signatures are 64 or 65 bytes.
