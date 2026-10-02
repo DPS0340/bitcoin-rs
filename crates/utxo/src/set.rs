@@ -8,7 +8,8 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::contract::{BlockChanges, UndoBatch, UtxoAdd};
-use crate::listener::{UtxoChangeEvents, UtxoChangeListener};
+use crate::listener::UtxoChangeEvents;
+use crate::stats::CoinStatsListener;
 use crate::{UtxoKey, record::OwnedUtxoOut, shard::Shard};
 
 /// Below this many combined add+remove operations, a multi-shard no-listener
@@ -149,7 +150,7 @@ pub(crate) struct SpendPayload<'a> {
 pub struct UtxoSet {
     pub(crate) shards: [Shard; UtxoKey::SHARD_COUNT],
     stable_view_lock: RwLock<()>,
-    listener: Option<Box<dyn UtxoChangeListener + Send + Sync>>,
+    listener: Option<CoinStatsListener>,
 }
 
 /// Byte-level accounting of what a UTXO set holds in memory.
@@ -262,8 +263,8 @@ impl UtxoSetView<'_> {
     pub(crate) fn listener_muhash3072(&self) -> Option<[u8; 384]> {
         self.set
             .listener
-            .as_deref()
-            .and_then(UtxoChangeListener::muhash3072)
+            .as_ref()
+            .map(CoinStatsListener::muhash3072)
     }
 }
 
@@ -290,8 +291,8 @@ impl UtxoSet {
     /// The set keeps one listener slot and the node keeps one listener: the
     /// [`CoinStatsListener`](crate::stats::CoinStatsListener) whose `MuHash` and
     /// accounting track every commit. Replay and recovery attach the same one.
-    pub fn track_coin_stats(&mut self, listener: crate::stats::CoinStatsListener) {
-        self.listener = Some(Box::new(listener));
+    pub fn track_coin_stats(&mut self, listener: CoinStatsListener) {
+        self.listener = Some(listener);
     }
 
     /// Runs `read` while commits are blocked, yielding a stable whole-set view.
@@ -425,7 +426,7 @@ impl UtxoSet {
             return self.commit_single_shard(adds, removes, active_shards[0]);
         }
 
-        let listener = self.listener.as_deref();
+        let listener = self.listener.as_ref();
         let group_txid_runs =
             listener.is_none() && active_shard_count <= TXID_RUN_GROUPING_MAX_SHARDS;
         let buckets =
@@ -486,7 +487,7 @@ impl UtxoSet {
         active_shards: &[usize; UtxoKey::SHARD_COUNT],
         active_shard_count: usize,
         buckets: &ShardCommitBuckets<'_>,
-        listener: &(dyn UtxoChangeListener + Send + Sync),
+        listener: &CoinStatsListener,
     ) -> Result<(), UtxoError> {
         if active_shard_count < PARALLEL_LISTENER_SHARD_THRESHOLD {
             return self.commit_serial_event_batches(
@@ -534,7 +535,7 @@ impl UtxoSet {
         active_shards: &[usize; UtxoKey::SHARD_COUNT],
         active_shard_count: usize,
         buckets: &ShardCommitBuckets<'_>,
-        listener: &(dyn UtxoChangeListener + Send + Sync),
+        listener: &CoinStatsListener,
     ) -> Result<(), UtxoError> {
         let mut error = None;
         let mut shard_events =
@@ -571,7 +572,7 @@ impl UtxoSet {
         shard_idx: usize,
     ) -> Result<(), UtxoError> {
         let _stable_commit = self.stable_view_lock.write();
-        let Some(listener) = self.listener.as_deref() else {
+        let Some(listener) = self.listener.as_ref() else {
             return self.shards[shard_idx].commit_single_shard_batch(adds, removes, shard_idx);
         };
 

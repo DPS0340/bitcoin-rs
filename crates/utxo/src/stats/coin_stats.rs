@@ -1,8 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::listener::{
-    UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoInserted, UtxoRemoved,
-};
+use crate::listener::{UtxoChangeEvents, UtxoCommittedEvent, UtxoInserted, UtxoRemoved};
 use crate::snapshot::{SnapshotCoin, SnapshotCoinObserver};
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use parking_lot::Mutex;
@@ -723,8 +721,8 @@ impl CoinStatsListener {
     }
 }
 
-impl UtxoChangeListener for CoinStatsListener {
-    fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
+impl CoinStatsListener {
+    pub(crate) fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
         if insertions.len() < PARALLEL_COIN_BATCH_OP_THRESHOLD {
             let mut state = self.state.lock();
             for insertion in insertions {
@@ -747,7 +745,7 @@ impl UtxoChangeListener for CoinStatsListener {
         delta.apply_to(&mut state.stats);
     }
 
-    fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
+    pub(crate) fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
         if removals.len() < PARALLEL_COIN_BATCH_OP_THRESHOLD {
             let mut state = self.state.lock();
             for removal in removals {
@@ -770,7 +768,7 @@ impl UtxoChangeListener for CoinStatsListener {
         delta.apply_to(&mut state.stats);
     }
 
-    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) {
+    pub(crate) fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) {
         if batches.is_empty() {
             return;
         }
@@ -807,8 +805,9 @@ impl UtxoChangeListener for CoinStatsListener {
         delta.apply_to(&mut state.stats);
     }
 
-    fn muhash3072(&self) -> Option<[u8; 384]> {
-        Some(self.state.lock().stats.muhash.finalize())
+    /// Returns the current `MuHash3072` snapshot trailer.
+    pub(crate) fn muhash3072(&self) -> [u8; 384] {
+        self.state.lock().stats.muhash.finalize()
     }
 }
 
