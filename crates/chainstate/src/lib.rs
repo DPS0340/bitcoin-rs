@@ -20,7 +20,7 @@ use disconnect::disconnect_block_admitted;
 pub use durable::recover_disconnect_marker;
 use hashbrown::HashMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use scratch::{ApplyScratchCapacities, SameBlockSpentSet};
+use scratch::SameBlockSpentSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use window::{PublishMode, apply_window_admitted};
@@ -1272,26 +1272,6 @@ impl BlockTxPlan {
         static NONE: std::sync::LazyLock<SameBlockSpentSet> =
             std::sync::LazyLock::new(SameBlockSpentSet::new);
         self.same_block_spent.as_ref().unwrap_or(&NONE)
-    }
-
-    fn into_scratch_parts(
-        self,
-        txids: Vec<Txid>,
-    ) -> (
-        Vec<Txid>,
-        ApplyScratchCapacities,
-        Option<SameBlockSpentSet>,
-        usize,
-    ) {
-        (
-            txids,
-            ApplyScratchCapacities {
-                created_outputs: self.created_output_count,
-                spent_inputs: self.spent_input_count,
-            },
-            self.same_block_spent,
-            self.same_block_spent_input_count,
-        )
     }
 }
 
