@@ -423,7 +423,6 @@ pub trait MempoolObserver: Send + Sync {
 /// `catch_unwind` around the composite stays as the backstop. Legs inherit
 /// the [`MempoolObserver`] contract: best-effort mirrors that run with no
 /// gateway lock held, so a leg may re-enter the gateway.
-#[derive(Default)]
 pub struct CompositeObserver {
     /// Guarded because a subsystem may attach its leg after the gateway is
     /// interned. Publication clones the list under this lock and releases it

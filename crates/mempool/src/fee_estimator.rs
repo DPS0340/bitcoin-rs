@@ -413,11 +413,6 @@ impl FeeEstimator {
         history_codec::decode(bytes)
     }
 }
-impl Default for FeeEstimator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Owner-local persistence of the estimator's recoverable state.
 ///

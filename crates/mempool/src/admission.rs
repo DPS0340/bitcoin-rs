@@ -68,7 +68,7 @@ pub struct ChainAdmissionSnapshot {
 /// Used to evaluate BIP68 relative locks and coinbase maturity at admission.
 /// The `MTP` value is the median-time-past of the block *before* the one that
 /// created the output, matching `bip68_prevout_mtp` in the block-connect path.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrevoutMeta {
     /// Height the spent output was created at.
     pub height: u32,
