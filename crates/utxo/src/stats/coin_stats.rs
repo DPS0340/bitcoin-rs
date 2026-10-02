@@ -1,8 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::listener::{
-    UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoInserted, UtxoRemoved,
-};
+use crate::listener::{UtxoChangeEvents, UtxoCommittedEvent, UtxoInserted, UtxoRemoved};
 use crate::snapshot::{SnapshotCoin, SnapshotCoinObserver};
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use parking_lot::Mutex;
@@ -221,16 +219,7 @@ pub fn scan_coin_stats(
     } else {
         CoinStatsAccumulator::without_muhash(height)
     };
-    view.for_each_coin(|txid, vout, value, script_pubkey, coin_height, coinbase| {
-        accumulator.observe_coin(SnapshotCoin {
-            txid,
-            vout,
-            value,
-            script_pubkey,
-            height: coin_height,
-            coinbase,
-        });
-    })?;
+    view.for_each_coin(|coin| accumulator.observe_coin(coin))?;
     Ok(accumulator.into_stats())
 }
 
@@ -638,23 +627,15 @@ struct CoinStatsListenerState {
 }
 
 impl CoinStatsListenerState {
-    fn insert_utxo_hash(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
+    fn insert_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
         coin_hash_bytes_into(&mut self.scratch, op, txout, height, coinbase);
         self.stats.muhash.insert(self.scratch.as_slice());
-    }
-
-    fn insert_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
-        self.insert_utxo_hash(op, txout, height, coinbase);
         self.stats.account_insert(txout);
     }
 
-    fn remove_utxo_hash(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
+    fn remove_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
         coin_hash_bytes_into(&mut self.scratch, op, txout, height, coinbase);
         self.stats.muhash.remove(self.scratch.as_slice());
-    }
-
-    fn remove_utxo(&mut self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
-        self.remove_utxo_hash(op, txout, height, coinbase);
         self.stats.account_remove(txout);
     }
 
@@ -723,8 +704,8 @@ impl CoinStatsListener {
     }
 }
 
-impl UtxoChangeListener for CoinStatsListener {
-    fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
+impl CoinStatsListener {
+    pub(crate) fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
         if insertions.len() < PARALLEL_COIN_BATCH_OP_THRESHOLD {
             let mut state = self.state.lock();
             for insertion in insertions {
@@ -747,7 +728,7 @@ impl UtxoChangeListener for CoinStatsListener {
         delta.apply_to(&mut state.stats);
     }
 
-    fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
+    pub(crate) fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
         if removals.len() < PARALLEL_COIN_BATCH_OP_THRESHOLD {
             let mut state = self.state.lock();
             for removal in removals {
@@ -770,7 +751,7 @@ impl UtxoChangeListener for CoinStatsListener {
         delta.apply_to(&mut state.stats);
     }
 
-    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) {
+    pub(crate) fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) {
         if batches.is_empty() {
             return;
         }
@@ -807,8 +788,9 @@ impl UtxoChangeListener for CoinStatsListener {
         delta.apply_to(&mut state.stats);
     }
 
-    fn muhash3072(&self) -> Option<[u8; 384]> {
-        Some(self.state.lock().stats.muhash.finalize())
+    /// Returns the current `MuHash3072` snapshot trailer.
+    pub(crate) fn muhash3072(&self) -> [u8; 384] {
+        self.state.lock().stats.muhash.finalize()
     }
 }
 
@@ -1010,7 +992,7 @@ mod tests {
     #[test]
     fn scan_coin_stats_matches_rolling_listener() {
         use crate::contract::{BlockChanges, UtxoAdd};
-        use crate::{SnapshotCoin, SnapshotCoinObserver, UtxoSet};
+        use crate::{SnapshotCoinObserver, UtxoSet};
         use bitcoin_rs_primitives::{Hash256, OutPoint};
 
         let mut utxo = UtxoSet::new();
@@ -1049,15 +1031,7 @@ mod tests {
                 .unwrap_or_else(|err| panic!("scan_coin_stats failed: {err}"));
             let mut accumulated = super::CoinStatsAccumulator::with_muhash(rolling.height);
             let mut without_muhash = super::CoinStatsAccumulator::without_muhash(rolling.height);
-            view.for_each_coin(|txid, vout, value, script_pubkey, height, coinbase| {
-                let coin = SnapshotCoin {
-                    txid,
-                    vout,
-                    value,
-                    script_pubkey,
-                    height,
-                    coinbase,
-                };
+            view.for_each_coin(|coin| {
                 accumulated.observe_coin(coin);
                 without_muhash.observe_coin(coin);
             })

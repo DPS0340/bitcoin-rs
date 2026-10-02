@@ -367,28 +367,27 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
 }
 
 impl UtxoSetView<'_> {
-    /// Invokes `f` once per live coin in the stable view, passing
-    /// `(txid, vout, value, script_pubkey, height, coinbase)`. The script slice
+    /// Invokes `f` once per live coin in the stable view. The script slice
     /// borrows the record payload only for the duration of the call.
     ///
     /// On-demand scan helper (e.g. `gettxoutsetinfo`); not on any hot path.
     pub(crate) fn for_each_coin<F>(&self, mut f: F) -> Result<(), UtxoError>
     where
-        F: FnMut(Hash256, u32, u64, &[u8], u32, bool),
+        F: FnMut(SnapshotCoin<'_>),
     {
         for shard_idx in 0_u8..=u8::MAX {
             self.shard(usize::from(shard_idx)).with_table(|table| {
                 for record in &table.table {
                     let txid = record.txid();
                     for output in record.outputs() {
-                        f(
+                        f(SnapshotCoin {
                             txid,
-                            output.vout,
-                            output.value,
-                            output.script_pubkey,
-                            output.height,
-                            output.coinbase,
-                        );
+                            vout: output.vout,
+                            value: output.value,
+                            script_pubkey: output.script_pubkey,
+                            height: output.height,
+                            coinbase: output.coinbase,
+                        });
                     }
                 }
                 Ok::<(), UtxoError>(())
