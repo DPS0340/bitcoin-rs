@@ -711,7 +711,6 @@ mod tests {
     /// Full chain application and transition ownership have separate tests in
     /// `crates/chainstate`; this checks the follower's lifecycle notification
     /// boundary.
-    #[allow(clippy::too_many_lines)]
     fn assert_admission_followers_after_chain_change(connect: bool) -> anyhow::Result<()> {
         let gateway = MempoolGateway::shared(
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),

@@ -169,7 +169,6 @@ fn prune_refuses_after_apply_admission_closes() -> anyhow::Result<()> {
 
 /// Successive prune calls advance both persisted and in-memory pruneheight.
 #[cfg(feature = "fjall")]
-#[allow(clippy::too_many_lines)]
 #[test]
 fn prune_to_height_advances_published_height() -> anyhow::Result<()> {
     use bitcoin_rs_rpc::context::PruneService;

@@ -465,7 +465,7 @@ impl Drop for StartupGuard {
 /// receives detached startup parts or needs to reconstruct lifecycle ownership.
 /// `install_signals` is the daemon's only difference from embedded startup.
 /// A failure after any service starts rolls it back through `StartupGuard`.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) fn start_node(
     config: NodeConfig,
     runtime: RuntimeInputs,

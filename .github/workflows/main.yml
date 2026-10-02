@@ -21,7 +21,7 @@ permissions:
 # waiting run when a newer one arrives, silently dropping that merged
 # commit's CI record. `queue: max` retains up to 100 pending generations
 # (only arrivals beyond the queue cap are rejected), so evidence is bounded
-# in concurrency and never dropped.
+# in concurrency and dropped only when 100 generations are already pending.
 #
 # Rationale (measured 2026-09-30, issue #1349): with a per-run group, every
 # `main` push fanned out all six deep lanes at once and stacked across rapid

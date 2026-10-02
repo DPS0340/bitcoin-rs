@@ -988,7 +988,7 @@ pub(crate) fn not_found_with(message: impl Into<String>) -> Response {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use bitcoin_rs_chain::{NodeStatus, TipSnapshot};

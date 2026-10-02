@@ -242,7 +242,6 @@ fn expected_coin_stats(blocks: &[&Block]) -> Result<CoinStats, Box<dyn std::erro
     Ok(stats)
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
 fn apply_handles_with_coin_stats(
     network: Network,
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
@@ -254,7 +253,6 @@ fn apply_handles_with_coin_stats(
     (handles, coin_stats)
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
 fn apply_handles_with_coin_stats_and_utxo(
     network: Network,
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,

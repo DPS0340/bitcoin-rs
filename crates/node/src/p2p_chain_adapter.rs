@@ -80,7 +80,7 @@ fn settle_window_failure(
 /// Symmetric with [`settle_window_failure`]: both paths attempt `finish`
 /// and surface a `Fatal` disposition when the CAS fails, so the caller
 /// stops retrying instead of wedging on an odd generation.
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn settle_window_success(
     transition: bitcoin_rs_chainstate::ChainTransition<'_>,
     mempool_change: Option<bitcoin_rs_mempool::ChainChangeGuard>,

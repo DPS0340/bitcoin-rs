@@ -193,7 +193,7 @@ impl WindowGroup {
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(super) fn apply_window_admitted(
     handles: &Chainstate,
     blocks: &[&Block],
@@ -386,7 +386,7 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
 
 /// Prepares consecutive blocks against one overlay and verifies all their input
 /// scripts in a single dispatch.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn prove_window<'a>(
     handles: &Chainstate,
     blocks: &[&'a Block],

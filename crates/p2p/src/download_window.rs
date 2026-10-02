@@ -25,7 +25,7 @@ pub use policy::*;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub struct SyncBudget {
     pub max_pending_blocks: usize,
     pub max_pending_bytes: usize,
@@ -1636,7 +1636,7 @@ impl DownloadWindow {
     ///      inside every pending/staging budget; `next_request_height` covers
     ///      every height the scan offered.
     /// INVARIANT: staged membership, count, and bytes are read from `stager`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn next_peer_request(
         &mut self,
         stager: &mut BlockStager,

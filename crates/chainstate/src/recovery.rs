@@ -127,7 +127,7 @@ fn cold_initial_chainstate(
     })
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 /// Recovers the initial authoritative state from checkpoint and journal evidence.
 pub fn prepare_initial_chainstate(
     data_dir: &Path,

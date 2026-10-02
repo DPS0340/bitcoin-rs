@@ -696,9 +696,9 @@ fn sats_from_btc(btc: f64, message: &'static str) -> Result<u64, RpcError> {
     if !raw.is_finite() || !(0.0..U64_MAX_F64).contains(&raw) {
         return Err(RpcError::InvalidParams(message));
     }
-    #[allow(clippy::as_conversions)] // see fn doc: no TryFrom<f64> for u64 in std
-    #[allow(clippy::cast_possible_truncation)] // fractional dust, per fn doc
-    #[allow(clippy::cast_sign_loss)] // raw >= 0.0 checked above
+    #[expect(clippy::as_conversions)] // see fn doc: no TryFrom<f64> for u64 in std
+    #[expect(clippy::cast_possible_truncation)] // fractional dust, per fn doc
+    #[expect(clippy::cast_sign_loss)] // raw >= 0.0 checked above
     Ok(raw as u64)
 }
 
@@ -865,7 +865,7 @@ pub(crate) fn combinepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value, 
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
 
@@ -2149,7 +2149,7 @@ mod gettxout_via_utxo_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod acceptance_tests {
     use alloc::sync::Arc;
 

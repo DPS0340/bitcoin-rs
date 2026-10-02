@@ -33,7 +33,6 @@ impl<S: KvStore> JournalWriter<S> {
         Self::restore(dir, store, head)
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Creates a journal with a new checkpoint base and durable head.
     pub fn initialize(
         dir: cap_std::fs::Dir,

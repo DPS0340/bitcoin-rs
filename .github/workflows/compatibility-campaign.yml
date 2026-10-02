@@ -18,7 +18,8 @@ permissions:
 # jobs against PR feedback (issue #1349). Fixed group + `queue: max` +
 # `cancel-in-progress: false`: the running campaign is never cancelled and
 # newer runs wait in queue (up to 100 pending) instead of cancelling the
-# previous pending one, so no invocation's evidence is dropped.
+# previous pending one, so an invocation's evidence is dropped only when 100
+# runs are already pending.
 concurrency:
   group: ci-compatibility
   queue: max

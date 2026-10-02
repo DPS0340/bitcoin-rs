@@ -392,7 +392,7 @@ impl BlockSync {
     ///   discarded with no retry and is not counted.
     /// INVARIANT: an unrequested body whose tree-resolved node fails an
     ///   admission clause is never staged.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(super) fn buffer_received_block_chunk(
         &self,
         blocks: &mut Vec<InboundBlock>,

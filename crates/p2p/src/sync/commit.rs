@@ -97,7 +97,7 @@ impl BlockSync {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[doc(hidden)]
     pub(crate) fn apply_buffered_blocks(
         &self,

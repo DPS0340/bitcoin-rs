@@ -291,7 +291,6 @@ fn far_future_matching_peer_retries_without_peer_blame() -> Result<(), Box<dyn s
 /// disconnects the chain has a real readmission candidate. Returns the
 /// handles, the blocks, and their serialized bodies for the reorg body
 /// loader.
-#[allow(clippy::type_complexity)]
 #[test]
 fn tick_sorts_out_of_order_peers_before_requesting_blocks() -> Result<(), Box<dyn std::error::Error>>
 {

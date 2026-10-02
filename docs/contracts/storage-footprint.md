@@ -10,9 +10,12 @@ Owners:
   `crates/storage/src/footprint/evidence.rs`
 - Measurement orchestration and identity projection:
   `crates/node/src/storage_footprint.rs`
-- Default-lane full-tip conservative high-water evidence:
+- Default-lane full-tip conservative high-water evidence (planned):
   `bin/bitcoin-rs/tests/overhaul_storage_evidence.rs`
-- Command: `bin/bitcoin-rs --measure-storage`
+- Verdict-machine gates: `crates/node/tests/unit/storage_footprint/tests.rs`
+  (FP-02, FP-04 budget pass/fail and stop-pinning rules)
+- Command: `bin/bitcoin-rs --measure-storage`, exercised by
+  `e2e/tests/lifecycle.rs` `measure_storage_exits_with_report`
 
 ## Clauses
 

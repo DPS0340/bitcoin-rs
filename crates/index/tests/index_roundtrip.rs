@@ -122,7 +122,7 @@ impl KvStore for MemoryStore {
         Ok(guard[cf.index()].get(key).cloned())
     }
 
-    #[allow(clippy::needless_collect)] // SPEC: returned KvIter must own cloned rows after the lock guard is dropped.
+    #[expect(clippy::needless_collect)] // SPEC: returned KvIter must own cloned rows after the lock guard is dropped.
     fn iter_prefix<'a>(
         &'a self,
         cf: ColumnFamily,
@@ -392,7 +392,7 @@ impl KvSnapshot for CallTrackingSnapshot<'_> {
         Ok(observed)
     }
 
-    #[allow(clippy::needless_collect)] // SPEC: returned KvIter owns captured rows.
+    // SPEC: returned KvIter owns captured rows.
     fn iter_prefix<'a>(
         &'a self,
         cf: ColumnFamily,
@@ -474,7 +474,7 @@ impl KvSnapshot for MemorySnapshot {
         Ok(self.cfs[cf.index()].get(key).cloned())
     }
 
-    #[allow(clippy::needless_collect)] // SPEC: returned KvIter owns cloned rows to match backend iterator ownership.
+    #[expect(clippy::needless_collect)] // SPEC: returned KvIter owns cloned rows to match backend iterator ownership.
     fn iter_prefix<'a>(
         &'a self,
         cf: ColumnFamily,

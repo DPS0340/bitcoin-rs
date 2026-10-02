@@ -30,7 +30,7 @@ pub(crate) fn configure_peer_stream(stream: &TcpStream) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 

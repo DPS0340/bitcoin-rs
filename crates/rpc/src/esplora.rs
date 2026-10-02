@@ -103,7 +103,7 @@ fn strip_dir<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -600,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn bitcoin_esplora_surface_matches_documented_routes_and_content_types()
     -> Result<(), Box<dyn std::error::Error>> {
         let (handler, transaction, block, address) = contract_fixture()?;
@@ -730,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn bitcoin_esplora_representations_match_the_documented_schemas()
     -> Result<(), Box<dyn std::error::Error>> {
         fn keys(value: &Value) -> std::collections::BTreeSet<&str> {
@@ -1044,7 +1044,7 @@ mod tests {
     /// `[b2, b1, genesis]` and `a1` is off it. Any other combination straddles
     /// two publications.
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn block_status_and_block_list_never_straddle_two_applied_branches()
     -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin_rs_chain::{NodeStatus, TipSnapshot};

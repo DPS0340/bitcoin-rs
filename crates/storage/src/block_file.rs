@@ -727,7 +727,7 @@ fn sync_blocks_dir(blocks_dir: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn sync_blocks_dir(_blocks_dir: &Path) -> Result<(), StorageError> {
     // std has no portable primitive for opening and syncing a directory.
     // Keep the durability boundary explicit where the platform supports it.

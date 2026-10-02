@@ -2533,7 +2533,7 @@ fn outpoint_range(outpoint: OutPoint) -> RangeInclusive<(SpendingKey, EntryId)> 
     (key, EntryId::MIN)..=(key, EntryId::MAX)
 }
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -4527,7 +4527,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod spend_index_tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -5350,7 +5350,7 @@ mod entry_overhead_tests {
 /// never resolve to a stale resident, cluster limits hold before a mutation
 /// commits, and walk work stays local to the affected cluster.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod graph_tests {
     use super::*;
 
@@ -5941,7 +5941,7 @@ mod graph_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn random_mutations_leave_graph_semantics_exact() {
         for seed in [0x5EED_u64, 0xC0_FFEE, 0xB1_05] {
             let mut pool = fuzzer_pool();

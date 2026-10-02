@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockTree, TipSnapshot, compact_is_met_by};
+use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_consensus::MAX_SCRIPT_SIZE;
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
@@ -127,13 +127,7 @@ pub(crate) fn mined_child(
         },
         txs: vec![tx],
     };
-    while !compact_is_met_by(block.header.bits, block.header.compute_hash().0) {
-        block.header.nonce = block
-            .header
-            .nonce
-            .checked_add(1)
-            .ok_or("test nonce exhausted")?;
-    }
+    bitcoin_rs_chain::regtest_fixture::mine_header_to_declared_target(&mut block.header)?;
     Ok(block)
 }
 

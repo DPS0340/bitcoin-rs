@@ -136,14 +136,14 @@ fn parse_connect_list(value: &str) -> Result<Vec<String>> {
 ///
 /// The wrap is deliberate: a row's grammar is one function shape, so an option
 /// that cannot fail still reports through `Result`.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn parse_text(value: &str) -> std::result::Result<String, Infallible> {
     Ok(value.to_owned())
 }
 
 /// Accepts any text as a filesystem path, for the same reason as
 /// [`parse_text`].
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn parse_path(value: &str) -> std::result::Result<PathBuf, Infallible> {
     Ok(PathBuf::from(value))
 }

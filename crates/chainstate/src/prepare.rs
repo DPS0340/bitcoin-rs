@@ -229,11 +229,6 @@ pub(super) fn resolve_block_prevouts(
     }
 }
 
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
 /// Runs every non-script transaction check for a block whose scripts are
 /// verified upstream: assume-valid or local replay.
 fn run_non_script_checks_only(
@@ -281,7 +276,7 @@ fn run_non_script_checks_only(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::as_conversions,
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation

@@ -303,7 +303,7 @@ pub enum BlockChangeError {
 
 /// Why a stored undo record could not be turned back into an [`UndoBatch`].
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum UndoLoadError {
     #[error("undo record read: {0}")]
     Read(#[source] StorageError),
@@ -320,7 +320,7 @@ pub enum UndoLoadError {
 /// Only `Refused` leaves state untouched; the rest fire after the marker is
 /// armed and may leave state torn for recovery to reconcile.
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub enum RollbackError {
     #[error("rollback refused: {0}")]
     Refused(#[source] StorageError),
@@ -377,7 +377,7 @@ pub fn commit_block_changes<T: Borrow<TxOut>>(
 /// [`BlockChangeError::BlockValueOverflow`] when value totals overflow; and
 /// [`BlockChangeError::UndoPrevoutMissing`] when a spend has no resolved
 /// prevout. Genesis returns empty mutations.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn build_block_changes<'a>(
     block: &'a Block,
     height: u32,
@@ -566,7 +566,6 @@ pub fn decode_undo_record(bytes: &[u8], block_hash: Hash256) -> Result<UndoBatch
 ///
 /// [`RollbackError::Refused`] before the marker is armed; every other variant
 /// after.
-#[allow(clippy::too_many_arguments)]
 pub fn rollback_block(
     store: &dyn UndoStore,
     utxo: &UtxoSet,

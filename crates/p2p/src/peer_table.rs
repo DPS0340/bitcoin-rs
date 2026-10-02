@@ -709,7 +709,7 @@ impl PeerTable {
     /// identity through the nonblocking enqueue. A replacement cannot
     /// register between validation and enqueue; saturation retains the
     /// lease's cancellation policy.
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn send(&self, source: PeerSource, message: crate::Message) -> Result<(), crate::Message> {
         let entries = self.entries.read();
         let Some(entry) = entries
@@ -725,7 +725,7 @@ impl PeerTable {
     /// identity is still held: a same-address replacement cannot register
     /// between the enqueue and the caller stamping request ownership under
     /// that identity.
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub(crate) fn send_then(
         &self,
         source: PeerSource,

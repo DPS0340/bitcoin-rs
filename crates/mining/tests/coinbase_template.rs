@@ -124,7 +124,7 @@ fn segwit_candidate_commits_to_selected_wtxids_and_reserved_value() -> Result<()
 }
 
 #[test]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn fee_overflow_is_reported_instead_of_wrapping() {
     let entry = snapshot_entry(
         Arc::new(tx_with_witness(1, 1_000, None)),
@@ -193,7 +193,6 @@ impl bitcoin_rs_mempool::AdmissionChain for ReorgCoins {
 /// The reserved reorg batch must store resolved BIP141 cost all the way
 /// through the real gateway and mining snapshot; template selection consumes it.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn reconsidered_prevout_cost_reaches_the_mining_sigop_budget() -> Result<(), Box<dyn Error>> {
     use bitcoin::hashes::{hash160, sha256};
     use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits};

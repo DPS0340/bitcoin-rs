@@ -219,7 +219,7 @@ fn next_block_sequence_locks_final(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use std::cell::Cell;
     use std::sync::Arc;

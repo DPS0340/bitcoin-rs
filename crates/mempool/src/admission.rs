@@ -2533,7 +2533,7 @@ mod tests {
     /// MPL-04: the guard's odd fence re-admits a dependency-ordered batch
     /// through the shared evaluator, publishing `Reorg` in order.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn reconsider_disconnected_admits_parent_then_child_under_the_guard() {
         let observer = Arc::new(ReorgRecording::default());
         let gateway = observed_gateway(&observer);
@@ -2570,7 +2570,7 @@ mod tests {
     /// MPL-04: a parent that is not final at the lower tip is refused and its
     /// descendant withheld, so no partial family is left behind.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn reconsider_disconnected_withholds_descendants_of_a_refused_parent() {
         let observer = Arc::new(ReorgRecording::default());
         let gateway = observed_gateway(&observer);
@@ -2597,7 +2597,7 @@ mod tests {
     /// MPL-04: reorg re-admission runs script verification like any other
     /// admission — a bad-witness candidate is refused, not force-inserted.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn reconsider_disconnected_refuses_a_script_failure() {
         let gateway = gateway();
         let (parent, valid) = witness_parent_and_child();
@@ -2619,7 +2619,7 @@ mod tests {
     /// Reorg re-admission is not new fee evidence: the estimator must not see
     /// the re-entered transaction, matching Core's `validForFeeEstimation=false`.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn reconsider_disconnected_does_not_register_with_the_estimator() {
         let gateway = gateway();
         let (parent, child) = witness_parent_and_child();
@@ -2668,7 +2668,7 @@ mod tests {
     /// are deferred, which is the ordering that keeps a parent from being
     /// shed before the child that spends it is re-admitted.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn reconsider_disconnected_admits_below_floor_then_trims_once() {
         // The ceiling falls between the parent's and the family's virtual
         // size, so a per-acceptance trim would have to act on the child, and
@@ -2734,7 +2734,7 @@ mod tests {
     /// Pins the batch log for one reorg settlement: every reorg admission
     /// precedes the single policy-eviction batch, the trim publishes as Reorg
     /// shedding `trimmed_txid`, and nothing commits after it.
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn assert_reorg_publication_order(
         batches: &[ReorgBatch],
         admissions: &[Txid],
@@ -2799,7 +2799,7 @@ mod tests {
     /// relay is refused, so the gates are live and only the reorg origin
     /// defers them.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn reconsider_control_refuses_fresh_relay_below_floor() {
         const CEILING: u64 = 150;
         let limits = crate::MempoolLimits {
@@ -2838,7 +2838,7 @@ mod tests {
     /// missing-input parent together with its descendant, and a resident whose
     /// locktime is no longer final — while a supported entry stays.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn remove_for_reorg_sweeps_only_unsupported_residents() {
         let gateway = gateway();
         let (parent, child) = parent_and_child();
@@ -2904,7 +2904,7 @@ mod tests {
 
     /// A moved fence sweeps nothing: the commit re-checks the exact odd value.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn remove_for_reorg_refuses_a_moved_generation() {
         let gateway = gateway();
         let (parent, _child) = parent_and_child();
@@ -2930,7 +2930,7 @@ mod tests {
     /// stable fence is refused too — the integer alone is not authority —
     /// and the guard's chain-change fence admits only its own odd value.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn admission_state_accepts_only_the_current_generation() {
         let gateway = gateway();
         let change = gateway.begin_chain_change().expect("fence");
@@ -3000,7 +3000,7 @@ mod tests {
     /// `remove_for_reorg` fails fast with `ForeignGuard` before any pool
     /// read, and `reconsider_disconnected` inserts nothing.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn reorg_methods_refuse_a_guard_from_another_gateway() {
         let gateway_a = gateway();
         let gateway_b = gateway();

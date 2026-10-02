@@ -137,7 +137,6 @@ impl InitialBlockDownload {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod initial_block_download_tests {
     use std::sync::Arc;
 
