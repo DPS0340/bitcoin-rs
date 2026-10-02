@@ -120,7 +120,7 @@ impl<T> BlockChanges<T> {
 /// No public constructor: batches come from [`build_block_changes`] or the
 /// undo decoder ([`load_block_undo`]), so a rollback can never be asked to
 /// replay a batch the contract did not produce.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct UndoBatch {
     pub(crate) restores: Vec<UtxoAdd>,
     pub(crate) removes: Vec<OutPoint>,
