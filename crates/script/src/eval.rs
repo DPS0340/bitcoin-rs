@@ -25,17 +25,17 @@ use bitcoin_hashes::{Hash as _, ripemd160, sha1};
 /// `OP_NOP` (0x61).
 pub(crate) const OP_NOP: u8 = 0x61;
 /// `OP_IF` (0x63).
-pub(crate) const OP_IF: u8 = 0x63;
+pub(crate) const OP_IF: u8 = crate::script::opcode::OP_IF;
 /// `OP_NOTIF` (0x64).
 pub(crate) const OP_NOTIF: u8 = 0x64;
 /// `OP_ELSE` (0x67).
 pub(crate) const OP_ELSE: u8 = 0x67;
 /// `OP_ENDIF` (0x68).
-pub(crate) const OP_ENDIF: u8 = 0x68;
+pub(crate) const OP_ENDIF: u8 = crate::script::opcode::OP_ENDIF;
 /// `OP_VERIFY` (0x69).
 pub(crate) const OP_VERIFY: u8 = 0x69;
 /// `OP_RETURN` (0x6a).
-pub(crate) const OP_RETURN: u8 = 0x6a;
+pub(crate) const OP_RETURN: u8 = crate::script::opcode::OP_RETURN;
 /// `OP_TOALTSTACK` (0x6b).
 pub(crate) const OP_TOALTSTACK: u8 = 0x6b;
 /// `OP_FROMALTSTACK` (0x6c).
@@ -59,7 +59,7 @@ pub(crate) const OP_DEPTH: u8 = 0x74;
 /// `OP_DROP` (0x75).
 pub(crate) const OP_DROP: u8 = crate::script::opcode::OP_DROP;
 /// `OP_DUP` (0x76).
-pub(crate) const OP_DUP: u8 = 0x76;
+pub(crate) const OP_DUP: u8 = crate::script::opcode::OP_DUP;
 /// `OP_NIP` (0x77).
 pub(crate) const OP_NIP: u8 = 0x77;
 /// `OP_OVER` (0x78).
@@ -77,11 +77,11 @@ pub(crate) const OP_TUCK: u8 = 0x7d;
 /// `OP_SIZE` (0x82).
 pub(crate) const OP_SIZE: u8 = 0x82;
 /// `OP_EQUAL` (0x87).
-pub(crate) const OP_EQUAL: u8 = 0x87;
+pub(crate) const OP_EQUAL: u8 = crate::script::opcode::OP_EQUAL;
 /// `OP_EQUALVERIFY` (0x88).
-pub(crate) const OP_EQUALVERIFY: u8 = 0x88;
+pub(crate) const OP_EQUALVERIFY: u8 = crate::script::opcode::OP_EQUALVERIFY;
 /// `OP_1NEGATE` (0x4f).
-pub(crate) const OP_1NEGATE: u8 = 0x4f;
+pub(crate) const OP_1NEGATE: u8 = crate::script::opcode::OP_1NEGATE;
 /// `OP_1ADD` (0x8b).
 pub(crate) const OP_1ADD: u8 = 0x8b;
 /// `OP_1SUB` (0x8c).
@@ -129,19 +129,19 @@ pub(crate) const OP_SHA1: u8 = 0xa7;
 /// `OP_SHA256` (0xa8).
 pub(crate) const OP_SHA256: u8 = 0xa8;
 /// `OP_HASH160` (0xa9).
-pub(crate) const OP_HASH160: u8 = 0xa9;
+pub(crate) const OP_HASH160: u8 = crate::script::opcode::OP_HASH160;
 /// `OP_HASH256` (0xaa).
 pub(crate) const OP_HASH256: u8 = 0xaa;
 /// `OP_CODESEPARATOR` (0xab).
 pub(crate) const OP_CODESEPARATOR: u8 = 0xab;
 /// `OP_CHECKSIG` (0xac).
-pub(crate) const OP_CHECKSIG: u8 = 0xac;
+pub(crate) const OP_CHECKSIG: u8 = crate::script::opcode::OP_CHECKSIG;
 /// `OP_CHECKSIGVERIFY` (0xad).
-pub(crate) const OP_CHECKSIGVERIFY: u8 = 0xad;
+pub(crate) const OP_CHECKSIGVERIFY: u8 = crate::script::opcode::OP_CHECKSIGVERIFY;
 /// `OP_CHECKMULTISIG` (0xae).
-pub(crate) const OP_CHECKMULTISIG: u8 = 0xae;
+pub(crate) const OP_CHECKMULTISIG: u8 = crate::script::opcode::OP_CHECKMULTISIG;
 /// `OP_CHECKMULTISIGVERIFY` (0xaf).
-pub(crate) const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+pub(crate) const OP_CHECKMULTISIGVERIFY: u8 = crate::script::opcode::OP_CHECKMULTISIGVERIFY;
 /// `OP_NOP1` (0xb0).
 pub(crate) const OP_NOP1: u8 = 0xb0;
 /// `OP_CHECKLOCKTIMEVERIFY` (0xb1).
