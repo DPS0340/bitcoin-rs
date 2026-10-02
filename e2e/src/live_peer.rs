@@ -191,7 +191,7 @@ impl LivePeer {
     }
 
     /// Read one wire frame, marking the peer dropped on hard failures.
-    pub fn recv(&mut self, deadline: Instant) -> Result<NetworkMessage> {
+    fn recv(&mut self, deadline: Instant) -> Result<NetworkMessage> {
         match read_frame(&mut self.stream, deadline, &mut self.pending) {
             Ok(frame) => {
                 let message = decode_frame(&frame)?;
