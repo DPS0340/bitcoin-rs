@@ -483,29 +483,6 @@ impl BlockTree {
             return Some(0);
         }
 
-        if window == 11 {
-            let mut times = [0_u32; 11];
-            let mut len = 0;
-            let mut cursor = start_id;
-            while len < times.len() {
-                let Ok(node) = self.node(cursor) else {
-                    if len == 0 {
-                        return None;
-                    }
-                    break;
-                };
-                times[len] = node.header.time;
-                len += 1;
-                let Some(parent) = node.parent else {
-                    break;
-                };
-                cursor = parent;
-            }
-
-            times[..len].sort_unstable();
-            return Some(times[len / 2]);
-        }
-
         let mut times = Vec::with_capacity(window);
         let mut cursor = start_id;
         while times.len() < window {
@@ -522,9 +499,6 @@ impl BlockTree {
             cursor = parent;
         }
 
-        if times.is_empty() {
-            return None;
-        }
         times.sort_unstable();
         Some(times[times.len() / 2])
     }
