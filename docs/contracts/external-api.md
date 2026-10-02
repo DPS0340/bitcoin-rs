@@ -165,9 +165,10 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 
 
 - **Owner**: the corpus loader in `crates/rpc/tests/support/fixture.rs` owns
-  `PINNED_CORE_VERSION`, `PINNED_CORE_SHA256`, and their validation. Every
-  fixture records the version and exact binary digest used for its capture;
-  missing, empty, or mismatched values fail loading before replay starts.
+  the `core_version` and `core_binary_sha256` provenance pins and their
+  validation. Every fixture records the version and exact binary digest used
+  for its capture; missing, empty, or mismatched values fail loading before
+  replay starts.
 - These pins describe the released Core node used for the recorded RPC
   responses. They are separate from the `bitcoinkernel` oracle and from the
   broader API family declared by `MANIFEST` (`API-01`). Changing either of
@@ -246,8 +247,8 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
   `crates/rpc/src/handlers/mining.rs` `render_block_template`.
 - Capabilities are the producer’s implemented set (`proposal`, `longpoll`).
   Client-advertised names are not echoed.
-- `submitold` is present after a long-poll wait and omitted otherwise. `workid`
-  is not emitted.
+- `submitold` and `workid` are BIP23 extras the pinned template contract
+  does not model; neither is emitted.
 - On signet, the template carries `signet` in `rules` (mandatory) and
   `signet_challenge`. Other networks omit `signet_challenge`.
   - Malformed `longpollid` values, including invalid UTF-8 split boundaries, are rejected without panicking.
@@ -378,8 +379,9 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 ### `API-20`: GBT `vbrequired` is always 0
 
 
-- **Owner**: `MiningService::version_bits_for` in
-  `crates/mining/src/coordinator.rs`; signalling deployments are read from
+- **Owner**: `template_from_candidate` in
+  `crates/mining/src/coordinator.rs` (driven by
+  `MiningService::get_block_template`); signalling deployments are read from
   the applied tree through the node-implemented `ChainContextSource`.
 - Core v31 `getblocktemplate` hardcodes `vbrequired` to 0. Signalling
   deployments still appear in `vbavailable`; locked-in bits are not OR'd
@@ -595,9 +597,9 @@ owned by [wallet-facing.md](wallet-facing.md).
 
 - `API-11`:
   - `crates/rpc/src/handlers/mining.rs` tests `getblocktemplate_forwards_longpollid`,
-    `getblocktemplate_emits_submitold_and_omits_it_when_unset`,
     `getblocktemplate_requires_signet_rule_on_signet`
-  - `crates/mining/src/coordinator/candidate_template_tests.rs` test
+  - `crates/mining/src/coordinator/candidate_template_tests.rs` tests
+    `template_facts_follow_mutated_candidate_generation`,
     `signet_template_carries_challenge_and_mandatory_rule`
   - `crates/node/tests/mining.rs` tests `template_does_not_echo_client_capabilities`,
     `signet_template_includes_challenge_and_signet_rule`
@@ -607,9 +609,10 @@ owned by [wallet-facing.md](wallet-facing.md).
     `getblocktemplate_rejects_mainnet_during_ibd`,
     `getblocktemplate_proposal_skips_mainnet_connection_gates`
 - `API-13`:
-  - `crates/rpc/src/handlers/mining.rs` tests `submitheader_rejects_undecodable_headers`,
-    `submitheader_returns_null_and_forwards_decoded_header`,
-    `submitheader_maps_rejected_to_verify_error`
+  - `crates/rpc/src/handlers/mining.rs` test
+    `submitheader_maps_armed_control_failure`; `e2e/tests/mining.rs` tests
+    `mining_rejections_carry_core_error_codes` (decode `-22`) and
+    `template_assembly_header_then_block` (null success)
   - `crates/node/tests/mining.rs` tests `submit_header_admits_a_mined_child_and_is_idempotent`,
     `submit_header_accepts_genesis_before_and_after_bootstrap`,
     `submit_header_requires_the_previous_header`,
