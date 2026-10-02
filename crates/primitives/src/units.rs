@@ -32,15 +32,6 @@ impl Amount {
         self.0
     }
 
-    /// Checked addition.
-    #[must_use]
-    pub const fn checked_add(self, rhs: Self) -> Option<Self> {
-        match self.0.checked_add(rhs.0) {
-            Some(sum) => Some(Self(sum)),
-            None => None,
-        }
-    }
-
     /// Saturating addition.
     #[must_use]
     pub const fn saturating_add(self, rhs: Self) -> Self {
