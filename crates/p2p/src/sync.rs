@@ -75,7 +75,8 @@ pub(crate) use frontier::{
     UsablePeer, header_request_live,
 };
 
-pub use crate::download_window::{SyncBudget, default_sync_budget};
+pub(crate) use crate::download_window::SyncBudget;
+pub use crate::download_window::default_sync_budget;
 
 #[cfg(test)]
 pub(crate) use crate::download_window::MIN_PEERS_FOR_FANOUT;
@@ -431,7 +432,7 @@ impl BlockSync {
     /// announcement wins, so a later vector cannot replace an unknown tip
     /// before header sync drains it — and a flooding peer cannot grow the
     /// queue past the live session set.
-    pub fn announce_block(&self, source: PeerSource, hash: Hash256) {
+    pub(crate) fn announce_block(&self, source: PeerSource, hash: Hash256) {
         self.block_announcements
             .lock()
             .entry(source)
@@ -466,7 +467,7 @@ impl BlockSync {
     ///   address alone, so a same-address replacement cannot claim its
     ///   predecessor's request.
     #[must_use]
-    pub fn owns_body_fetch(&self, source: PeerSource, hash: Hash256) -> bool {
+    pub(crate) fn owns_body_fetch(&self, source: PeerSource, hash: Hash256) -> bool {
         let scheduler = self.scheduler.lock();
         scheduler.window.pending_owner(&hash) == Some(source)
             || scheduler
