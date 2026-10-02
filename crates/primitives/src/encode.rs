@@ -21,15 +21,6 @@ impl Sink for Vec<u8> {
     }
 }
 
-/// Sink that only accumulates the byte count.
-pub(crate) struct CountSink<'a>(pub(crate) &'a mut usize);
-
-impl Sink for CountSink<'_> {
-    fn write_all(&mut self, bytes: &[u8]) {
-        *self.0 = self.0.saturating_add(bytes.len());
-    }
-}
-
 /// Sink that streams bytes into a SHA-256 engine without allocating.
 pub(crate) struct Sha256Sink<'a>(pub(crate) &'a mut Sha256);
 
@@ -102,14 +93,7 @@ pub trait ConsensusEncode {
     fn consensus_encode(&self, sink: &mut impl Sink);
 
     /// Consensus serialization length without allocating the encoded bytes.
-    ///
-    /// The default walks [`Self::consensus_encode`] into a counting sink.
-    /// Fixed-layout types override this with an analytic size.
-    fn consensus_size(&self) -> usize {
-        let mut total = 0_usize;
-        self.consensus_encode(&mut CountSink(&mut total));
-        total
-    }
+    fn consensus_size(&self) -> usize;
 }
 
 /// Bitcoin consensus decoding for native protocol types.
