@@ -18,7 +18,8 @@ use std::path::Path;
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
-use crate::{ColumnFamily, KvStore, StorageError, complete_framed_stats, is_block_file_name};
+use crate::block_file::{complete_framed_stats, is_block_file_name};
+use crate::{ColumnFamily, KvStore, StorageError};
 
 /// POSIX `st_blocks` unit: allocated bytes = `st_blocks * 512`.
 const ALLOCATED_BLOCK_BYTES: u64 = 512;
@@ -109,7 +110,7 @@ impl PhysicalObservationKind {
 
 /// Physical file-role category inside a namespace, or the unattributed residual.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum PhysicalCategory {
+pub(crate) enum PhysicalCategory {
     /// Primary payload of the namespace (SST tables, block files, checkpoint bytes).
     Data,
     /// Write-ahead / journal residue inside a key-value namespace.
@@ -123,7 +124,7 @@ pub enum PhysicalCategory {
 impl PhysicalCategory {
     /// Stable evidence spelling.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Data => "data",
             Self::Wal => "wal",
@@ -172,7 +173,7 @@ impl LogicalLedger {
     ///
     /// This is a logical-ledger total only. It is not a data-directory budget.
     #[must_use]
-    pub fn serialized_bytes(&self) -> u64 {
+    pub(crate) fn serialized_bytes(&self) -> u64 {
         self.owners.iter().fold(0, |total, owner| {
             total.saturating_add(owner.serialized_bytes)
         })
@@ -233,7 +234,7 @@ pub struct PhysicalLedger {
 impl PhysicalLedger {
     /// Peak used by a budget gate: high-water when present, otherwise the snapshot.
     #[must_use]
-    pub fn budget_bytes(&self) -> u64 {
+    pub(crate) fn budget_bytes(&self) -> u64 {
         self.high_water_allocated_bytes
             .unwrap_or(self.allocated_bytes)
     }
@@ -760,7 +761,7 @@ fn is_json_sidecar(name: &str) -> bool {
 }
 
 fn classify_inside(namespace: &str, rel_within: &str) -> PhysicalCategory {
-    if namespace == crate::BLOCK_FILE_DIRECTORY {
+    if namespace == crate::block_file::BLOCK_FILE_DIRECTORY {
         let name = rel_within.rsplit('/').next().unwrap_or(rel_within);
         if is_block_file_name(name) {
             return PhysicalCategory::Data;
@@ -808,7 +809,7 @@ fn logical_flat_block_files(root: BorrowedFd<'_>) -> Result<LogicalOwner, Footpr
     let root_stat = rfs::fstat(root)?;
     let blocks = match rfs::openat(
         root,
-        crate::BLOCK_FILE_DIRECTORY,
+        crate::block_file::BLOCK_FILE_DIRECTORY,
         nofollow_read() | OFlags::DIRECTORY,
         Mode::empty(),
     ) {
@@ -818,14 +819,18 @@ fn logical_flat_block_files(root: BorrowedFd<'_>) -> Result<LogicalOwner, Footpr
         }
         Err(Errno::LOOP) => {
             return Err(FootprintError::Symlink {
-                path: crate::BLOCK_FILE_DIRECTORY.to_owned(),
+                path: crate::block_file::BLOCK_FILE_DIRECTORY.to_owned(),
             });
         }
         Err(error) => return Err(error.into()),
     };
     let blocks_stat = rfs::fstat(&blocks)?;
-    require_directory(&blocks_stat, crate::BLOCK_FILE_DIRECTORY)?;
-    require_same_dev(&root_stat, &blocks_stat, crate::BLOCK_FILE_DIRECTORY)?;
+    require_directory(&blocks_stat, crate::block_file::BLOCK_FILE_DIRECTORY)?;
+    require_same_dev(
+        &root_stat,
+        &blocks_stat,
+        crate::block_file::BLOCK_FILE_DIRECTORY,
+    )?;
     let mut rows = 0_u64;
     let mut value_bytes = 0_u64;
     let mut entries = rfs::Dir::read_from(&blocks)?;
@@ -836,7 +841,7 @@ fn logical_flat_block_files(root: BorrowedFd<'_>) -> Result<LogicalOwner, Footpr
             .file_name()
             .to_str()
             .map_err(|_| FootprintError::InvalidName {
-                parent: crate::BLOCK_FILE_DIRECTORY.to_owned(),
+                parent: crate::block_file::BLOCK_FILE_DIRECTORY.to_owned(),
             })?;
         if name == "." || name == ".." {
             continue;
@@ -847,7 +852,7 @@ fn logical_flat_block_files(root: BorrowedFd<'_>) -> Result<LogicalOwner, Footpr
     }
     names.sort_unstable();
     for name in names {
-        let child_rel = format!("{}/{name}", crate::BLOCK_FILE_DIRECTORY);
+        let child_rel = format!("{}/{name}", crate::block_file::BLOCK_FILE_DIRECTORY);
         let listed = rfs::statat(blocks.as_fd(), name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
         require_regular_file(&listed, &child_rel)?;
         let child = match rfs::openat(

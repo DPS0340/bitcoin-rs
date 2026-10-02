@@ -46,13 +46,13 @@ use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
 use core::mem::size_of;
 
 /// Block-body pruning over persisted block rows.
-pub mod block_pruner;
+mod block_pruner;
 /// Retention leases that keep required history against pruning.
-pub mod lease;
+mod lease;
 /// Pruning policy shapes matching Bitcoin Core semantics.
-pub mod policy;
+mod policy;
 /// Undo-data pruning over persisted undo rows.
-pub mod undo_pruner;
+mod undo_pruner;
 
 pub use block_pruner::{BLOCK_DATA_CF, BlockPruner, block_body_key};
 pub use lease::{
@@ -158,13 +158,13 @@ impl ExecutedFrontier {
 
     /// The raw height: one past the highest deleted row.
     #[must_use]
-    pub const fn get(self) -> u32 {
+    pub(crate) const fn get(self) -> u32 {
         self.0
     }
 
     /// The monotonic join of two frontiers.
     #[must_use]
-    pub const fn advance(self, other: Self) -> Self {
+    pub(crate) const fn advance(self, other: Self) -> Self {
         if self.0 >= other.0 { self } else { other }
     }
 

@@ -35,7 +35,7 @@ pub const REDB_DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 /// redb-backed key-value store.
 pub struct RedbStore {
     db: Database,
-    faults: crate::PersistFaultSlot,
+    faults: crate::trait_::PersistFaultSlot,
 }
 
 impl RedbStore {
@@ -72,7 +72,7 @@ impl RedbStore {
         write_txn.commit().map_err(StorageError::backend)?;
         Ok(Self {
             db,
-            faults: crate::PersistFaultSlot::default(),
+            faults: crate::trait_::PersistFaultSlot::default(),
         })
     }
 
@@ -93,7 +93,7 @@ impl RedbStore {
             .record(crate::metric_f64_from_usize(batch.encoded_bytes));
 
         // Apply boundary: the atomic transaction commit.
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Apply) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Apply) {
             if fault == crate::PersistFault::PartialApply {
                 // A strict prefix of the batch is staged into a
                 // transaction that is dropped uncommitted: no family
@@ -107,7 +107,7 @@ impl RedbStore {
 
         // Sync boundary: the durability tier of the commit.
         if matches!(durability, Durability::Immediate) {
-            if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Sync) {
+            if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Sync) {
                 // The batch commits at the deferred tier; completion then
                 // faults or is lost.
                 let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
@@ -221,14 +221,14 @@ impl KvStore for RedbStore {
         }
         // Seam: the apply and sync boundaries of this commit. Condition
         // evaluation precedes both, so a mismatch never consumes a fault.
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Apply) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Apply) {
             if fault == crate::PersistFault::PartialApply {
                 apply_redb_ops(&write_txn, prefix_ops(batch.ops))?;
                 drop(write_txn);
             }
             return Err(fault.injected_error());
         }
-        let sync_fault = self.faults.take_at(crate::PersistBoundary::Sync);
+        let sync_fault = self.faults.take_at(crate::trait_::PersistBoundary::Sync);
         let durability = if sync_fault.is_some() {
             // The commit runs at the deferred tier; the completion fault or
             // loss is reported after the batch applies.
@@ -253,7 +253,7 @@ impl KvStore for RedbStore {
 
     fn flush(&self) -> Result<(), StorageError> {
         metrics::counter!("storage.flushes_total", "backend" => "redb").increment(1);
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Flush) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Flush) {
             return Err(fault.injected_error());
         }
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
@@ -278,7 +278,7 @@ impl KvStore for RedbStore {
 /// redb-backed transaction-index store using fixed-width physical tables.
 struct RedbTxIndexStore {
     db: Database,
-    faults: crate::PersistFaultSlot,
+    faults: crate::trait_::PersistFaultSlot,
 }
 
 impl RedbTxIndexStore {
@@ -344,7 +344,7 @@ impl RedbTxIndexStore {
         write_txn.commit().map_err(StorageError::backend)?;
         Ok(Self {
             db,
-            faults: crate::PersistFaultSlot::default(),
+            faults: crate::trait_::PersistFaultSlot::default(),
         })
     }
 
@@ -365,7 +365,7 @@ impl RedbTxIndexStore {
 
         // Same seam discipline as the main store: apply faults precede the
         // transaction, sync faults downgrade the commit tier.
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Apply) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Apply) {
             if fault == crate::PersistFault::PartialApply {
                 let write_txn = self.db.begin_write().map_err(StorageError::backend)?;
                 apply_txindex_ops(&write_txn, prefix_ops(batch.ops))?;
@@ -374,7 +374,7 @@ impl RedbTxIndexStore {
             return Err(fault.injected_error());
         }
         let sync_fault = if matches!(durability, Durability::Immediate) {
-            self.faults.take_at(crate::PersistBoundary::Sync)
+            self.faults.take_at(crate::trait_::PersistBoundary::Sync)
         } else {
             None
         };
@@ -482,14 +482,14 @@ impl KvStore for RedbTxIndexStore {
         }
         // Seam: the apply and sync boundaries of this commit, after every
         // condition matched. A mismatch consumes no fault.
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Apply) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Apply) {
             if fault == crate::PersistFault::PartialApply {
                 apply_txindex_ops(&write_txn, prefix_ops(batch.ops))?;
                 drop(write_txn);
             }
             return Err(fault.injected_error());
         }
-        let sync_fault = self.faults.take_at(crate::PersistBoundary::Sync);
+        let sync_fault = self.faults.take_at(crate::trait_::PersistBoundary::Sync);
         let durability = if sync_fault.is_some() {
             // The commit runs at the deferred tier; the completion fault or
             // loss is reported after the batch applies.
@@ -514,7 +514,7 @@ impl KvStore for RedbTxIndexStore {
 
     fn flush(&self) -> Result<(), StorageError> {
         metrics::counter!("storage.flushes_total", "backend" => "redb-txindex").increment(1);
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Flush) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Flush) {
             return Err(fault.injected_error());
         }
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;

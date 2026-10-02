@@ -19,7 +19,7 @@ pub struct RocksDbStore {
     db: rust_rocksdb::DB,
     // Non-reentrant: public mutators hold this lock while calling the lock-free batch helper.
     write_lock: parking_lot::Mutex<()>,
-    faults: crate::PersistFaultSlot,
+    faults: crate::trait_::PersistFaultSlot,
 }
 
 impl RocksDbStore {
@@ -71,7 +71,7 @@ impl RocksDbStore {
         Ok(Self {
             db,
             write_lock: parking_lot::Mutex::new(()),
-            faults: crate::PersistFaultSlot::default(),
+            faults: crate::trait_::PersistFaultSlot::default(),
         })
     }
 
@@ -116,11 +116,11 @@ impl RocksDbStore {
         count_write(durability, batch.encoded_bytes);
         // Same seam discipline as the primary backends: apply faults precede
         // the engine write, sync faults drop the durable write options.
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Apply) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Apply) {
             return Err(fault.injected_error());
         }
         let sync_fault = if sync {
-            self.faults.take_at(crate::PersistBoundary::Sync)
+            self.faults.take_at(crate::trait_::PersistBoundary::Sync)
         } else {
             None
         };
@@ -222,7 +222,7 @@ impl KvStore for RocksDbStore {
 
     fn flush(&self) -> Result<(), StorageError> {
         metrics::counter!("storage.flushes_total", "backend" => "rocksdb").increment(1);
-        if let Some(fault) = self.faults.take_at(crate::PersistBoundary::Flush) {
+        if let Some(fault) = self.faults.take_at(crate::trait_::PersistBoundary::Flush) {
             return Err(fault.injected_error());
         }
         self.db.flush_wal(true).map_err(StorageError::backend)

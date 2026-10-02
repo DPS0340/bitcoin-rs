@@ -98,7 +98,7 @@ impl AppliedTipWitness {
 /// Exactly one rollback event kind.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "kind", deny_unknown_fields)]
-pub enum RollbackEventKind {
+pub(crate) enum RollbackEventKind {
     /// The durable applied-tip witness is ahead of the restored tip.
     CheckpointFallback {
         /// Restored applied-tip height.
@@ -134,7 +134,7 @@ pub enum RollbackEventKind {
 /// Last-event-wins. The prior valid event is preserved as `.prev`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
-pub struct ChainRollbackEvent {
+pub(crate) struct ChainRollbackEvent {
     /// Format identifier.
     pub format: String,
     /// Genesis block hash in hex.
@@ -149,7 +149,7 @@ pub struct ChainRollbackEvent {
 
 impl ChainRollbackEvent {
     /// Creates an event detected by `detecting_epoch` at `time`.
-    pub fn new(
+    pub(crate) fn new(
         genesis_hash: impl Into<String>,
         detecting_epoch: u64,
         time: u64,
@@ -261,7 +261,7 @@ pub fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), Evid
 }
 
 /// Publishes a rollback marker atomically. Last-event-wins.
-pub fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
+pub(crate) fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
     write_sidecar(dir, MARKER_FILE, &serde_json::to_string(event)?, |data| {
         ChainRollbackEvent::decode(data, &event.genesis_hash).is_some()
     })

@@ -34,7 +34,7 @@ pub const UTXO_FILE: &str = "utxo-v4.dat";
 /// Coin statistics artifact filename.
 pub const COINSTATS_FILE: &str = "coinstats-v1.dat";
 /// Expected format identifier for the CURRENT pointer.
-pub const CURRENT_FORMAT: &str = "bitcoin-rs-chainstate-current";
+pub(crate) const CURRENT_FORMAT: &str = "bitcoin-rs-chainstate-current";
 /// Expected format identifier for checkpoint manifests.
 pub const MANIFEST_FORMAT: &str = "bitcoin-rs-chainstate-checkpoint";
 /// Codec identifier for canonical header artifacts.
@@ -44,7 +44,7 @@ pub const UTXO_CODEC: &str = "bitcoin-rs-utxo-spendable-v1";
 /// Codec identifier for `CoinStats` artifacts.
 pub const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats-v1";
 /// CURRENT pointer schema version.
-pub const CURRENT_VERSION: u32 = 1;
+pub(crate) const CURRENT_VERSION: u32 = 1;
 /// Checkpoint manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;
 /// UTXO artifact schema version.
@@ -58,9 +58,9 @@ pub const COINSTATS_PAYLOAD_LEN: u32 = 804;
 /// Complete `CoinStats` artifact length in bytes.
 pub const COINSTATS_ARTIFACT_LEN: u64 = 820;
 /// Maximum accepted checkpoint artifact payload size in bytes.
-pub const MAX_CHECKPOINT_PAYLOAD_BYTES: u64 = 64_u64 * 1024 * 1024 * 1024;
+pub(crate) const MAX_CHECKPOINT_PAYLOAD_BYTES: u64 = 64_u64 * 1024 * 1024 * 1024;
 /// Maximum accepted checkpoint metadata size in bytes.
-pub const MAX_CHECKPOINT_METADATA_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_CHECKPOINT_METADATA_BYTES: u64 = 1024 * 1024;
 const CHECKPOINT_WRITE_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Authenticated pointer to the currently published checkpoint generation.
