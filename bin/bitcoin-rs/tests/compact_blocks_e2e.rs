@@ -21,9 +21,6 @@
 
 #![expect(clippy::expect_used, reason = "process test assertions")]
 
-#[path = "support/wire.rs"]
-mod wire;
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write as _;
@@ -44,10 +41,21 @@ use bitcoin_rs_e2e::helpers::{
     best_hash, block_count, build_chain, genesis_block, segwit_coinbase_block, wait_for,
 };
 use bitcoin_rs_e2e::node::workspace;
-use bitcoin_rs_e2e::process_peer::{FrameBuffer, connect_loopback, decode_frame, read_frame};
+use bitcoin_rs_e2e::process_peer::{
+    FrameBuffer, connect_loopback, decode_frame, is_soft_recv_error, read_frame,
+};
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
 use serde_json::json;
-use wire::{is_soft_recv_error, remaining};
+
+/// The remaining slice of `deadline` as a socket timeout, or an error
+/// naming `message` once the deadline has already passed.
+fn remaining(deadline: Instant, message: &str) -> Result<Option<Duration>, Error> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| *d >= Duration::from_micros(1))
+        .map(Some)
+        .ok_or_else(|| Error::Protocol(format!("{message} ran past the deadline")))
+}
 
 /// Blocks applied before the serving probes: deep enough that a request 11
 /// below the tip exists on the active chain.

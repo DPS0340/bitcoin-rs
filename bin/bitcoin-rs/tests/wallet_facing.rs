@@ -17,14 +17,16 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bitcoin_rs_e2e::helpers::assemble_block_from_template;
+use bitcoin_rs_e2e::helpers::{
+    COINBASE_MATURITY, REGTEST_SUBSIDY_SATS, assemble_block_from_template,
+};
 use bitcoin_rs_e2e::node::HttpResponse;
 use bitcoin_rs_e2e::rpc::Connection;
 
 use bitcoin::absolute::LockTime;
 
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::constants::{COINBASE_MATURITY, genesis_block};
+use bitcoin::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
 use bitcoin::opcodes::all::OP_PUSHNUM_1;
@@ -40,7 +42,6 @@ use serde_json::{Value, json};
 const RPC_USER: &str = "bitcoin-rs";
 const RPC_PASSWORD: &str = "bitcoin-rs";
 const FEE_SATS: u64 = 10_000;
-const REGTEST_SUBSIDY_SATS: u64 = 5_000_000_000;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const INDEX_TIMEOUT: Duration = Duration::from_mins(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
