@@ -106,16 +106,21 @@ def _mask_rust_raw_strings(text: str) -> str:
 
 
 def _commands(source: Path) -> dict[str, bytes]:
-    text = _mask_rust_raw_strings(_strip_rust_comments(source.read_text()))
+    stripped = _strip_rust_comments(source.read_text())
+    # The mask preserves offsets (raw-string bodies -> spaces, newlines kept), so
+    # a span found in the masked text indexes the same range in `stripped`.
+    masked = _mask_rust_raw_strings(stripped)
     table = re.search(
         r"pub\s+const\s+COMMANDS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
-        text, re.S,
+        masked, re.S,
     )
     if table is None:
         raise ValueError("Cannot find the P2P COMMANDS inventory")
-    commands = re.findall(r'"([a-z0-9]{1,12})"', table.group(1))
+    table_source = stripped[table.start(1):table.end(1)]
+    prefix = r'(?:br|cr|b)?r?#*'
+    commands = re.findall(prefix + r'"([a-z0-9]{1,12})"', table_source)
     if (not commands or len(commands) > 256 or len(set(commands)) != len(commands)
-            or len(commands) != len(re.findall(r'"[^"]*"', table.group(1)))):
+            or len(commands) != len(re.findall(prefix + r'"[^"]*"', table_source))):
         raise ValueError("Invalid P2P COMMANDS inventory")
     return {name: bytes([index]) for index, name in enumerate(commands)}
 
