@@ -10,7 +10,7 @@ use sonic_rs::{Value, json};
 use crate::tx_render::transaction_json;
 
 /// Applied-chain facts required to project a header or block.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct BlockChainContext {
     /// Height of this block on the applied chain when active; still reported
     /// for known headers that are not active.
@@ -30,7 +30,7 @@ pub(crate) struct BlockChainContext {
 }
 
 /// Transaction array shape for `getblock` verbosity levels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BlockTxVerbosity {
     /// Verbosity 1: array of txid strings.
     Ids,

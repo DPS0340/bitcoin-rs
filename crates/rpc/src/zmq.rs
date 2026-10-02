@@ -138,7 +138,7 @@ impl ZmqTopic {
 }
 
 /// Event published on Core's unified `sequence` topic.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum SequenceEvent {
     /// A block was connected.
     Connected(Hash256),

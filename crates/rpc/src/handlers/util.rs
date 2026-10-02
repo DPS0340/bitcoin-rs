@@ -333,7 +333,7 @@ fn with_checksum(canonical: &str) -> String {
 /// will send money to, so Core passes `require_checksum = true` -- a mistyped
 /// descriptor derives perfectly good addresses that nobody holds the keys for,
 /// and the checksum is the only thing standing between a typo and that.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ChecksumRequirement {
     /// Accept a descriptor with no checksum; verify one that is present.
     Optional,
@@ -488,7 +488,7 @@ pub(crate) fn strip_addr_wrapper(payload: &str) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 /// What `getdescriptorinfo` reports about a descriptor.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct DescriptorInfo {
     /// Canonical form, with private keys replaced by their public counterparts.
     ///

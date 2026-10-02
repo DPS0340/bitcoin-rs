@@ -64,7 +64,6 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone)]
 struct HeaderRecord {
     hash: Hash256,
     height: u32,

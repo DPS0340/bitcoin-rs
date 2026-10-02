@@ -763,7 +763,7 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     })
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 struct FeeFields {
     avgfee: u64,
     avgfeerate: u64,
@@ -1215,7 +1215,7 @@ pub(crate) fn getcapabilities(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     Ok(json!({ "capabilities": snapshot.capabilities }))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ScanScript {
     script_pubkey: Vec<u8>,
     desc: String,

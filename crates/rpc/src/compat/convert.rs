@@ -336,7 +336,7 @@ pub(crate) fn coinbase_transaction_typed(
 }
 
 /// Confirmed-chain context attached to a verbose transaction projection.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct VerboseTxChain {
     /// Confirming block hash.
     pub block_hash: String,

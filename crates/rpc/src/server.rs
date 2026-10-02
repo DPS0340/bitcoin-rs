@@ -588,7 +588,7 @@ fn split_path_query(path: &str) -> (&str, &str) {
 }
 
 /// Listener directories; see `docs/contracts/wallet-facing.md` WF-02.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum HttpRoute<'a> {
     Rest {
         path: &'a str,
@@ -616,7 +616,7 @@ enum HttpSurface {
     EsploraBackend,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum CorsPolicy {
     Disabled,
     Public {

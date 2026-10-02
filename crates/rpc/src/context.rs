@@ -88,7 +88,7 @@ use bitcoin_rs_index::block_log::{BlockLog, BlockRecord, record_at_height, recor
 use bitcoin_rs_index::query_api::RollbackWarningSource;
 
 /// Typed synchronization progress behind `getblockchaininfo`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct SyncProgress {
     /// Consensus network the node follows.
     pub network: Network,
@@ -128,14 +128,14 @@ pub struct PruneStatus {
 }
 
 /// Summary of one completed manual prune request.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct PruneResult {
     /// Highest prune height now recorded by the service.
     pub pruneheight: u32,
 }
 
 /// Error returned by the node-owned pruning implementation.
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PruneServiceError {
     /// Storage or backend-specific pruning failure.
     #[error("{0}")]
