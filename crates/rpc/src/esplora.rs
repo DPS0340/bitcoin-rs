@@ -1,12 +1,10 @@
 //! Esplora HTTP projections over confirmed indexes and the live mempool.
-#![allow(
+#![expect(
     clippy::as_conversions,
     clippy::cast_precision_loss,
-    clippy::map_unwrap_or,
     clippy::needless_borrow,
     clippy::needless_pass_by_value,
     clippy::redundant_closure_for_method_calls,
-    clippy::semicolon_if_nothing_returned,
     clippy::significant_drop_in_scrutinee,
     clippy::unnecessary_semicolon
 )]

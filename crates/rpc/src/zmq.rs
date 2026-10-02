@@ -138,7 +138,7 @@ impl ZmqTopic {
 }
 
 /// Event published on Core's unified `sequence` topic.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum SequenceEvent {
     /// A block was connected.
     Connected(Hash256),
@@ -244,7 +244,7 @@ pub trait ZmqPublisher: Send + Sync + core::fmt::Debug {
 /// Default no-op implementation. All methods discard their input silently.
 ///
 /// Use this when ZMQ notifications are not configured.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug)]
 pub struct NoOpZmqPublisher;
 
 impl ZmqPublisher for NoOpZmqPublisher {
@@ -267,8 +267,6 @@ impl ZmqPublisher for NoOpZmqPublisher {
     fn publish_rawblock(&self, _bytes: &[u8]) {}
 
     fn publish_rawtx(&self, _bytes: &[u8]) {}
-
-    fn publish_sequence(&self, _event: SequenceEvent) {}
 }
 
 #[cfg(feature = "zmq")]
@@ -472,7 +470,7 @@ impl ZmqPublisher for SocketZmqPublisher {
 /// Body frame for a `hashblock`/`hashtx`/`sequence` event: the hash or txid's
 /// natural byte order reversed for the wire.
 #[cfg(any(feature = "zmq", test))]
-pub(crate) fn reversed_hash_body(mut bytes: [u8; 32]) -> [u8; 32] {
+fn reversed_hash_body(mut bytes: [u8; 32]) -> [u8; 32] {
     bytes.reverse();
     bytes
 }
@@ -482,7 +480,7 @@ pub(crate) fn reversed_hash_body(mut bytes: [u8; 32]) -> [u8; 32] {
 /// as a little-endian u64. The transport's own 4-byte counter stays in its
 /// separate trailing frame.
 #[cfg(any(feature = "zmq", test))]
-pub(crate) fn sequence_payload(event: SequenceEvent) -> Vec<u8> {
+fn sequence_payload(event: SequenceEvent) -> Vec<u8> {
     match event {
         SequenceEvent::Added(txid, mempool_sequence)
         | SequenceEvent::Removed(txid, mempool_sequence) => {

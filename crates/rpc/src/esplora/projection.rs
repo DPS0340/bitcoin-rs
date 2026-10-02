@@ -41,7 +41,6 @@ impl From<Confirmation> for TransactionStatus {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct ConfirmedActivity {
     pub record: ScriptHistoryRecord,
     pub confirmation: Confirmation,
