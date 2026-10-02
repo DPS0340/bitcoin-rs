@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 
 use crate::checker::{SigVersion, TxSignatureChecker};
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
-use crate::script::{Instruction, instructions, opcode, push_data};
+use crate::script::{Instruction, instructions, minimal_push, opcode, push_data};
 use crate::stack::{ScriptItem, Stack};
 
 use bitcoin_hashes::{Hash as _, ripemd160, sha1};
@@ -176,8 +176,6 @@ type Bytes = SmallVec<[u8; 32]>;
 /// A condition stack mirroring Core's `ConditionStack`: tracks only whether
 /// every open `IF` level is executing.
 struct ConditionStack {
-    /// Levels currently open; the top is the innermost.
-    all_true: bool,
     /// Position (from the bottom) of the first `false` level, if any.
     first_false: Option<usize>,
     size: usize,
@@ -186,14 +184,13 @@ struct ConditionStack {
 impl ConditionStack {
     fn new() -> Self {
         Self {
-            all_true: true,
             first_false: None,
             size: 0,
         }
     }
 
     fn all_true(&self) -> bool {
-        self.all_true
+        self.first_false.is_none()
     }
 
     fn is_empty(&self) -> bool {
@@ -203,7 +200,6 @@ impl ConditionStack {
     fn push(&mut self, value: bool) {
         if self.first_false.is_none() && !value {
             self.first_false = Some(self.size);
-            self.all_true = false;
         }
         self.size += 1;
     }
@@ -212,20 +208,13 @@ impl ConditionStack {
         self.size -= 1;
         if self.first_false == Some(self.size) {
             self.first_false = None;
-            self.all_true = true;
         }
     }
 
     fn toggle_top(&mut self) {
         match self.first_false {
-            None => {
-                self.first_false = Some(self.size - 1);
-                self.all_true = false;
-            }
-            Some(pos) if pos == self.size - 1 => {
-                self.first_false = None;
-                self.all_true = true;
-            }
+            None => self.first_false = Some(self.size - 1),
+            Some(pos) if pos == self.size - 1 => self.first_false = None,
             Some(_) => {}
         }
     }
@@ -348,14 +337,6 @@ pub(crate) fn eval_script(
     validation_weight_left: &mut Option<i64>,
     tapleaf_hash: Option<&Hash256>,
 ) -> Result<(), ScriptError> {
-    debug_assert!(
-        matches!(
-            sigversion,
-            SigVersion::Base | SigVersion::WitnessV0 | SigVersion::Tapscript
-        ),
-        "taproot key-path admits no script execution"
-    );
-
     // BIP342: OP_SUCCESSx opcodes make the script unconditionally valid.
     // This scan runs before any other check (including stack element size
     // limits) and overrides everything. Mirrors Core's ExecuteWitnessScript.
@@ -397,9 +378,9 @@ pub(crate) fn eval_script(
     // Byte offset of the instruction start, tracked for codeseparator
     // positioning relative to the whole script.
     let mut instruction_start: usize = 0;
-    let mut remaining = script;
+    let mut iter = instructions(script);
 
-    while let Some(parsed) = instructions(remaining).next() {
+    while let Some(parsed) = iter.next() {
         let instruction = match parsed {
             Ok(instruction) => instruction,
             // Core's GetOp returning false is a BAD_OPCODE.
@@ -411,7 +392,8 @@ pub(crate) fn eval_script(
         };
         let opcode_byte = match instruction {
             Instruction::PushBytes(data) => {
-                let opcode_byte = push_opcode_for(remaining)?;
+                // The instruction's head byte is the push opcode.
+                let opcode_byte = script[instruction_start];
                 // Core checks push size unconditionally (interpreter.cpp:457),
                 // before testing fExec — a >520-byte push in a non-executed
                 // branch is still PUSH_SIZE.
@@ -423,8 +405,7 @@ pub(crate) fn eval_script(
                 if conditions.all_true() {
                     // Core checks MINIMALDATA only in executed branches
                     // (interpreter.cpp:489, inside `if (fExec && ... <= OP_PUSHDATA4)`).
-                    if flags.contains(VerifyFlags::MINIMALDATA)
-                        && !check_minimal_push(data, opcode_byte)
+                    if flags.contains(VerifyFlags::MINIMALDATA) && !minimal_push(data, opcode_byte)
                     {
                         return Err(ScriptError::Invalid {
                             code: ScriptErrCode::MinimalData,
@@ -432,19 +413,11 @@ pub(crate) fn eval_script(
                     }
                     push_bytes(stack, data)?;
                 }
-                advance(&mut remaining, opcode_byte, data.len());
-                instruction_start = script.len() - remaining.len();
+                instruction_start = script.len() - iter.remaining.len();
                 continue;
             }
             Instruction::Op(op) => op,
         };
-
-        let executed_push = opcode_byte <= opcode::OP_PUSHDATA4;
-        if executed_push {
-            // Handled above; unreachable for Op(_) variant, kept for parity.
-            advance(&mut remaining, opcode_byte, 0);
-            continue;
-        }
 
         if sigversion == SigVersion::Base || sigversion == SigVersion::WitnessV0 {
             // OP_RESERVED does not count towards the opcode limit.
@@ -502,8 +475,7 @@ pub(crate) fn eval_script(
             });
         }
 
-        advance(&mut remaining, opcode_byte, 0);
-        instruction_start = script.len() - remaining.len();
+        instruction_start = script.len() - iter.remaining.len();
     }
 
     if !conditions.is_empty() {
@@ -512,42 +484,6 @@ pub(crate) fn eval_script(
         });
     }
     Ok(())
-}
-
-/// Advances `remaining` past the instruction that starts with `op` and, for
-/// pushes, carries `data_len` payload bytes.
-fn advance(remaining: &mut &[u8], op: u8, data_len: usize) {
-    let header = if (0x01..=0x4b).contains(&op) {
-        1
-    } else {
-        match op {
-            opcode::OP_PUSHDATA1 => 2,
-            opcode::OP_PUSHDATA2 => 3,
-            opcode::OP_PUSHDATA4 => 5,
-            _ => 1,
-        }
-    };
-    *remaining = remaining.get(header + data_len..).unwrap_or_default();
-}
-
-/// Returns the push opcode byte at the head of `remaining` for a
-/// `PushBytes` instruction, reconstructing it from the length encoding.
-fn push_opcode_for(remaining: &[u8]) -> Result<u8, ScriptError> {
-    let head = remaining.first().copied().ok_or(ScriptError::Invalid {
-        code: ScriptErrCode::BadOpcode,
-    })?;
-    if (0x01..=0x4b).contains(&head) {
-        Ok(head)
-    } else {
-        match head {
-            opcode::OP_PUSHDATA1 | opcode::OP_PUSHDATA2 | opcode::OP_PUSHDATA4 | opcode::OP_0 => {
-                Ok(head)
-            }
-            _ => Err(ScriptError::Invalid {
-                code: ScriptErrCode::BadOpcode,
-            }),
-        }
-    }
 }
 
 /// Pushes raw bytes as a stack item, bounding the stack.
@@ -594,34 +530,6 @@ const fn is_op_success(op: u8) -> bool {
         || (op >= 187 && op <= 254)
 }
 
-/// Core's `CheckMinimalPush`.
-fn check_minimal_push(data: &[u8], op: u8) -> bool {
-    if data.is_empty() {
-        // Should have used OP_0.
-        return op == opcode::OP_0;
-    }
-    let first = data.first().copied().unwrap_or(0);
-    if data.len() == 1 && (1..=16).contains(&first) {
-        // Should have used OP_1 .. OP_16.
-        return false;
-    }
-    if data.len() == 1 && first == 0x81 {
-        // Should have used OP_1NEGATE.
-        return false;
-    }
-    if data.len() <= 75 {
-        // Must have used a direct push.
-        return usize::from(op) == data.len();
-    }
-    if data.len() <= 255 {
-        return op == opcode::OP_PUSHDATA1;
-    }
-    if data.len() <= 65535 {
-        return op == opcode::OP_PUSHDATA2;
-    }
-    true
-}
-
 /// Executes one opcode. `f_exec` reports whether the enclosing conditional
 /// stack is active; most arms are skipped otherwise, but `IF`-family
 /// opcodes still drive the condition stack.
@@ -649,9 +557,6 @@ fn dispatch(
     tapleaf_hash: Option<&Hash256>,
     script: &[u8],
 ) -> Result<(), ScriptError> {
-    if !f_exec && !(OP_IF..=OP_ENDIF).contains(&op) {
-        return Ok(());
-    }
     let invalid_stack = || ScriptError::Invalid {
         code: ScriptErrCode::InvalidStackOperation,
     };
@@ -828,10 +733,15 @@ fn dispatch(
             })?;
         }
         OP_2ROT => {
-            let top_six = stack.drain(6).map_err(|_| invalid_stack())?;
-            let x1 = top_six.first().cloned().unwrap_or_default();
-            let x2 = top_six.get(1).cloned().unwrap_or_default();
-            for item in top_six.into_iter().skip(2) {
+            // drain(6) can only succeed with a full six items.
+            let mut top_six = stack.drain(6).map_err(|_| invalid_stack())?.into_iter();
+            let x1 = top_six
+                .next()
+                .unwrap_or_else(|| unreachable!("drain(6) yields six items"));
+            let x2 = top_six
+                .next()
+                .unwrap_or_else(|| unreachable!("drain(6) yields six items"));
+            for item in top_six {
                 stack.push(item).map_err(|_| ScriptError::Invalid {
                     code: ScriptErrCode::StackSize,
                 })?;
@@ -1163,56 +1073,24 @@ fn remove_all(haystack: &[u8], needle: &[u8]) -> (Vec<u8>, usize) {
     }
     let mut out = Vec::with_capacity(haystack.len());
     let mut removed = 0_usize;
-    let mut cursor = haystack;
-    while !cursor.is_empty() {
-        let consumed = instruction_len(cursor);
-        let (instr, rest) = cursor.split_at(consumed);
-        if instr == needle {
+    let mut iter = instructions(haystack);
+    let mut start = 0_usize;
+    while let Some(item) = iter.next() {
+        // A malformed tail is one instruction: it is compared and emitted
+        // whole, the same span Core's failed GetOp leaves behind.
+        let end = if item.is_err() {
+            haystack.len()
+        } else {
+            haystack.len() - iter.remaining.len()
+        };
+        if haystack[start..end] == *needle {
             removed += 1;
         } else {
-            out.extend_from_slice(instr);
+            out.extend_from_slice(&haystack[start..end]);
         }
-        cursor = rest;
+        start = end;
     }
     (out, removed)
-}
-
-/// Returns the total byte length of the instruction at the head of `script`.
-fn instruction_len(script: &[u8]) -> usize {
-    let Some(&op) = script.first() else {
-        return 0;
-    };
-    let (header, payload) = if (0x01..=0x4b).contains(&op) {
-        (1_usize, usize::from(op))
-    } else {
-        match op {
-            opcode::OP_PUSHDATA1 => {
-                let len = usize::from(script.get(1).copied().unwrap_or(0));
-                (2, len)
-            }
-            opcode::OP_PUSHDATA2 => {
-                let len = u16::from_le_bytes([
-                    script.get(1).copied().unwrap_or(0),
-                    script.get(2).copied().unwrap_or(0),
-                ]);
-                (3, usize::from(len))
-            }
-            opcode::OP_PUSHDATA4 => {
-                let bytes = [
-                    script.get(1).copied().unwrap_or(0),
-                    script.get(2).copied().unwrap_or(0),
-                    script.get(3).copied().unwrap_or(0),
-                    script.get(4).copied().unwrap_or(0),
-                ];
-                // u32 always fits in usize (>= 32 bits) on supported targets.
-                let wide = u64::from(u32::from_le_bytes(bytes));
-                let len = usize::try_from(wide).unwrap_or(usize::MAX);
-                (5, len)
-            }
-            _ => (1, 0),
-        }
-    };
-    header.saturating_add(payload).min(script.len())
 }
 
 /// Core's `EvalChecksig`: dispatches to pre-tapscript (ECDSA) or tapscript
@@ -1276,7 +1154,6 @@ fn eval_checksig(
                     success = checker.check_schnorr_signature(
                         sig,
                         pubkey,
-                        sigversion,
                         tapleaf_hash,
                         codeseparator_pos,
                     )?;
@@ -1288,7 +1165,6 @@ fn eval_checksig(
             }
             Ok(success)
         }
-        SigVersion::Taproot => Ok(false),
     }
 }
 
@@ -1404,11 +1280,12 @@ fn check_multisig(
         }
     }
 
-    // Clean up the actual arguments (keys + sigs + the two counts).
+    // Clean up the actual arguments (keys + sigs + the two counts). The last
+    // `sigs` pops are the signature operands; NULLFAIL requires them empty
+    // on failure.
     let mut args = keys + sigs + 2;
-    let mut key_scan = keys + 2;
     while args > 0 {
-        if !success && flags.contains(VerifyFlags::NULLFAIL) && key_scan == 0 {
+        if !success && flags.contains(VerifyFlags::NULLFAIL) && args <= sigs {
             let top = stack.peek().map_err(|_| invalid_stack())?;
             if !item_bytes(top).is_empty() {
                 return Err(ScriptError::Invalid {
@@ -1416,7 +1293,6 @@ fn check_multisig(
                 });
             }
         }
-        key_scan = key_scan.saturating_sub(1);
         stack.pop().map_err(|_| invalid_stack())?;
         args -= 1;
     }

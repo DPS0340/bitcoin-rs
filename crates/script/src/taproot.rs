@@ -28,7 +28,7 @@ pub const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
 
 /// Verifies a taproot key-path Schnorr signature.
 #[must_use]
-pub fn verify_taproot_keypath(
+pub(crate) fn verify_taproot_keypath(
     signature: &Signature,
     message: &Message,
     public_key: &XOnlyPublicKey,
