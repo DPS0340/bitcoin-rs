@@ -13,6 +13,7 @@ use bitcoin_rs_primitives::{
     Amount, Script, Sighash, SighashCache, Tx, TxOut, Witness, varint::encoded_len,
 };
 use secp256k1::{Message, XOnlyPublicKey, schnorr::Signature};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::checker::{SigVersion, TxSignatureChecker};
@@ -686,7 +687,6 @@ fn p2wpkh_script_code(program: &[u8]) -> Vec<u8> {
 }
 
 fn sha256_of(bytes: &[u8]) -> [u8; 32] {
-    use sha2::{Digest as _, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher.finalize().into()
