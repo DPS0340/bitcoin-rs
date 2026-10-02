@@ -458,17 +458,13 @@ pub fn verify_block_input_scripts(
     let unit = prepare_block_script_checks(view, height, locktime_cutoff, flags, parsed)?;
     timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
 
+    // Timing covers only the check run: the ordered scan below is serial
+    // attribution work, not parallel script execution.
+    let unit_slice = core::slice::from_ref(&unit);
     let parallel_started = Instant::now();
-    let mut set_parallel_seconds = || {
-        timings.parallel_seconds = parallel_started.elapsed().as_secs_f64();
-    };
-    let mut before_serial_scan = || {};
-    let verdict = verify_prepared_units_with_hooks(
-        core::slice::from_ref(&unit),
-        &mut set_parallel_seconds,
-        &mut before_serial_scan,
-    );
-    verdict.map_err(|failure| failure.error)
+    let results = run_prepared_checks(unit_slice);
+    timings.parallel_seconds = parallel_started.elapsed().as_secs_f64();
+    first_unit_failure(unit_slice, &results).map_err(|failure| failure.error)
 }
 
 /// One block's script checks, prepared but not executed.
@@ -536,19 +532,38 @@ where
     })
 }
 
-fn verify_prepared_units_with_hooks<AfterParallel, BeforeSerialScan>(
+/// Runs every unit's retained checks flat, in unit order, sharing the
+/// script-verify thread pool above the parallel threshold. Results align
+/// index-for-index with each unit's [`InputCheck`]s in the flattened order.
+fn run_prepared_checks(units: &[BlockScriptChecks<'_>]) -> Vec<Result<(), ConsensusError>> {
+    let run = |(unit_index, check): &(usize, &InputCheck)| check_input(&units[*unit_index], check);
+    let flat: Vec<(usize, &InputCheck)> = units
+        .iter()
+        .enumerate()
+        .flat_map(|(index, unit)| unit.checks.iter().map(move |check| (index, check)))
+        .collect();
+    if flat.len() < MIN_PARALLEL_SCRIPT_CHECKS {
+        flat.iter().map(run).collect()
+    } else {
+        SCRIPT_VERIFY_POOL.install(|| flat.par_iter().map(run).collect())
+    }
+}
+
+/// Scans `results` in unit order and reports the first failure.
+///
+/// Offsets are precomputed rather than accumulated during the scan. With a
+/// running counter, reversing the scan order misaligns every slice instead
+/// of simply reporting a different unit, which hides an ordering bug behind
+/// an unrelated symptom and lets an ordering test pass for the wrong reason.
+///
+/// # Errors
+/// Returns the first [`BatchScriptFailure`] in the supplied unit order, or an
+/// internal layout failure when retained checks and their results do not
+/// correspond.
+fn first_unit_failure(
     units: &[BlockScriptChecks<'_>],
-    after_parallel: &mut AfterParallel,
-    before_serial_scan: &mut BeforeSerialScan,
-) -> Result<(), BatchScriptFailure>
-where
-    AfterParallel: FnMut(),
-    BeforeSerialScan: FnMut(),
-{
-    // Offsets are precomputed rather than accumulated during the scan. With a
-    // running counter, reversing the scan order misaligns every slice instead
-    // of simply reporting a different unit, which hides an ordering bug behind
-    // an unrelated symptom and lets an ordering test pass for the wrong reason.
+    results: &[Result<(), ConsensusError>],
+) -> Result<(), BatchScriptFailure> {
     let mut offsets = Vec::with_capacity(units.len());
     let mut total = 0_usize;
     for unit in units {
@@ -558,26 +573,6 @@ where
         };
         total = next;
     }
-
-    let run = |(unit_index, check): &(usize, &InputCheck)| {
-        let unit = &units[*unit_index];
-        check_input(&unit.prepared, check, unit.flags)
-    };
-    let flat: Vec<(usize, &InputCheck)> = units
-        .iter()
-        .enumerate()
-        .flat_map(|(index, unit)| unit.checks.iter().map(move |check| (index, check)))
-        .collect();
-    let results: Vec<Result<(), ConsensusError>> = if total < MIN_PARALLEL_SCRIPT_CHECKS {
-        flat.iter().map(run).collect()
-    } else {
-        SCRIPT_VERIFY_POOL.install(|| flat.par_iter().map(run).collect())
-    };
-
-    // Timing must stop here: the ordered scan below is serial attribution work,
-    // not parallel script execution.
-    after_parallel();
-    before_serial_scan();
 
     for (unit_index, unit) in units.iter().enumerate() {
         let from = offsets[unit_index];
@@ -608,9 +603,8 @@ where
 /// Returns the first [`BatchScriptFailure`] in the supplied unit order, or an
 /// internal layout failure when retained checks and their results do not correspond.
 pub fn verify_prepared_units(units: &[BlockScriptChecks<'_>]) -> Result<(), BatchScriptFailure> {
-    let mut after = || {};
-    let mut before = || {};
-    verify_prepared_units_with_hooks(units, &mut after, &mut before)
+    let results = run_prepared_checks(units);
+    first_unit_failure(units, &results)
 }
 
 /// Reports an internal prepared-check layout mismatch.
@@ -767,12 +761,8 @@ fn prepare_block_input_checks<'b>(
 /// Runs one deferred input's script verdict against its retained state, under
 /// the engine that prepared it. Only the backend dispatches here; the ordered
 /// pipeline around it is shared and engine-free.
-fn check_input(
-    prepared: &[PreparedTx<'_>],
-    check: &InputCheck,
-    flags: VerifyFlags,
-) -> Result<(), ConsensusError> {
-    let prep = &prepared[check.prepared_index];
+fn check_input(unit: &BlockScriptChecks<'_>, check: &InputCheck) -> Result<(), ConsensusError> {
+    let prep = &unit.prepared[check.prepared_index];
     let script_state = prep.script_state.as_ref().ok_or_else(|| {
         ConsensusError::Kernel("clean non-coinbase tx lost prepared script state".to_owned())
     })?;
@@ -781,7 +771,7 @@ fn check_input(
         &prep.spent_outputs,
         prep.tx,
         check.input_index,
-        flags,
+        unit.flags,
     )
 }
 
@@ -2068,49 +2058,6 @@ mod tests {
             result.is_ok(),
             "expected portable taproot script-path acceptance, got {result:?}"
         );
-    }
-
-    #[test]
-    fn parallel_timing_is_captured_before_ordered_error_scan() {
-        use std::cell::Cell;
-
-        let shared_tx = Tx {
-            version: 2,
-            lock_time: LockTime::ZERO,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-        };
-        let prepared: Vec<super::PreparedTx<'_>> = (0..10)
-            .map(|_| super::PreparedTx {
-                tx: &shared_tx,
-                spent_outputs: Vec::new(),
-                pre_error: None,
-                post_error: None,
-                checks_start: 0,
-                checks_len: 0,
-                script_state: None,
-            })
-            .collect();
-        let unit = super::BlockScriptChecks {
-            prepared,
-            checks: Vec::new(),
-            flags: VerifyFlags::MANDATORY,
-        };
-        let scan_started = Cell::new(false);
-        let mut before_serial_scan = || scan_started.set(true);
-        let mut after_parallel = || {
-            assert!(
-                !scan_started.get(),
-                "parallel timing hook must run before the serial error scan"
-            );
-        };
-        let result = super::verify_prepared_units_with_hooks(
-            core::slice::from_ref(&unit),
-            &mut after_parallel,
-            &mut before_serial_scan,
-        );
-        assert!(result.is_ok());
-        assert!(scan_started.get(), "the serial error scan must have run");
     }
 
     #[test]

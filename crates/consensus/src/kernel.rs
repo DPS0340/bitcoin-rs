@@ -67,7 +67,6 @@ mod native {
     use core::marker::PhantomData;
 
     use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid};
-    use bitcoin_rs_script::VerifyFlags;
 
     use crate::ConsensusError;
 
@@ -148,28 +147,8 @@ mod native {
             _input_count: usize,
             _spent_outputs: &[(OutPoint, TxOut)],
         ) -> Result<super::PreparedTx<'b>, ConsensusError> {
-            Ok(super::PreparedTx::Native(NativePreparedTx, PhantomData))
+            Ok(super::PreparedTx::Native(PhantomData))
         }
-    }
-
-    /// The native backend retains nothing across prepared input checks.
-    #[derive(Debug, Clone, Copy)]
-    pub(crate) struct NativePreparedTx;
-
-    /// The native per-input script verdict: the interpreter in
-    /// `bitcoin-rs-script` covers every consensus spend class.
-    #[expect(
-        clippy::trivially_copy_pass_by_ref,
-        reason = "shape parity with the kernel backend's prepared-state handle"
-    )]
-    pub(super) fn verify_input(
-        _prepared: &NativePreparedTx,
-        input_index: usize,
-        flags: VerifyFlags,
-        spent_outputs: &[TxOut],
-        tx: &Tx,
-    ) -> Result<(), ConsensusError> {
-        crate::verify_tx::verify_input_script_native(input_index, spent_outputs, tx, flags)
     }
 }
 
@@ -484,9 +463,9 @@ fn kernel_block_parse(_raw_block: &[u8]) -> Result<BlockParse, ConsensusError> {
 
 /// One prepared transaction's backend state for the parse's engine.
 pub(crate) enum PreparedTx<'b> {
-    /// The native backend retains nothing; the marker ties the state to its
-    /// parse in builds where the kernel variant is compiled out.
-    Native(native::NativePreparedTx, core::marker::PhantomData<&'b ()>),
+    /// The native backend retains no prepared state; the marker ties the
+    /// variant to its parse in builds where the kernel variant is compiled out.
+    Native(core::marker::PhantomData<&'b ()>),
     /// The kernel transaction and its shared sighash precompute.
     #[cfg(feature = "kernel")]
     Kernel(kernel_backend::PreparedKernelTx<bitcoinkernel::TransactionRef<'b>>),
@@ -505,8 +484,10 @@ pub(crate) fn verify_prepared_input(
     flags: VerifyFlags,
 ) -> Result<(), ConsensusError> {
     match prepared {
-        PreparedTx::Native(state, _) => {
-            native::verify_input(state, input_index, flags, spent_outputs, tx)
+        // The native per-input script verdict: the interpreter in
+        // `bitcoin-rs-script` covers every consensus spend class.
+        PreparedTx::Native(_) => {
+            crate::verify_tx::verify_input_script_native(input_index, spent_outputs, tx, flags)
         }
         #[cfg(feature = "kernel")]
         PreparedTx::Kernel(state) => kernel_backend::verify_prepared_input(
