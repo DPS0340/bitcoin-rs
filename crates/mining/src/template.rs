@@ -93,8 +93,6 @@ pub struct CandidateTransaction {
     pub sigop_cost: u32,
     /// Consensus transaction weight.
     pub weight: u64,
-    /// Consensus serialization size including witness.
-    pub size: u32,
     /// One-based indexes of in-candidate ancestors.
     pub depends: Vec<u32>,
 }
@@ -459,7 +457,6 @@ fn candidate_transactions(
             modified_fee: modified_fee(entry),
             sigop_cost: entry.sigop_cost,
             weight: entry.weight,
-            size: entry.size,
             depends: depends(&entry.tx, &tx_positions),
         });
     }

@@ -1567,7 +1567,6 @@ mod tests {
             modified_fee: 100,
             sigop_cost: 2,
             weight: 400,
-            size: 100,
             depends: vec![],
         });
         template.candidate = Arc::new(candidate);
