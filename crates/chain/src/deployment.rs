@@ -115,12 +115,12 @@ pub fn candidate_version(
 
 /// Resolves each named deployment's parameters and BIP9 state at `height`,
 /// reading through the tree's cache.
-fn deployment_states<'a>(
-    tree: &'a BlockTree,
+fn deployment_states(
+    tree: &BlockTree,
     network: Network,
     previous_tip_id: NodeId,
     height: u32,
-) -> impl Iterator<Item = (&'static str, DeploymentParams, DeploymentState)> + 'a {
+) -> impl Iterator<Item = (&'static str, DeploymentParams, DeploymentState)> + '_ {
     let ctx = DeploymentView::new(tree, previous_tip_id);
     NAMED_DEPLOYMENTS
         .into_iter()

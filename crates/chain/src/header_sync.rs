@@ -706,7 +706,10 @@ mod timestamp_tests {
             );
             tip = Some(header);
         }
-        (tree, tip.unwrap_or_else(|| panic!("fixture inserts eleven headers")))
+        (
+            tree,
+            tip.unwrap_or_else(|| panic!("fixture inserts eleven headers")),
+        )
     }
 
     fn check(tree: &BlockTree, header: &BlockHeader, now: u32) -> Result<(), ChainError> {
