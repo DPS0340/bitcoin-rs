@@ -196,7 +196,6 @@ pub fn dispatch_inbound<S>(
 /// POST: block inventory reaches `announce_block` and never a `getdata`.
 /// INVARIANT: block bodies are requested only by header sync and the
 /// download window (Core 31.1 `net_processing.cpp:4370-4410`).
-#[allow(clippy::too_many_arguments)]
 pub fn dispatch_inbound_full<S>(
     peer: &mut Peer<S>,
     message: &Message,
@@ -1565,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn one_sided_wtxid_negotiation_does_not_rerequest_pool_or_orphan_bodies() {
         use bitcoin_rs_primitives::Script;
         use std::sync::Arc;
@@ -1819,7 +1818,6 @@ mod tests {
         Hash256::from_le_bytes(block_hash.as_byte_array())
     }
 
-    #[allow(clippy::expect_used)]
     fn dispatch_collect_full<S>(
         peer: &mut Peer<S>,
         message: &Message,
@@ -1830,7 +1828,6 @@ mod tests {
     }
 
     /// Same helper with the transaction-relay gate under test control.
-    #[allow(clippy::expect_used)]
     fn dispatch_collect_gated<S>(
         peer: &mut Peer<S>,
         message: &Message,
@@ -1843,7 +1840,7 @@ mod tests {
 
     /// Same helper, additionally returning the block-inventory hashes that
     /// dispatch routed to header sync instead of requesting their bodies.
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn dispatch_collect_announcements<S>(
         peer: &mut Peer<S>,
         message: &Message,

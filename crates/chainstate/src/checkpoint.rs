@@ -102,7 +102,6 @@ pub(crate) enum CheckpointWrite {
     Published { generation: u64 },
 }
 
-#[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum CheckpointError {
     #[error("header checkpoint failed: {0}")]
@@ -137,7 +136,7 @@ pub enum CheckpointError {
     FullRevalidationMarker(std::io::Error),
 }
 
-#[allow(clippy::as_conversions)]
+#[expect(clippy::as_conversions)]
 const _: () = assert!(COINSTATS_PAYLOAD_LEN as usize == COIN_STATS_ENCODED_LEN);
 
 pub(crate) fn load_checkpoint_from_dir(
@@ -476,7 +475,7 @@ fn checkpoint_best_tip_id(
     }
     Ok(applied_id)
 }
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) fn write_checkpoint_from_dir(
     data_dir: &Dir,
     config: headers::HeaderCheckpointConfig,

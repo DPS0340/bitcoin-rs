@@ -46,7 +46,7 @@ pub(super) fn apply_committed_block_admitted<'b>(
 }
 
 /// Shared connect body for [`ApplyIntent::Commit`] and [`ApplyIntent::Propose`].
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) fn apply_block_admitted<'b>(
     handles: &Chainstate,
     block: &'b Block,

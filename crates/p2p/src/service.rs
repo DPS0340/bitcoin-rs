@@ -766,7 +766,7 @@ fn wait_for_shutdown(shutdown: &AtomicBool, delay: Duration) -> bool {
     true
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn run_fixed_peer_bootstrap(
     shutdown: Arc<AtomicBool>,
     network_active: Arc<AtomicBool>,
@@ -1119,7 +1119,6 @@ fn clear_pending_auto_dial(dns_queue: &Mutex<DnsQueueState>, dial: OutboundDial)
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn run_dns_peer_maintenance(
     DnsPeerMaintenance {
         shutdown,
@@ -1270,7 +1269,7 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::PeerSource;

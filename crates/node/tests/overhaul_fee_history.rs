@@ -27,9 +27,8 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 
-use bitcoin_rs_chain::compact_is_met_by;
 use bitcoin_rs_chain::regtest_fixture::{self, REGTEST_BITS};
 use bitcoin_rs_mempool::{AdmissionOrigin, FeeEstimator, SubmitOutcome};
 use bitcoin_rs_node::state::NodeState;
@@ -191,7 +190,7 @@ fn mine_and_apply(
     };
     block.header.merkle_root = regtest_fixture::merkle_root(&block.txs)
         .ok_or_else(|| anyhow!("block must have a merkle root"))?;
-    grind_pow(&mut block)?;
+    regtest_fixture::mine_block_to_declared_target(&mut block)?;
     state
         .apply_block(&block)
         .map_err(|error| anyhow!("apply failed at height {height}: {error}"))?;
@@ -200,18 +199,6 @@ fn mine_and_apply(
 
 fn null_prevout() -> OutPoint {
     OutPoint::new(Txid::default(), u32::MAX)
-}
-
-fn grind_pow(block: &mut Block) -> Result<()> {
-    loop {
-        if compact_is_met_by(block.header.bits, block.header.compute_hash().into()) {
-            return Ok(());
-        }
-        let Some(next) = block.header.nonce.checked_add(1) else {
-            bail!("nonce exhausted while grinding block");
-        };
-        block.header.nonce = next;
-    }
 }
 
 // ---------------------------------------------------------------------------

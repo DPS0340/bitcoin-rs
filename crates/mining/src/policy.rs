@@ -225,7 +225,7 @@ pub(crate) fn modified_fee(entry: &SnapshotEntry) -> i128 {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use std::cell::Cell;
     use std::sync::Arc;

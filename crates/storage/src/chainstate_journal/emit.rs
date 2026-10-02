@@ -68,7 +68,7 @@ pub trait JournalEmit: Send + Sync {
     fn resume(&mut self) -> Result<(), JournalWriterError>;
 }
 
-#[allow(clippy::use_self)] // inherent vs trait method disambiguation requires the type path
+#[expect(clippy::use_self)] // inherent vs trait method disambiguation requires the type path
 impl<S: KvStore> JournalEmit for JournalWriter<S> {
     fn prepare_for_apply(&mut self) -> Result<(), JournalWriterError> {
         JournalWriter::prepare_for_apply(self)

@@ -207,7 +207,6 @@ impl<S: KvStore> JournalWriter<S> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_fork_cursor(
     bytes: &[u8],
     generation: u64,

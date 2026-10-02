@@ -8,7 +8,6 @@
 use std::task::{Context, Poll, Waker};
 
 use anyhow::{Result, bail};
-use bitcoin_rs_chain::compact_is_met_by;
 use bitcoin_rs_chain::regtest_fixture::{self, REGTEST_BITS};
 use bitcoin_rs_mempool::MutationOutcome;
 use bitcoin_rs_node::state::NodeState;
@@ -280,7 +279,7 @@ fn seed_chain(state: &NodeState, count: u32) -> Result<(Hash256, Hash256, Vec<u8
         };
         block.header.merkle_root = regtest_fixture::merkle_root(&block.txs)
             .ok_or_else(|| anyhow::anyhow!("seed block must have a merkle root"))?;
-        grind_pow(&mut block)?;
+        regtest_fixture::mine_block_to_declared_target(&mut block)?;
         state.apply_block(&block)?;
         tip = applied
             .load_full()
@@ -340,19 +339,6 @@ fn seed_coinbase_spend() -> Tx {
 /// The one-input null-prevout coinbase outpoint (Core `COINBASE_OUTPOINT`).
 fn null_prevout() -> OutPoint {
     OutPoint::new(Txid::default(), u32::MAX)
-}
-
-/// Grinds the header nonce until the hash meets the compact bits target.
-fn grind_pow(block: &mut Block) -> Result<()> {
-    loop {
-        if compact_is_met_by(block.header.bits, block.header.compute_hash().into()) {
-            return Ok(());
-        }
-        let Some(next) = block.header.nonce.checked_add(1) else {
-            bail!("nonce exhausted while grinding block");
-        };
-        block.header.nonce = next;
-    }
 }
 
 /// Dropping a node without `shutdown` must still run the ordered teardown in

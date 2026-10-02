@@ -69,7 +69,6 @@ pub(crate) struct ReplayedState {
     pub chain_tx_count: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_from_journal(
     dir: &cap_std::fs::Dir,
     base_generation: u64,
@@ -203,7 +202,7 @@ impl ReplayAccumulator {
 }
 
 #[cfg(test)]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn replay_records(
     records: Vec<JournalRecord>,
     tree: BlockTree,

@@ -448,7 +448,6 @@ impl Default for ChainHandles {
     /// wiring supplies the role from the node's transition domain when it
     /// builds `ChainHandles`. Reader capability types expose no constructor
     /// of their own; the domain is what creates each role.
-    #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self::with_transition(bitcoin_rs_chain::TransitionDomain::new().stable_read())
     }
@@ -461,7 +460,6 @@ impl ChainHandles {
     /// role composition minted for that node, so the resulting context and the
     /// chainstate it reads exclude each other's transitions. The other fields
     /// are empty publications with no owner behind them.
-    #[allow(clippy::arc_with_non_send_sync)]
     #[must_use]
     fn with_transition(chain_transition: bitcoin_rs_chain::StableRead) -> Self {
         let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
@@ -497,7 +495,6 @@ impl ChainHandles {
 }
 
 impl Default for MempoolHandles {
-    #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
             gateway: MempoolGateway::shared(
@@ -510,7 +507,6 @@ impl Default for MempoolHandles {
 }
 
 impl Default for NetworkHandles {
-    #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
             network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
@@ -526,7 +522,6 @@ impl Default for NetworkHandles {
 impl Default for ContextHandles {
     /// Builds the empty synthetic capability set used by tests. Production
     /// wiring supplies every capability it owns.
-    #[allow(clippy::arc_with_non_send_sync)]
     fn default() -> Self {
         Self {
             chain: ChainHandles::default(),
@@ -561,7 +556,6 @@ impl Context {
     /// observer instead of `None`. Test-only: production wiring constructs
     /// the gateway through `NodeState::open`.
     #[must_use]
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new_with_mempool_observer(observer: Arc<dyn MempoolObserver>) -> Self {
         Self::from_handles(ContextHandles {
             mempool: MempoolHandles {
@@ -713,7 +707,7 @@ impl Context {
     /// the failure verbatim; nothing is inserted when this fails.
     // Owned `Tx` is the public call form (`admit_transaction(tx, None)`).
     // Admission only borrows; the value parameter is the compatibility contract.
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn admit_transaction(
         &self,
         tx: Tx,
@@ -1279,7 +1273,7 @@ impl AppliedView {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1492,7 +1486,6 @@ mod tests {
     /// published, and nothing covered it: a mutation replacing it with "the last
     /// record in the log" stayed green.
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
     fn block_by_height_without_an_applied_tip_reads_the_log() {
         let ctx = Context::new();
         for record in shaped_records() {
@@ -1597,8 +1590,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn from_handles_shares_chain_handles_with_caller() {
         use alloc::sync::Arc;
 
@@ -1866,7 +1858,6 @@ mod tests {
     /// from: the tree, via `record_for_hash`. A record built straight from a
     /// block has none.
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
     fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
         let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
@@ -1893,7 +1884,6 @@ mod tests {
     /// it unchanged would answer with none, which is what an earlier revision of
     /// this change did until this test caught it.
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
     fn record_for_hash_answers_with_the_tree_header_for_a_cached_record() {
         let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
@@ -2148,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn ibd_latch_judges_the_contexts_own_tree() {
         use alloc::sync::Arc;
 
@@ -2484,7 +2474,7 @@ mod admission_chain_tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {
         use sonic_rs::{JsonValueTrait as _, Value, json};
 

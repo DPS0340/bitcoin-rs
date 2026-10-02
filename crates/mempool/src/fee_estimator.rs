@@ -674,7 +674,7 @@ fn build_buckets() -> Vec<Bucket> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::{history_codec::HISTORY_MAGIC, *};
     use bitcoin_rs_primitives::Hash256;

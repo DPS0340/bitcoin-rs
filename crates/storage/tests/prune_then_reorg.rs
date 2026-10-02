@@ -1153,7 +1153,7 @@ impl KvStore for MemoryStore {
     }
 
     // RATIONALE: `KvIter` outlives the lock guard, so test rows are cloned before returning.
-    #[allow(clippy::needless_collect)]
+    #[expect(clippy::needless_collect)]
     fn iter_prefix<'a>(
         &'a self,
         cf: ColumnFamily,
@@ -1279,7 +1279,7 @@ impl KvSnapshot for MemorySnapshot {
     }
 
     // RATIONALE: the returned `KvIter` must not borrow the caller-owned prefix slice.
-    #[allow(clippy::needless_collect)]
+    #[expect(clippy::needless_collect)]
     fn iter_prefix<'a>(
         &'a self,
         cf: ColumnFamily,

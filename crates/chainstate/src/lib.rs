@@ -358,7 +358,6 @@ enum ApplyIntent {
 }
 
 /// Outcome of [`apply_block_admitted`] once intent is known.
-#[allow(clippy::large_enum_variant)]
 enum ApplyFinish {
     /// Commit path: the new applied tip, already published.
     Committed(Box<ConnectOutcome>),
@@ -540,7 +539,7 @@ impl<'a> ChainTransition<'a> {
     }
 
     /// Applies consecutive blocks under this one transition.
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn connect_window(
         &self,
         blocks: &[&Block],
@@ -884,7 +883,6 @@ impl Chainstate {
 
     /// Builds a chainstate facade for tests and composition that do not go
     /// through `NodeState::open`.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         network: Network,
@@ -1045,7 +1043,7 @@ impl Chainstate {
 
     /// Admits a transition, applies consecutive blocks, then releases the
     /// transition lock. Persistence matches [`ChainTransition::connect_window`].
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_window(
         &self,

@@ -149,7 +149,7 @@ pub fn save(data_dir: &Path, mempool: &RwLock<Mempool>) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::{MempoolEntry, MempoolLimits};

@@ -514,7 +514,7 @@ impl PeerLease {
     /// [`OutboundBudget`]: the lease is cancelled and the message is returned.
     /// A successful queue admission is also this connection's `last_send`,
     /// which the connection loop reads into its keepalive ledger.
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn send(&self, message: crate::Message) -> Result<(), SendError<crate::Message>> {
         if self.is_cancelled() {
             return Err(SendError(message));

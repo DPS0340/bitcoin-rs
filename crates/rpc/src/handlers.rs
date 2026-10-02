@@ -332,7 +332,7 @@ mod registry_tests {
     // correctly typed but unacceptable value is -8, and only shape and
     // arity remain on -32602.
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn wrong_json_type_answers_core_type_error_text() {
         let params = json!(["abc"]);
         let error = required_u64(&params, 0, "height is required").expect_err("type error");
@@ -344,7 +344,7 @@ mod registry_tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn missing_required_parameter_keeps_the_shape_error() {
         let params = json!([]);
         let error = required_str(&params, 0, "txid is required").expect_err("missing");
@@ -353,7 +353,7 @@ mod registry_tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn optional_boolean_type_error_names_the_type() {
         let params = json!(["ignored", "yes"]);
         let error = optional_bool(&params, 1, true).expect_err("type error");
@@ -365,7 +365,7 @@ mod registry_tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn txid_parameter_errors_use_core_text() {
         let short = parse_txid("123", "parameter 1").expect_err("short");
         assert_eq!(short.code(), RpcError::CORE_INVALID_PARAMETER);

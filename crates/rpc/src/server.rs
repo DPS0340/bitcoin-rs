@@ -73,7 +73,7 @@ impl RpcServer {
     /// shutdown without parking on an open socket. Each accepted connection
     /// is restored to blocking mode and handed to a bounded worker thread,
     /// preserving the configured `idle_timeout` per connection.
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn serve_with_shutdown(
         self,
         shutdown: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
@@ -782,7 +782,7 @@ struct ResponseHead<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -803,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn serve_with_shutdown_exits_on_signal() -> std::io::Result<()> {
         let auth = Arc::new(Auth::basic("alice", "secret"));
         let handler = Arc::new(Handler::new(Arc::new(Context::new())));

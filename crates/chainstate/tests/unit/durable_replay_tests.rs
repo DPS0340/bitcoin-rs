@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use arc_swap::ArcSwapOption;
-use bitcoin_rs_chain::{BlockTree, compact_is_met_by, current_unix_seconds};
+use bitcoin_rs_chain::{BlockTree, current_unix_seconds};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
     Sequence, Tx, TxIn, TxOut, Txid, Witness, consensus_bytes,
@@ -72,13 +72,7 @@ fn restored_chainstate() -> Result<(Chainstate, Block), Box<dyn std::error::Erro
         },
         txs: vec![tx],
     };
-    while !compact_is_met_by(child.header.bits, child.header.compute_hash().0) {
-        child.header.nonce = child
-            .header
-            .nonce
-            .checked_add(1)
-            .ok_or("test nonce exhausted")?;
-    }
+    bitcoin_rs_chain::regtest_fixture::mine_header_to_declared_target(&mut child.header)?;
     Ok((handles, child))
 }
 
@@ -196,13 +190,7 @@ fn replay_gap_skips_the_live_future_drift_recheck() -> Result<(), Box<dyn std::e
     // clock plus the two-hour future window, so the real clock plays the part
     // of a clock that moved back after the block committed legally.
     child.header.time = current_unix_seconds().saturating_add(4 * 60 * 60);
-    while !compact_is_met_by(child.header.bits, child.header.compute_hash().0) {
-        child.header.nonce = child
-            .header
-            .nonce
-            .checked_add(1)
-            .ok_or("test nonce exhausted")?;
-    }
+    bitcoin_rs_chain::regtest_fixture::mine_header_to_declared_target(&mut child.header)?;
     let bodies = Arc::new(MemoryBodies::default());
     bodies.persist_block_body(
         1,
@@ -423,13 +411,7 @@ fn mined_child(
         },
         txs: vec![tx],
     };
-    while !compact_is_met_by(block.header.bits, block.header.compute_hash().0) {
-        block.header.nonce = block
-            .header
-            .nonce
-            .checked_add(1)
-            .ok_or("test nonce exhausted")?;
-    }
+    bitcoin_rs_chain::regtest_fixture::mine_header_to_declared_target(&mut block.header)?;
     Ok(block)
 }
 

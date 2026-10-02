@@ -41,11 +41,7 @@ use std::time::{Duration, Instant};
 /// On an ordinary error or panic, publishes `Failed` with a bounded
 /// diagnostic and no query, if the generation is still current. If the token
 /// was revoked, publishes nothing. Converts panic payloads to bounded text.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::needless_pass_by_value,
-    clippy::needless_borrow
-)]
+#[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub(super) fn run_worker_with_open(
     runtime: &Arc<DerivedIndexRuntime>,
     spec: DerivedIndexOpenSpec,
@@ -181,7 +177,7 @@ pub(super) fn publish_lifecycle(
 }
 
 /// Opens the store, constructs the engine, publishes lifecycle, and runs.
-#[allow(clippy::too_many_arguments, clippy::ref_option)]
+#[expect(clippy::too_many_arguments, clippy::ref_option)]
 pub(super) fn open_and_run(
     runtime: &Arc<DerivedIndexRuntime>,
     spec: &DerivedIndexOpenSpec,

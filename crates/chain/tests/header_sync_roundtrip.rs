@@ -602,7 +602,7 @@ fn seed_period(
     seed_headers(tree, &headers)
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn assert_nbits_mismatch(result: Result<(), ChainError>, actual: u32, expected: u32, height: u32) {
     assert!(matches!(
         result,

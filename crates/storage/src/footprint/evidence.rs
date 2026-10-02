@@ -214,7 +214,7 @@ pub fn storage_footprint_json(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     // CONTRACT: `docs/contracts/storage-footprint.md` FP-01 owns the evidence
     // record shape and FP-04 owns the default-lane budget verdict policy;

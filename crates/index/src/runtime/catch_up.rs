@@ -198,8 +198,6 @@ impl Worker {
     /// the loaded prefix. Returns `Stalled` if a body is missing or shutdown
     /// was requested, `Progressed` if the batch filled and was committed, or
     /// `Continue` to keep processing.
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_and_admit_chunk(
         &self,
         identities: &mut &[BlockIdentity],

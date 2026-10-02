@@ -855,7 +855,6 @@ mod timestamp_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod contextual_header_tests {
     use super::{
         HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, accept_headers, compact_is_met_by,
@@ -915,7 +914,7 @@ mod contextual_header_tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn rejects_outdated_versions_after_activation() -> Result<(), Box<dyn std::error::Error>> {
         let network = Network::Regtest;
         let genesis = network.genesis_block();
