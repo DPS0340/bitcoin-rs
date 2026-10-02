@@ -20,7 +20,7 @@ const MIN_COINBASE_SCRIPT_SIG_SIZE: usize = 2;
 const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 
 /// Number of blocks after a coinbase that its outputs become spendable.
-pub const COINBASE_MATURITY: u32 = 100;
+pub(crate) const COINBASE_MATURITY: u32 = 100;
 
 // Width of the script-verification pool. 16 was chosen on the belief that SMT
 // siblings slow secp256k1 down past that width. A full-verification replay of

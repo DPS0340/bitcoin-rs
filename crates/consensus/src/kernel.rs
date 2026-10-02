@@ -23,7 +23,7 @@ use crate::ValidationEngine;
 /// without `kernel` support. Selection fails closed here; it never falls back
 /// to another engine. Only builds without the capability produce it.
 #[cfg(not(feature = "kernel"))]
-pub(crate) fn kernel_not_compiled() -> ConsensusError {
+fn kernel_not_compiled() -> ConsensusError {
     ConsensusError::UnsupportedEngine {
         engine: ValidationEngine::Kernel,
     }
@@ -41,7 +41,7 @@ pub(crate) fn kernel_not_compiled() -> ConsensusError {
 /// Returns [`ConsensusError::PrevoutCount`] when the counts disagree: the
 /// mismatch is a caller wiring bug and is reported backend-neutrally, never
 /// as a script failure.
-pub(crate) fn ensure_prevout_count(
+fn ensure_prevout_count(
     spent_outputs: &[(OutPoint, TxOut)],
     input_count: usize,
 ) -> Result<(), ConsensusError> {
@@ -142,7 +142,7 @@ mod native {
             clippy::unnecessary_wraps,
             reason = "shape parity with the fallible kernel backend"
         )]
-        pub(crate) fn prepare_tx<'b>(
+        pub(super) fn prepare_tx<'b>(
             &self,
             _index: usize,
             _input_count: usize,
@@ -162,7 +162,7 @@ mod native {
         clippy::trivially_copy_pass_by_ref,
         reason = "shape parity with the kernel backend's prepared-state handle"
     )]
-    pub(crate) fn verify_input(
+    pub(super) fn verify_input(
         _prepared: &NativePreparedTx,
         input_index: usize,
         flags: VerifyFlags,
@@ -267,7 +267,7 @@ mod kernel_backend {
 
         /// Prepares this block's transaction `index` for parallel per-input
         /// kernel verification over its resolved prevouts.
-        pub(crate) fn prepare_tx(
+        pub(super) fn prepare_tx(
             &self,
             index: usize,
             input_count: usize,
@@ -333,7 +333,7 @@ mod kernel_backend {
     }
 
     /// Verifies a single input against a previously prepared kernel transaction.
-    pub(crate) fn verify_prepared_input<T: bitcoinkernel::prelude::TransactionExt>(
+    pub(super) fn verify_prepared_input<T: bitcoinkernel::prelude::TransactionExt>(
         prepared: &PreparedKernelTx<T>,
         prevout: &TxOut,
         input_index: usize,
