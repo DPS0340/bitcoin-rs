@@ -32,7 +32,7 @@ mod pareto;
 /// Mempool policy limits.
 mod policy;
 /// Mempool indexes and mutation API.
-pub mod pool;
+mod pool;
 /// Core 31.1 replacement fee and graph policy.
 mod rbf;
 /// Transaction relay standardness policy.
@@ -46,7 +46,7 @@ pub use admission::{
 pub use entry::{EntryId, MempoolEntry};
 pub(crate) use eviction::evict_lowest_fee_packages;
 pub use fee_diagram::FeeDiagramError;
-pub use fee_estimator::{FeeEstimator, FeeRate, HistoryReject};
+pub use fee_estimator::{FeeEstimator, FeeRate};
 pub use gateway::{
     AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError, ChainChangeGuard,
     CompositeObserver, MempoolGateway, MempoolObserver, SharedGatewayError,
@@ -60,9 +60,11 @@ pub use mutation::{
 pub(crate) use pareto::ParetoFront;
 pub use policy::{MempoolLimits, MempoolPolicySnapshot, PolicyError};
 pub use pool::{
-    Mempool, MempoolChunk, MempoolError, MempoolMiningSnapshot, MempoolStats, PrioritiseError,
-    PrioritisedTransaction, ScriptHash, SnapshotEntry,
+    Mempool, MempoolChunk, MempoolError, MempoolMiningSnapshot, MempoolStats, OutpointSpender,
+    PrioritiseError, PrioritisedTransaction, ScriptHash, SnapshotEntry,
 };
-pub use rbf::{RbfError, ReplacementCandidate, ReplacementPlan};
+#[cfg(any(test, feature = "test-seam"))]
+pub use rbf::ReplacementPlan;
+pub use rbf::{RbfError, ReplacementCandidate};
 pub use standardness::{StandardnessError, StandardnessPolicy, is_standard_tx};
 pub use truc::TrucError;

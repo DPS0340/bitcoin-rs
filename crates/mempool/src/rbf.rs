@@ -6,7 +6,6 @@ use hashbrown::HashSet;
 use thiserror::Error;
 
 use crate::mutation::{AdmissionOrigin, RemovalReason};
-use crate::pool::tx_fee_rate;
 use crate::{EntryId, Mempool, MempoolEntry, MempoolError};
 
 /// Whether a committed entry registers with the fee estimator.
@@ -86,15 +85,12 @@ impl ReplacementCandidate {
         self.sigop_cost = sigop_cost;
         self
     }
-
-    /// Candidate fee rate in sat/vB multiplied by 1000.
-    #[must_use]
-    pub fn fee_rate(&self) -> u64 {
-        tx_fee_rate(self.fee, self.vsize)
-    }
 }
 
 /// Successful replacement validation result.
+///
+/// Produced only by [`Mempool::check_replacement`], the test-seam oracle.
+#[cfg(any(test, feature = "test-seam"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplacementPlan {
     /// Conflicts and descendants removed by the replacement.

@@ -1535,13 +1535,14 @@ pub struct ChainChangeGuard {
 impl ChainChangeGuard {
     /// Returns the exact odd generation this guard reserved.
     #[must_use]
-    pub fn odd_generation(&self) -> u64 {
+    pub(crate) fn odd_generation(&self) -> u64 {
         self.odd
     }
 
     /// Returns the reserved even value `finish` will store on success.
+    #[cfg(test)]
     #[must_use]
-    pub fn reserved_even(&self) -> u64 {
+    pub(crate) fn reserved_even(&self) -> u64 {
         self.even
     }
 
