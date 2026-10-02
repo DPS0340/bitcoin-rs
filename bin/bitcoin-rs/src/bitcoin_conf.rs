@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 use bitcoin_rs_node::{Network, UserConfig};
 
 /// Parses `path` into user-config layers for `network`, lowest precedence first.
-pub fn load_file(path: &Path, network: Network) -> Result<Vec<UserConfig>> {
+pub(crate) fn load_file(path: &Path, network: Network) -> Result<Vec<UserConfig>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read bitcoin.conf {}", path.display()))?;
     Ok(parse_for_network(&text, network))

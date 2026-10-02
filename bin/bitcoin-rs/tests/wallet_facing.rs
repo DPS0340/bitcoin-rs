@@ -6,8 +6,6 @@
 //! The named out-of-repo consumer is `gosuda/bitcoin-wallet`
 //! (`btcw -u`).
 
-#![allow(missing_docs)]
-
 use std::cell::RefCell;
 use std::error::Error;
 use std::io::{BufRead as _, BufReader, Read};
