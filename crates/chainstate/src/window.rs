@@ -269,17 +269,7 @@ pub(super) fn apply_window_admitted(
                 // its durable group before reporting, so the durable head
                 // and the published tip keep moving together. A flush
                 // failure is the ambiguous-batch case: fatal, never retried.
-                let flushed = group.flush(handles).map_err(|flush_error| {
-                    group.abandon();
-                    WindowApplyError {
-                        applied: committed.len(),
-                        committed: std::mem::take(&mut committed),
-                        source: flush_error,
-                        disposition: WindowApplyDisposition::Fatal,
-                        invalidated: Box::default(),
-                    }
-                })?;
-                committed.extend(flushed);
+                flush_group(&mut group, handles, &mut committed)?;
                 return Err(WindowApplyError {
                     applied: committed.len(),
                     committed,
@@ -290,30 +280,38 @@ pub(super) fn apply_window_admitted(
             }
         }
         if group.should_flush() {
-            let flushed = group.flush(handles).map_err(|flush_error| {
-                group.abandon();
-                WindowApplyError {
-                    applied: committed.len(),
-                    committed: std::mem::take(&mut committed),
-                    source: flush_error,
-                    disposition: WindowApplyDisposition::Fatal,
-                    invalidated: Box::default(),
-                }
-            })?;
-            committed.extend(flushed);
+            flush_group(&mut group, handles, &mut committed)?;
         }
     }
-    let flushed = group
-        .flush(handles)
-        .map_err(|flush_error| WindowApplyError {
-            applied: committed.len(),
-            committed: std::mem::take(&mut committed),
-            source: flush_error,
-            disposition: WindowApplyDisposition::Fatal,
-            invalidated: Box::default(),
-        })?;
-    committed.extend(flushed);
+    flush_group(&mut group, handles, &mut committed)?;
     Ok(committed)
+}
+
+/// Flushes the group's staged prefix into `committed`. A flush failure is
+/// the ambiguous-batch case — the durable head may or may not name it — so
+/// the group is abandoned and the error is fatal, never retried.
+#[allow(clippy::result_large_err)]
+fn flush_group(
+    group: &mut WindowGroup,
+    handles: &Chainstate,
+    committed: &mut Vec<ConnectOutcome>,
+) -> core::result::Result<(), WindowApplyError> {
+    match group.flush(handles) {
+        Ok(flushed) => {
+            committed.extend(flushed);
+            Ok(())
+        }
+        Err(flush_error) => {
+            group.abandon();
+            Err(WindowApplyError {
+                applied: committed.len(),
+                committed: std::mem::take(committed),
+                source: flush_error,
+                disposition: WindowApplyDisposition::Fatal,
+                invalidated: Box::default(),
+            })
+        }
+    }
 }
 
 /// Invalidates a permanently invalid block's subtree through the shared
