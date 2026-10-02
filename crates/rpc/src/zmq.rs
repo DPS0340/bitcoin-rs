@@ -244,7 +244,7 @@ pub trait ZmqPublisher: Send + Sync + core::fmt::Debug {
 /// Default no-op implementation. All methods discard their input silently.
 ///
 /// Use this when ZMQ notifications are not configured.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug)]
 pub struct NoOpZmqPublisher;
 
 impl ZmqPublisher for NoOpZmqPublisher {
