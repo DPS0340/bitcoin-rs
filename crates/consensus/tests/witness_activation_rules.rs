@@ -4,8 +4,8 @@
 //! `CheckWitnessMalleation`. These fixtures isolate block witness rules; they
 //! are not mined or UTXO-valid chain fixtures.
 
-use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_consensus::BlockView;
+use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_consensus::verify_block::{
     BlockRuleContext, verify_block_rules, verify_block_rules_precomputed,
 };
