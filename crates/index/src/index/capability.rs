@@ -262,6 +262,19 @@ impl IndexWatermarks {
             IndexCapability::ScriptLive => self.script_live,
         }
     }
+
+    /// Sets one capability's durable cursor, leaving the others unchanged.
+    pub(crate) const fn set(
+        &mut self,
+        capability: IndexCapability,
+        cursor: Option<IndexWatermark>,
+    ) {
+        match capability {
+            IndexCapability::TxLookup => self.tx_lookup = cursor,
+            IndexCapability::ScriptHistory => self.script_history = cursor,
+            IndexCapability::ScriptLive => self.script_live = cursor,
+        }
+    }
 }
 
 impl IndexWatermark {

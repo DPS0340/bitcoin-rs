@@ -140,8 +140,8 @@ impl DerivedIndexWorker {
     /// abandonment path so the namespace is permanently `Poisoned` and
     /// subsequent claims are rejected.
     pub fn poison_namespace(&self) {
-        if let (Some(key), token) = (&self.namespace_key, &self.generation) {
-            NAMESPACE_REGISTRY.poison(key, token.id());
+        if let Some(key) = &self.namespace_key {
+            NAMESPACE_REGISTRY.poison(key, self.generation.id());
         }
     }
 }
