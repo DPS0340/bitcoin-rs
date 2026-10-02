@@ -382,7 +382,7 @@ impl UtxoSetView<'_> {
     /// borrows the record payload only for the duration of the call.
     ///
     /// On-demand scan helper (e.g. `gettxoutsetinfo`); not on any hot path.
-    pub fn for_each_coin<F>(&self, mut f: F) -> Result<(), UtxoError>
+    pub(crate) fn for_each_coin<F>(&self, mut f: F) -> Result<(), UtxoError>
     where
         F: FnMut(Hash256, u32, u64, &[u8], u32, bool),
     {

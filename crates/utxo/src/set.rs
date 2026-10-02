@@ -233,7 +233,7 @@ impl UtxoSetView<'_> {
     }
 
     /// Scans every live output for exact scriptPubKey matches.
-    pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
+    pub(crate) fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
         let mut scan = UtxoScan::default();
         for shard in &self.set.shards {
             shard.scan_script_pubkeys(scripts, &mut scan);
