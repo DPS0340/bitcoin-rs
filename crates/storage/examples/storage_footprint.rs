@@ -20,10 +20,14 @@
 #![allow(clippy::print_stdout)]
 #![allow(clippy::expect_used)]
 
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 use hashbrown::HashMap;
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 use std::path::Path;
 
-use bitcoin_rs_storage::{ColumnFamily, KvStore};
+use bitcoin_rs_storage::ColumnFamily;
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
+use bitcoin_rs_storage::KvStore;
 
 // ---------------------------------------------------------------------------
 // Corpus
@@ -84,6 +88,7 @@ fn logical_data_size() -> u64 {
 }
 
 /// Writes the synthetic corpus into `store`.
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 fn write_corpus<S: KvStore>(store: &S) {
     // Index CFs with small key/value pairs.
     let index_cfs: &[(ColumnFamily, usize, usize)] = &[
@@ -129,6 +134,7 @@ fn write_corpus<S: KvStore>(store: &S) {
     store.flush().expect("flush after undo");
 }
 
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 fn synthetic_key(index: u32, len: usize) -> Vec<u8> {
     let mut key = vec![0u8; len];
     let bytes = index.to_le_bytes();
@@ -142,6 +148,7 @@ fn synthetic_key(index: u32, len: usize) -> Vec<u8> {
     key
 }
 
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 fn synthetic_val(index: u32, len: usize) -> Vec<u8> {
     if len == 0 {
         return Vec::new();
@@ -162,6 +169,7 @@ fn synthetic_val(index: u32, len: usize) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Recursively sums the size of every regular file under `path`.
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 fn dir_size(path: &Path) -> u64 {
     fn recurse(dir: &Path) -> u64 {
         let mut total = 0;
@@ -186,6 +194,7 @@ fn dir_size(path: &Path) -> u64 {
 
 /// Measures per-column-family bytes for fjall. Each keyspace is a separate
 /// numbered directory under `keyspaces/`. Also reports the shared journal.
+#[cfg(feature = "fjall")]
 fn fjall_cf_sizes(root: &Path) -> (HashMap<String, u64>, u64) {
     let mut sizes = HashMap::new();
     let cf_names: Vec<&str> = ColumnFamily::ALL.iter().map(|cf| cf.name()).collect();
@@ -272,6 +281,7 @@ fn mib(bytes: u64) -> f64 {
     reason = "byte counts < 2^24, lossless in f64"
 )]
 #[expect(clippy::as_conversions, reason = "byte counts < 2^24, lossless in f64")]
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 fn kib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0
 }
@@ -284,6 +294,7 @@ fn kib(bytes: u64) -> f64 {
     reason = "byte counts < 2^28, lossless in f64"
 )]
 #[expect(clippy::as_conversions, reason = "byte counts < 2^28, lossless in f64")]
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 fn amplification_ratio(total: u64, logical: u64) -> f64 {
     if logical > 0 {
         total as f64 / logical as f64
@@ -310,7 +321,9 @@ fn main() {
     );
     println!();
 
+    #[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
     let temp = tempfile::TempDir::new().expect("tempdir");
+    #[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
     let path = temp.path();
 
     match backend.as_str() {
@@ -352,6 +365,7 @@ fn main() {
     }
 }
 
+#[cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
 fn print_results(
     backend: &str,
     total: u64,

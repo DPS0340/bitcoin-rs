@@ -1002,8 +1002,6 @@ fn optional_consumer_budget_exhaustion_unblocks_pruning() -> Result<(), Box<dyn 
     Ok(())
 }
 
-
-
 fn fake_hash(height: u32) -> Hash256 {
     let mut bytes = [0_u8; 32];
     bytes[..4].copy_from_slice(&height.to_le_bytes());

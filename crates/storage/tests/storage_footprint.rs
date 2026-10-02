@@ -9,9 +9,10 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::symlink;
 
+#[cfg(feature = "fjall")]
+use bitcoin_rs_storage::{ColumnFamily, KvStore, logical_store_owners};
 use bitcoin_rs_storage::{
-    ColumnFamily, DataDirAnchor, FootprintError, KvStore, PhysicalObservationKind,
-    logical_store_owners, measure_physical_tree,
+    DataDirAnchor, FootprintError, PhysicalObservationKind, measure_physical_tree,
 };
 use tempfile::tempdir;
 
