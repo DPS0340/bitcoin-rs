@@ -2,7 +2,7 @@
 
 use super::{
     capability::IndexCapability, capability::IndexWatermark, capability::IndexWatermarks,
-    capability::SCRIPT_LIVE_WATERMARK_KEY, error::IndexError, rows::IndexRowCounts,
+    capability::SCRIPT_LIVE_WATERMARK_KEY, error::IndexError,
 };
 use crate::{types::ScriptHashRow, types::SpendingPrefixRow, types::TxidRow};
 use bitcoin_rs_primitives::{OutPoint, Txid};
@@ -14,26 +14,17 @@ use bitcoin_rs_storage::{ColumnFamily, KvStore};
 /// owned exclusively by [`super::write::IndexWriter`].
 pub struct Indexer<S: KvStore> {
     pub(super) store: std::sync::Arc<S>,
-    pub(super) last_counts: IndexRowCounts,
 }
 
 impl<S: KvStore> Indexer<S> {
     /// Creates an indexer over `store`.
     pub fn new(store: std::sync::Arc<S>) -> Self {
-        Self {
-            store,
-            last_counts: IndexRowCounts::default(),
-        }
+        Self { store }
     }
 
     /// Returns the underlying key-value store.
     pub const fn store(&self) -> &std::sync::Arc<S> {
         &self.store
-    }
-
-    /// Returns the row counts from the last successful prepared commit.
-    pub const fn last_counts(&self) -> IndexRowCounts {
-        self.last_counts
     }
 
     /// Loads the exact durable `TxIndex` watermark, or `None` for an empty v2 index.
