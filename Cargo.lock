@@ -407,7 +407,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",
- "proptest",
  "quanta",
  "rayon",
  "rustix",

@@ -90,7 +90,6 @@ tempfile.workspace = true
 bitcoin-rs-chain = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-p2p = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-chainstate = { workspace = true, features = ["test-seam"] }
-proptest.workspace = true
 criterion.workspace = true
 sonic-rs.workspace = true
 serde_json.workspace = true
