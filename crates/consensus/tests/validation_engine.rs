@@ -157,7 +157,7 @@ fn kernel_engine_fails_closed_without_the_kernel_feature() {
         version: 1,
         lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: vec![1, 1].into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),

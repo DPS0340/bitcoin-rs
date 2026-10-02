@@ -31,7 +31,7 @@ fn segwit_coinbase(height: u32, witness: bool) -> Tx {
     Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(script_sig),
             sequence: Sequence::from_consensus(0xffff_ffff),
             witness: if witness {

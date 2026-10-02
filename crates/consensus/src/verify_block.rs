@@ -1179,7 +1179,7 @@ mod tests {
         Tx {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![1, 1]),
                 sequence: Sequence::from_consensus(u32::MAX),
                 witness: Witness::new(),

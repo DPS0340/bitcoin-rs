@@ -1386,7 +1386,7 @@ fn coinbase_transaction(height: u32) -> Tx {
         version: 2,
         lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: coinbase_script_sig(height).into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -1409,7 +1409,7 @@ fn fanout_coinbase_transaction(height: u32) -> Tx {
         version: 2,
         lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: coinbase_script_sig(height).into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -1595,7 +1595,7 @@ fn signed_fanout_coinbase_transaction(height: u32, keys: &SigningKeys) -> Tx {
         version: 2,
         lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: coinbase_script_sig(height).into(),
             sequence: Sequence::MAX,
             witness: vec![WITNESS_RESERVED_VALUE.to_vec()].into(),

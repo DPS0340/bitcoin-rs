@@ -379,7 +379,7 @@ impl BlockSource for FakeSource {
 /// spend, so funding and spending rows both exist alongside txid and header
 /// rows.
 fn rollback_fixture_block() -> Block {
-    let funded = tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51]);
+    let funded = tx(OutPoint::null(), vec![0x51]);
     let spender = tx(OutPoint::new(funded.txid(), 0), vec![0x52]);
     block(vec![funded, spender])
 }

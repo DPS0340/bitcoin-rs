@@ -1782,7 +1782,7 @@ mod tests {
         let coinbase = Tx {
             version: 1,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                previous_output: OutPoint::null(),
                 script_sig: Script::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -2651,7 +2651,7 @@ mod tests {
             version: 1,
             lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                previous_output: OutPoint::null(),
                 script_sig: vec![0x51].into(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),

@@ -218,8 +218,7 @@ impl<'a> Projection<'a> {
         let mut inputs = Vec::with_capacity(transaction.inputs.len());
         for input in &transaction.inputs {
             let previous_output = input.previous_output;
-            let coinbase =
-                previous_output.txid == Txid::default() && previous_output.vout == u32::MAX;
+            let coinbase = previous_output.is_null();
             let previous = if coinbase {
                 None
             } else {

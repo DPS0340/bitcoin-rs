@@ -1541,7 +1541,7 @@ mod tests {
         let mut nonstandard = (*child).clone();
         nonstandard.version = 4;
         let mut coinbase = (*child).clone();
-        coinbase.inputs[0].previous_output = OutPoint::new(Txid::default(), u32::MAX);
+        coinbase.inputs[0].previous_output = OutPoint::null();
         for tx in [nonstandard, coinbase] {
             let tx = Arc::new(tx);
             assert!(
@@ -2340,7 +2340,7 @@ mod tests {
         let (parent, child) = parent_and_child();
         let mut tx = (*child).clone();
         tx.inputs.push(TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::new(),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: Witness::new(),
@@ -2450,7 +2450,7 @@ mod tests {
         let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[92; 32])), 0);
         let mut tx = standard_spend(outpoint, 4);
         let mut null_input = tx.inputs[0].clone();
-        null_input.previous_output = OutPoint::new(Txid::default(), u32::MAX);
+        null_input.previous_output = OutPoint::null();
         tx.inputs.push(null_input);
         assert_input_structure_rejection(tx, Coins(vec![]));
     }

@@ -206,7 +206,7 @@ mod tests {
 
     /// Core's null outpoint: zero txid, `u32::MAX` vout.
     fn null_outpoint() -> OutPoint {
-        OutPoint::new(Txid::default(), u32::MAX)
+        OutPoint::null()
     }
 
     /// Folds txids into the block merkle root the consensus encoder builds,

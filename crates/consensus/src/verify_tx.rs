@@ -939,7 +939,7 @@ mod tests {
             version: 1,
             lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                previous_output: OutPoint::null(),
                 script_sig: vec![1, 1].into(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -1681,7 +1681,7 @@ mod tests {
             version: 1,
             lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                previous_output: OutPoint::null(),
                 script_sig: vec![1; len].into(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -1969,16 +1969,7 @@ mod tests {
     /// committed and validated, so a malformed hex is a corpus regression, not
     /// a runtime condition.
     fn decode_hex(hex: &str) -> Vec<u8> {
-        assert!(hex.len().is_multiple_of(2), "hex string has odd length");
-        hex.as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                let digits = std::str::from_utf8(pair).unwrap_or_else(|_| panic!("hex ascii"));
-                u8::from_str_radix(digits, 16).unwrap_or_else(|_| panic!("hex digit"))
-            })
-            .collect()
+        bitcoin::hex::FromHex::from_hex(hex).unwrap_or_else(|error| panic!("bad hex: {error}"))
     }
 
     /// Loads and decodes the committed mainnet Taproot script-path fixture.

@@ -18,7 +18,7 @@ use bitcoin_rs_node::{MiningCoordinator, Network, NodeConfig, state::NodeState};
 
 use bitcoin_rs_primitives::{
     Amount, Block, CompactTarget, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
-    Txid, Witness, consensus_bytes, deserialize as native_deserialize, encode::double_sha256,
+    Witness, consensus_bytes, deserialize as native_deserialize, encode::double_sha256,
 };
 use bitcoin_rs_script::push_int;
 
@@ -36,6 +36,7 @@ use parking_lot::Mutex;
 
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
+use bitcoin::hex::{DisplayHex, FromHex};
 use std::sync::Arc;
 
 const SEED_BLOCKS: u32 = 100;
@@ -125,7 +126,7 @@ fn template_mines_to_tip_and_drains_mempool() -> Result<()> {
         "rendered hash is the wtxid"
     );
     assert_eq!(
-        native_deserialize::<Tx>(&hex_decode(&required_str(entry, "data")?)?)?,
+        native_deserialize::<Tx>(&Vec::<u8>::from_hex(&required_str(entry, "data")?)?)?,
         mempool_tx,
         "rendered data round-trips to the mempool tx"
     );
@@ -210,7 +211,7 @@ fn template_mines_to_tip_and_drains_mempool() -> Result<()> {
     let expected_commitment = double_sha256(&commitment_input).to_le_bytes();
     assert_eq!(
         &commitment[12..],
-        hex_encode(&expected_commitment),
+        expected_commitment.to_lower_hex_string(),
         "rendered commitment must be SHA256D(witness merkle root || witness reserved value)"
     );
 
@@ -218,7 +219,7 @@ fn template_mines_to_tip_and_drains_mempool() -> Result<()> {
     let block = assemble_from_template(&template, template_txs)?;
 
     // --- submitblock over the real RPC handler -------------------------------
-    let hex = hex_encode(&consensus_bytes(&block));
+    let hex = consensus_bytes(&block).to_lower_hex_string();
     let verdict = handler.dispatch("submitblock", &json!([hex]))?;
     assert!(
         verdict.is_null(),
@@ -365,7 +366,7 @@ fn seed_chain(state: &NodeState, count: u32) -> Result<Hash256> {
         let coinbase = Tx {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: null_prevout(),
+                previous_output: OutPoint::null(),
                 // BIP34 height push plus one pad byte: consensus requires a
                 // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
                 script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
@@ -418,7 +419,8 @@ fn assemble_from_template(
     let bits = u32::from_str_radix(&required_str(template, "bits")?, 16)?;
     let curtime = u32::try_from(required_u64(template, "curtime")?).unwrap_or(u32::MAX);
     let version = i32::try_from(required_u64(template, "version")?).unwrap_or(0);
-    let commitment_script = hex_decode(&required_str(template, "default_witness_commitment")?)?;
+    let commitment_script =
+        Vec::<u8>::from_hex(&required_str(template, "default_witness_commitment")?)?;
     assert!(
         commitment_script.starts_with(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]),
         "default_witness_commitment must be the BIP141 commitment script"
@@ -430,7 +432,7 @@ fn assemble_from_template(
             .get("data")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("template transaction missing data hex"))?;
-        txs.push(native_deserialize::<Tx>(&hex_decode(data)?)?);
+        txs.push(native_deserialize::<Tx>(&Vec::<u8>::from_hex(data)?)?);
     }
 
     assemble_block(
@@ -459,7 +461,7 @@ fn seed_coinbase_spend_with_fee(fee_sats: u64) -> Tx {
     let seed_coinbase = Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: null_prevout(),
+            previous_output: OutPoint::null(),
             // Must mirror the height-1 seed coinbase exactly (txid anchors
             // the mempool spend).
             script_sig: Script::from_bytes([push_int(1), push_int(0)].concat()),
@@ -509,7 +511,7 @@ fn assemble_regtest_block(prev: Hash256, height: u32, txs: Vec<Tx>) -> Result<Bl
     let coinbase = Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: null_prevout(),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
             sequence: Sequence::from_consensus(0xffff_ffff),
             witness: Witness::new(),
@@ -569,7 +571,7 @@ fn mine_regtest_block(
     let coinbase = Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: null_prevout(),
+            previous_output: OutPoint::null(),
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
             script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
@@ -662,7 +664,7 @@ fn assemble_block(
     let coinbase = Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: null_prevout(),
+            previous_output: OutPoint::null(),
             // BIP34: the coinbase scriptSig begins with the serialized height.
             script_sig: Script::from_bytes(push_int(i64::from(height))),
             sequence: Sequence::from_consensus(0xffff_ffff),
@@ -704,11 +706,6 @@ fn assemble_block(
     Ok(block)
 }
 
-/// The one-input null-prevout coinbase outpoint (Core `COINBASE_OUTPOINT`).
-fn null_prevout() -> OutPoint {
-    OutPoint::new(Txid::default(), u32::MAX)
-}
-
 /// Native BIP141 witness merkle fold with the odd-leaf duplication rule.
 /// The coinbase wtxid is replaced by all-zeroes before folding.
 fn compute_witness_merkle_root(txs: &[Tx]) -> Option<Hash256> {
@@ -733,42 +730,6 @@ fn compute_witness_merkle_root(txs: &[Tx]) -> Option<Hash256> {
         level = next;
     }
     Some(Hash256::from_le_bytes(&level[0]))
-}
-
-/// Encodes `bytes` as lowercase hexadecimal.
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
-
-/// Decodes a hexadecimal string into bytes.
-fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    let bytes = hex.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        bail!("hex string must have even length");
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.as_chunks::<2>().0 {
-        let hi = hex_nibble(pair[0]).ok_or_else(|| anyhow::anyhow!("invalid hex"))?;
-        let lo = hex_nibble(pair[1]).ok_or_else(|| anyhow::anyhow!("invalid hex"))?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-/// Decodes one ASCII hex nibble.
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn required_str(value: &sonic_rs::Value, key: &str) -> Result<String> {
@@ -999,7 +960,7 @@ fn submitblock_accepts_block_without_prior_mempool_admission() -> Result<()> {
     assert!(!state.mempool().read().contains_txid(&tx.txid()));
 
     let block = assemble_regtest_block(seed_tip_hash, SEED_BLOCKS + 1, vec![tx])?;
-    let block_hex = hex_encode(&consensus_bytes(&block));
+    let block_hex = consensus_bytes(&block).to_lower_hex_string();
 
     let handler = mining_handler(&state);
     let verdict = handler.dispatch("submitblock", &json!([block_hex]))?;
@@ -1034,7 +995,7 @@ fn submitblock_rejects_stale_template_with_inconclusive_prevblk() -> Result<()> 
         .and_then(|value| value.as_array())
         .map_or(&[][..], |entries| entries.as_slice());
     let accepted = assemble_from_template(&template, template_txs)?;
-    let accepted_hex = hex_encode(&consensus_bytes(&accepted));
+    let accepted_hex = consensus_bytes(&accepted).to_lower_hex_string();
     let verdict = handler.dispatch("submitblock", &json!([accepted_hex]))?;
     assert!(
         verdict.is_null(),
@@ -1043,7 +1004,7 @@ fn submitblock_rejects_stale_template_with_inconclusive_prevblk() -> Result<()> 
 
     // A competing block built on the superseded template still points at old_tip.
     let stale_block = assemble_regtest_block(old_tip, SEED_BLOCKS + 1, Vec::new())?;
-    let stale_hex = hex_encode(&consensus_bytes(&stale_block));
+    let stale_hex = consensus_bytes(&stale_block).to_lower_hex_string();
     let reject = handler.dispatch("submitblock", &json!([stale_hex]))?;
     let reason = reject
         .as_str()
@@ -1106,7 +1067,7 @@ fn post_connect_template_pool_and_estimator_observables() -> Result<()> {
         .and_then(|value| value.as_array())
         .map_or(&[][..], |entries| entries.as_slice());
     let block = assemble_from_template(&template, template_txs)?;
-    let block_hex = hex_encode(&consensus_bytes(&block));
+    let block_hex = consensus_bytes(&block).to_lower_hex_string();
     let verdict = handler.dispatch("submitblock", &json!([block_hex]))?;
     assert!(
         verdict.is_null(),

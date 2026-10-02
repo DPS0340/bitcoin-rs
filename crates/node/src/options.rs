@@ -23,11 +23,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr as _;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, Visitor};
 
 use crate::config::{NetworkSelection, NotificationConfig, ScriptIndexMode};
+use bitcoin::hex::FromHex;
 use bitcoin_rs_chainstate::ValidationMode;
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_storage::StorageBackend;
@@ -77,15 +78,8 @@ fn parse_bool(value: &str) -> Result<bool> {
 /// Parses P2P message-start bytes as eight hexadecimal characters.
 pub fn parse_p2p_magic(value: &str) -> Result<[u8; 4]> {
     let value = value.trim();
-    ensure!(
-        value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "p2p magic must be exactly eight hexadecimal characters"
-    );
-    let mut magic = [0; 4];
-    for (index, slot) in magic.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)?;
-    }
-    Ok(magic)
+    <[u8; 4]>::from_hex(value)
+        .map_err(|_| anyhow::anyhow!("p2p magic must be exactly eight hexadecimal characters"))
 }
 
 /// Parses one fixed outbound peer endpoint: a socket address or a

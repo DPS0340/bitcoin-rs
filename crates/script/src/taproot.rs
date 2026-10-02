@@ -124,6 +124,7 @@ pub fn verify_taproot_commitment(control: &[u8], program: &[u8], tapleaf_hash: &
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::hex::FromHex;
     use bitcoin_rs_primitives::Hash256;
     use secp256k1::{Keypair, Message, Parity, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
     use sha2::{Digest, Sha256};
@@ -309,12 +310,8 @@ mod tests {
         assert_eq!(merkle.as_byte_array(), fixture.tapleaf.as_byte_array());
     }
 
-    fn fixture_hex(text: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
-        assert!(text.len().is_multiple_of(2));
-        (0..text.len())
-            .step_by(2)
-            .map(|offset| u8::from_str_radix(&text[offset..offset + 2], 16))
-            .collect()
+    fn fixture_hex(text: &str) -> Vec<u8> {
+        Vec::from_hex(text).unwrap_or_else(|error| panic!("bad fixture hex: {error}"))
     }
 
     struct CommitmentVector {
@@ -408,17 +405,17 @@ mod tests {
             output,
         } in BIP341_VECTORS
         {
-            let mut control = fixture_hex(control)?;
-            let leaf: [u8; 32] = fixture_hex(leaf)?.try_into().map_err(|_| "leaf width")?;
+            let mut control = fixture_hex(control);
+            let leaf: [u8; 32] = fixture_hex(leaf).try_into().map_err(|_| "leaf width")?;
             let leaf = Hash256::from_le_bytes(&leaf);
-            let expected_root = fixture_hex(root)?;
+            let expected_root = fixture_hex(root);
             let actual = compute_taproot_merkle_root(&control, &leaf);
             assert_eq!(actual.as_byte_array().as_slice(), expected_root);
             let mut engine = std::sync::LazyLock::force(&super::TAPTWEAK_ENGINE).clone();
             Digest::update(&mut engine, &control[1..33]);
             Digest::update(&mut engine, actual.as_byte_array());
-            assert_eq!(engine.finalize().as_slice(), fixture_hex(tweak)?);
-            let output = fixture_hex(output)?;
+            assert_eq!(engine.finalize().as_slice(), fixture_hex(tweak));
+            let output = fixture_hex(output);
             assert!(verify_taproot_commitment(&control, &output, &leaf));
             control[0] ^= 1;
             assert!(!verify_taproot_commitment(&control, &output, &leaf));

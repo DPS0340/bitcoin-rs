@@ -621,6 +621,7 @@ fn sighash_to_script_error(error: &SighashError) -> ScriptError {
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, reason = "test assertions")]
+    use bitcoin::hex::FromHex;
     use bitcoin_rs_primitives::{
         Amount, Hash256, LockTime, OutPoint, Script, Sequence, SighashCache, Tx, TxIn, TxOut, Txid,
         Witness,
@@ -1166,14 +1167,6 @@ mod tests {
     // --- utility ---
 
     fn hex_decode(s: &str) -> Vec<u8> {
-        s.as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|chunk| {
-                let hex = std::str::from_utf8(chunk).expect("hex chars are ASCII");
-                u8::from_str_radix(hex, 16).unwrap_or_else(|e| panic!("hex decode: {e}"))
-            })
-            .collect()
+        Vec::from_hex(s).unwrap_or_else(|error| panic!("bad hex: {error}"))
     }
 }

@@ -40,10 +40,11 @@ use bitcoin_rs_rpc::{
     },
 };
 
-use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
+use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd, is_coinbase_tx};
 
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
+use bitcoin::hex::DisplayHex;
 use std::error::Error;
 
 fn p2wpkh_script() -> Vec<u8> {
@@ -79,18 +80,7 @@ fn rpc_txid(tx: &Tx) -> Txid {
 /// Native consensus hex for RPC submission: the exact wire image the node
 /// decoder consumes.
 fn raw_tx_hex(tx: &Tx) -> String {
-    hex_encode(&consensus_bytes(tx))
-}
-
-/// Encodes `bytes` as lowercase hexadecimal.
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
+    consensus_bytes(tx).to_lower_hex_string()
 }
 
 /// Commits one funded UTXO to the context's UTXO set and returns the RPC-side
@@ -1537,21 +1527,11 @@ fn open_regtest_state() -> Result<(NodeState, tempfile::TempDir), Box<dyn Error>
     Ok((state, dir))
 }
 
-/// The one-input null-prevout coinbase outpoint (Core `COINBASE_OUTPOINT`).
-fn null_prevout() -> OutPoint {
-    OutPoint::new(Txid::default(), u32::MAX)
-}
-
-/// Core `IsCoinBase` shape: exactly one input spending the null prevout.
-fn is_coinbase(tx: &Tx) -> bool {
-    tx.inputs.len() == 1 && tx.inputs[0].previous_output == null_prevout()
-}
-
 fn reorg_seed_coinbase(height: u32) -> Tx {
     Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: null_prevout(),
+            previous_output: OutPoint::null(),
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
             script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
@@ -1758,7 +1738,7 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
         mined_block
             .txs
             .iter()
-            .filter(|tx| !is_coinbase(tx))
+            .filter(|tx| !is_coinbase_tx(tx))
             .map(|tx| Arc::new(tx.clone())),
     );
     assert_eq!(committed.len(), 1, "one admitted candidate: the spend");

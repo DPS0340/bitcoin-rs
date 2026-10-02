@@ -32,6 +32,7 @@
 use std::str::FromStr;
 
 use bitcoin::ScriptBuf;
+use bitcoin::hex::FromHex;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::taproot::{LeafVersion, TaprootBuilder};
 use bitcoin_rs_primitives::tapleaf_hash;
@@ -542,13 +543,7 @@ fn lookup_opcode(bare: &str) -> Option<u8> {
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("odd length: {}", hex.len()));
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| format!("at offset {i}: {e}")))
-        .collect()
+    Vec::from_hex(hex).map_err(|error| error.to_string())
 }
 
 // ===========================================================================
@@ -559,7 +554,7 @@ fn build_crediting_tx(script_pubkey: &[u8], amount: u64) -> Tx {
     Tx {
         version: 1,
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: vec![opcode::OP_0, opcode::OP_0].into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),

@@ -299,7 +299,7 @@ fn seed_coinbase(height: u32) -> Tx {
     Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: null_prevout(),
+            previous_output: OutPoint::null(),
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
             script_sig: [push_int(i64::from(height)), push_int(0)].concat().into(),
@@ -334,11 +334,6 @@ fn seed_coinbase_spend() -> Tx {
         }],
         lock_time: LockTime::ZERO,
     }
-}
-
-/// The one-input null-prevout coinbase outpoint (Core `COINBASE_OUTPOINT`).
-fn null_prevout() -> OutPoint {
-    OutPoint::new(Txid::default(), u32::MAX)
 }
 
 /// Dropping a node without `shutdown` must still run the ordered teardown in

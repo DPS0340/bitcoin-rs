@@ -150,7 +150,7 @@ fn mined_child_labeled(prev: BlockHash, label: i64) -> anyhow::Result<Block> {
         version: 2,
         lock_time: LockTime::from_consensus(0),
         inputs: vec![TxIn {
-            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![script_opcode, 0x51]),
             sequence: Sequence::from_consensus(u32::MAX),
             witness: Witness::new(),

@@ -140,11 +140,7 @@ mod tests {
 
     /// A coinbase paying one output, so `advance` sees a creation.
     fn paying(script_pubkey: Vec<u8>, value: u64) -> Tx {
-        tx(
-            OutPoint::new(Txid::default(), u32::MAX),
-            script_pubkey,
-            value,
-        )
+        tx(OutPoint::null(), script_pubkey, value)
     }
 
     fn spending(previous_output: OutPoint) -> Tx {

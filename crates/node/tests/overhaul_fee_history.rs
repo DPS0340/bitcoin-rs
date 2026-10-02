@@ -162,7 +162,7 @@ fn mine_and_apply(
     let coinbase = Tx {
         version: 2,
         inputs: vec![TxIn {
-            previous_output: null_prevout(),
+            previous_output: OutPoint::null(),
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig.
             script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
@@ -195,10 +195,6 @@ fn mine_and_apply(
         .apply_block(&block)
         .map_err(|error| anyhow!("apply failed at height {height}: {error}"))?;
     Ok(block)
-}
-
-fn null_prevout() -> OutPoint {
-    OutPoint::new(Txid::default(), u32::MAX)
 }
 
 // ---------------------------------------------------------------------------
