@@ -1397,11 +1397,24 @@ fn proposal_of_a_header_only_block_is_duplicate_inconclusive() -> anyhow::Result
 }
 
 fn disconnect_applied(state: &NodeState, block: &Block) -> anyhow::Result<()> {
-    state
-        .chain_followers()
-        .apply_disconnect(&state.chainstate(), block)
-        .map(|_| ())
-        .map_err(|error| anyhow::anyhow!("{error}"))
+    use bitcoin_rs_primitives::consensus_bytes;
+    let genesis = Network::Regtest.genesis_block();
+    let target = state
+        .chainstate()
+        .block_tree_reader()
+        .read()
+        .lookup(Hash256::from(genesis.block_hash()))
+        .ok_or_else(|| anyhow::anyhow!("missing genesis node"))?;
+    let block_hash = Hash256::from(block.block_hash());
+    let body = block.clone();
+    bitcoin_rs_node::reorg::switch_to_branch(
+        &state.chainstate(),
+        &state.chain_followers(),
+        target,
+        |hash| (hash == block_hash).then(|| (body.clone(), consensus_bytes(&body).into())),
+        |_| {},
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 // CONTRACT: API-18
