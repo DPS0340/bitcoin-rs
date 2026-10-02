@@ -778,30 +778,27 @@ fn capture_output(mut reader: impl Read + Send + 'static, file: PathBuf) -> Join
         };
         let mut tail: VecDeque<u8> = VecDeque::new();
         let limit = usize::try_from(MAX_OUTPUT).unwrap_or(usize::MAX);
-        let mut pending = 0_usize; // tail bytes not yet mirrored to the file
+        // File bytes already dropped from `tail`; once they reach `limit` the
+        // file (stale head + live tail) is compacted back to the tail.
+        let mut stale = 0_usize;
         let mut buffer = [0_u8; 8192];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
                     tail.extend(buffer[..count].iter().copied());
-                    pending += count;
+                    let _ = file.write_all(&buffer[..count]);
                     let excess = tail.len().saturating_sub(limit);
                     if excess > 0 {
                         tail.drain(..excess);
-                        // File-held bytes were dropped from the head: rewrite.
-                        pending = tail.len();
+                        stale += excess;
                     }
-                    let tail_len = tail.len();
-                    let tail_slice = tail.make_contiguous();
-                    if pending == tail_len {
+                    if stale >= limit {
                         let _ = file.rewind();
                         let _ = file.set_len(0);
-                        let _ = file.write_all(tail_slice);
-                    } else if pending > 0 {
-                        let _ = file.write_all(&tail_slice[tail_len - pending..]);
+                        let _ = file.write_all(tail.make_contiguous());
+                        stale = 0;
                     }
-                    pending = 0;
                     let _ = file.flush();
                 }
             }

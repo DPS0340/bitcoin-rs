@@ -117,10 +117,28 @@ def _commands(source: Path) -> dict[str, bytes]:
     if table is None:
         raise ValueError("Cannot find the P2P COMMANDS inventory")
     table_source = stripped[table.start(1):table.end(1)]
-    prefix = r'(?:br|cr|b)?r?#*'
-    commands = re.findall(prefix + r'"([a-z0-9]{1,12})"', table_source)
-    if (not commands or len(commands) > 256 or len(set(commands)) != len(commands)
-            or len(commands) != len(re.findall(prefix + r'"[^"]*"', table_source))):
+    # Sequential parse: every comma-separated entry must be one complete
+    # literal — r#"x"junk"# is not the entry "x" and must not parse as it.
+    literal = re.compile(
+        r'(?:(b|c)?r(#{0,255})"([^"]*)"\2|(?:b|c)?"([^"]*)")'
+    )
+    whitespace = re.compile(r"\s*")
+    name = re.compile(r"[a-z0-9]{1,12}")
+    commands: list[str] = []
+    pos = whitespace.match(table_source).end()
+    while pos < len(table_source):
+        entry = literal.match(table_source, pos)
+        value = entry and (entry.group(3) or entry.group(4))
+        if value is None or name.fullmatch(value) is None:
+            raise ValueError("Invalid P2P COMMANDS inventory")
+        commands.append(value)
+        pos = whitespace.match(table_source, entry.end()).end()
+        if pos >= len(table_source):
+            break
+        if table_source[pos] != ",":
+            raise ValueError("Invalid P2P COMMANDS inventory")
+        pos = whitespace.match(table_source, pos + 1).end()
+    if not commands or len(commands) > 256 or len(set(commands)) != len(commands):
         raise ValueError("Invalid P2P COMMANDS inventory")
     return {name: bytes([index]) for index, name in enumerate(commands)}
 
