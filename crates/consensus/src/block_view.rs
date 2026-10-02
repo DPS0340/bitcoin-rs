@@ -178,12 +178,6 @@ pub struct BlockView<'b> {
 }
 
 impl<'b> BlockView<'b> {
-    /// Builds a view from decoded transactions and precomputed transaction IDs.
-    #[must_use]
-    pub fn new(txs: &'b [Tx], txids: Vec<Txid>) -> Self {
-        Self::from_facts(txs, BlockFacts::from_txids(txs, txids))
-    }
-
     /// Builds a view from decoded transactions and existing facts.
     #[must_use]
     pub fn from_facts(txs: &'b [Tx], facts: BlockFacts) -> Self {

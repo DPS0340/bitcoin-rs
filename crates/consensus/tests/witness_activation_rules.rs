@@ -4,7 +4,7 @@
 //! `CheckWitnessMalleation`. These fixtures isolate block witness rules; they
 //! are not mined or UTXO-valid chain fixtures.
 
-use bitcoin_rs_consensus::BlockView;
+use bitcoin_rs_consensus::{BlockFacts, BlockView};
 use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_consensus::verify_block::{
     BlockRuleContext, verify_block_rules, verify_block_rules_precomputed,
@@ -72,7 +72,7 @@ fn block(tx: Tx) -> Block {
 
 fn verify_with_activation(block: &Block, segwit_active: bool) -> Result<(), ConsensusError> {
     let txids = block.txs.iter().map(Tx::txid).collect();
-    let mut view = BlockView::new(&block.txs, txids);
+    let mut view = BlockView::from_facts(&block.txs, BlockFacts::from_txids(&block.txs, txids));
     if view.facts().has_witness() {
         let _ = view.witness_ids();
     }
