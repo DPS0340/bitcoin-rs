@@ -20,7 +20,7 @@ use crate::download_window::SyncBudget;
 
 /// Bounded in-memory staging set for inbound block bodies.
 #[derive(Debug)]
-pub struct BlockStager {
+pub(crate) struct BlockStager {
     budget: SyncBudget,
     received: HashMap<Hash256, ReceivedBlock>,
     received_order: VecDeque<Hash256>,
@@ -84,16 +84,9 @@ impl DrainedBlock {
     }
 }
 
-/// A staged body dropped for retry or eviction.
-#[derive(Clone, Debug)]
-pub struct DroppedBlock {
-    /// Identity of the dropped body.
-    pub hash: Hash256,
-}
-
 /// Result of attempting to stage one inbound body.
 #[derive(Clone, Debug)]
-pub enum StagedBlock {
+pub(crate) enum StagedBlock {
     /// The hash is already in the staging set.
     AlreadyStaged,
     /// The body is retained. `dropped` are count-budget evictions caused by
@@ -102,20 +95,20 @@ pub enum StagedBlock {
         /// Serialized size of the newly staged body.
         bytes: usize,
         /// Bodies evicted so this insert could fit the slot budget.
-        dropped: Vec<DroppedBlock>,
+        dropped: Vec<Hash256>,
     },
     /// The body was refused (byte budget or oversize) and should be
     /// re-requested.
     DroppedForRetry {
         /// The refused body.
-        dropped: DroppedBlock,
+        hash: Hash256,
     },
 }
 
 impl BlockStager {
     /// Empty stager sized to `budget`.
     #[must_use]
-    pub fn new(budget: SyncBudget) -> Self {
+    pub(crate) fn new(budget: SyncBudget) -> Self {
         Self {
             budget,
             received: HashMap::with_capacity(budget.max_received_blocks),
@@ -136,19 +129,19 @@ impl BlockStager {
 
     /// Total serialized bytes of currently staged bodies.
     #[must_use]
-    pub fn received_bytes(&self) -> usize {
+    pub(crate) fn received_bytes(&self) -> usize {
         self.received_bytes
     }
 
     /// Highest staged-block population ever observed this run.
     #[must_use]
-    pub const fn received_high_water(&self) -> usize {
+    pub(crate) const fn received_high_water(&self) -> usize {
         self.received_blocks_high_water
     }
 
     /// Highest staged-byte total ever observed this run; feeds the high-water gauge.
     #[must_use]
-    pub const fn received_bytes_high_water(&self) -> usize {
+    pub(crate) const fn received_bytes_high_water(&self) -> usize {
         self.received_bytes_high_water
     }
 
@@ -178,7 +171,7 @@ impl BlockStager {
     }
 
     /// Stages `block` or refuses it for retry under the byte budget.
-    pub fn insert(
+    pub(crate) fn insert(
         &mut self,
         hash: Hash256,
         next_expected_hash: Option<Hash256>,
@@ -194,9 +187,7 @@ impl BlockStager {
         let bytes = serialized.len();
         debug_assert_eq!(bytes, block_size(&block));
         if bytes > self.budget.max_received_bytes {
-            return StagedBlock::DroppedForRetry {
-                dropped: DroppedBlock { hash },
-            };
+            return StagedBlock::DroppedForRetry { hash };
         }
         // Byte-budget exhaustion is backpressure, not eviction: refuse the
         // incoming block (it stays re-requestable through the window's
@@ -207,9 +198,7 @@ impl BlockStager {
         if Some(hash) != next_expected_hash
             && self.received_bytes.saturating_add(bytes) > self.budget.max_received_bytes
         {
-            return StagedBlock::DroppedForRetry {
-                dropped: DroppedBlock { hash },
-            };
+            return StagedBlock::DroppedForRetry { hash };
         }
 
         entry.insert(ReceivedBlock {
@@ -243,7 +232,7 @@ impl BlockStager {
     /// no-blame guard: a staged next-expected block means the apply side owns
     /// the frontier.
     #[must_use]
-    pub fn contains(&self, hash: &Hash256) -> bool {
+    pub(crate) fn contains(&self, hash: &Hash256) -> bool {
         self.received.contains_key(hash)
     }
 
@@ -274,7 +263,7 @@ impl BlockStager {
     /// Clones one staged decoded body and its original wire bytes without
     /// removing it from the bounded staging set.
     #[must_use]
-    pub fn staged_body(&self, hash: Hash256) -> Option<(Block, bytes::Bytes)> {
+    pub(crate) fn staged_body(&self, hash: Hash256) -> Option<(Block, bytes::Bytes)> {
         self.received
             .get(&hash)
             .map(|entry| (entry.block.clone(), entry.serialized.clone()))
@@ -360,7 +349,7 @@ impl BlockStager {
     }
 
     /// Drops staged bodies whose received deadline has passed.
-    pub(crate) fn prune_expired(&mut self, now: Instant) -> Vec<DroppedBlock> {
+    pub(crate) fn prune_expired(&mut self, now: Instant) -> Vec<Hash256> {
         if self.received.is_empty() {
             self.next_received_deadline = None;
             return Vec::new();
@@ -388,7 +377,7 @@ impl BlockStager {
             }
             received_bytes = received_bytes.saturating_sub(entry.bytes);
             gate_pending_dropped += usize::from(entry.gate_pending);
-            dropped.push(DroppedBlock { hash: *hash });
+            dropped.push(*hash);
             false
         });
         self.gate_pending_count = self.gate_pending_count.saturating_sub(gate_pending_dropped);
@@ -398,7 +387,7 @@ impl BlockStager {
         dropped
     }
 
-    fn evict_over_budget(&mut self, next_expected_hash: Option<Hash256>) -> Vec<DroppedBlock> {
+    fn evict_over_budget(&mut self, next_expected_hash: Option<Hash256>) -> Vec<Hash256> {
         let mut dropped = Vec::new();
         while self.is_over_count_budget() {
             let Some(hash) = self.oldest_unprotected_candidate(next_expected_hash) else {
@@ -439,19 +428,19 @@ impl BlockStager {
         self.received.len() > self.budget.max_received_blocks
     }
 
-    fn remove(&mut self, hash: &Hash256) -> Option<DroppedBlock> {
+    fn remove(&mut self, hash: &Hash256) -> Option<Hash256> {
         let entry = self.received.remove(hash)?;
         if entry.gate_pending {
             self.gate_pending_count = self.gate_pending_count.saturating_sub(1);
         }
         self.received_bytes = self.received_bytes.saturating_sub(entry.bytes);
-        Some(DroppedBlock { hash: *hash })
+        Some(*hash)
     }
 
     /// Drops the staged body for `hash`, releasing its staging-budget bytes.
     /// Used for bodies whose embedded header is permanently inadmissible —
     /// they can never become expected, so they are dead inventory.
-    pub fn discard(&mut self, hash: &Hash256) -> bool {
+    pub(crate) fn discard(&mut self, hash: &Hash256) -> bool {
         self.remove(hash).is_some()
     }
 
@@ -695,19 +684,19 @@ mod tests {
         let first_drop = stager.prune_expired(now);
 
         assert_eq!(first_drop.len(), 1);
-        assert_eq!(first_drop[0].hash, old);
+        assert_eq!(first_drop[0], old);
         assert_eq!(stager.received_len(), 1);
         assert!(stager.contains(&fresh));
 
         let second_drop = stager.prune_expired(now + Duration::from_secs(1));
 
-        assert!(second_drop.is_empty());
+        assert_eq!(second_drop, Vec::<Hash256>::new());
         assert!(stager.contains(&fresh));
 
         let final_drop = stager.prune_expired(now + Duration::from_secs(10));
 
         assert_eq!(final_drop.len(), 1);
-        assert_eq!(final_drop[0].hash, fresh);
+        assert_eq!(final_drop[0], fresh);
         assert_eq!(stager.received_len(), 0);
     }
 
@@ -765,7 +754,7 @@ mod tests {
         let dropped = stager.prune_expired(now + Duration::from_secs(10));
 
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].hash, hash);
+        assert_eq!(dropped[0], hash);
         assert_eq!(stager.received_len(), 0);
         assert_eq!(stager.received_bytes(), 0);
     }
@@ -835,9 +824,9 @@ mod tests {
         };
 
         assert_eq!(dropped.len(), 3);
-        assert_eq!(dropped[0].hash, first);
-        assert_eq!(dropped[1].hash, second);
-        assert_eq!(dropped[2].hash, third);
+        assert_eq!(dropped[0], first);
+        assert_eq!(dropped[1], second);
+        assert_eq!(dropped[2], third);
         assert!(stager.contains(&protected));
         assert!(stager.contains(&incoming));
         assert_eq!(stager.received_len(), 2);
@@ -870,8 +859,8 @@ mod tests {
             }
         };
         assert_eq!(dropped.len(), 2);
-        assert_eq!(dropped[0].hash, first);
-        assert_eq!(dropped[1].hash, second);
+        assert_eq!(dropped[0], first);
+        assert_eq!(dropped[1], second);
         assert!(!stager.contains(&first));
         assert!(!stager.contains(&second));
         assert!(stager.contains(&third));
@@ -906,7 +895,7 @@ mod tests {
         );
         let dropped = stager.prune_expired(now + Duration::from_secs(10));
 
-        assert!(dropped.is_empty());
+        assert_eq!(dropped, Vec::<Hash256>::new());
         assert!(stager.contains(&fresh));
     }
 
@@ -939,7 +928,7 @@ mod tests {
         };
 
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].hash, second);
+        assert_eq!(dropped[0], second);
         assert!(!stager.contains(&first));
         assert!(!stager.contains(&second));
         assert!(stager.contains(&third));
@@ -1053,8 +1042,8 @@ mod tests {
                 None,
                 now,
             ) {
-                super::StagedBlock::DroppedForRetry { dropped } => {
-                    assert_eq!(dropped.hash, incoming);
+                super::StagedBlock::DroppedForRetry { hash } => {
+                    assert_eq!(hash, incoming);
                 }
                 other => panic!("exhausted stager should refuse incoming block: {other:?}"),
             }
@@ -1147,7 +1136,7 @@ mod tests {
             }
         };
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].hash, first);
+        assert_eq!(dropped[0], first);
         assert!(stager.contains(&second));
     }
 
@@ -1177,7 +1166,7 @@ mod tests {
         ) else {
             panic!("fork block should stage");
         };
-        assert!(dropped.is_empty());
+        assert_eq!(dropped, Vec::<Hash256>::new());
 
         let super::StagedBlock::Memory { dropped, .. } = stager.insert(
             expected_hash,
@@ -1190,7 +1179,7 @@ mod tests {
             panic!("expected block should stage");
         };
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].hash, fork_hash);
+        assert_eq!(dropped[0], fork_hash);
         assert_eq!(stager.received_len(), 1);
         assert!(stager.contains(&expected_hash));
     }

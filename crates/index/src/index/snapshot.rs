@@ -50,10 +50,7 @@ pub trait TxIndexSnapshot: Send + Sync {
     fn capability_watermark(
         &self,
         capability: IndexCapability,
-    ) -> Result<Option<IndexWatermark>, IndexError> {
-        let _ = capability;
-        self.watermark()
-    }
+    ) -> Result<Option<IndexWatermark>, IndexError>;
     /// Loads one capability's coverage floor: the first height its committed
     /// rows cover. `0` means complete coverage from genesis.
     fn capability_floor(&self, capability: IndexCapability) -> Result<u32, IndexError> {
@@ -83,10 +80,7 @@ pub trait TxIndexSnapshot: Send + Sync {
         &self,
         scripthash: ScriptHash,
         limit: PrefixScanLimit,
-    ) -> Result<ScriptLiveScan, IndexError> {
-        let _ = (scripthash, limit);
-        Err(IndexError::UnsupportedRollback)
-    }
+    ) -> Result<ScriptLiveScan, IndexError>;
 }
 
 struct StoreTxIndexSnapshot<'a> {

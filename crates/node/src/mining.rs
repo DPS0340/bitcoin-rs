@@ -283,7 +283,11 @@ impl MempoolSnapshotSource for MempoolAdapter {
                             let outpoint = input.previous_output;
                             if let hashbrown::hash_map::Entry::Vacant(slot) =
                                 prevouts.entry(outpoint)
-                                && let Some(output) = self.chainstate.utxo_reader().get(&outpoint)
+                                && let Some(output) = self
+                                    .chainstate
+                                    .utxo_reader()
+                                    .get_entry(&outpoint)
+                                    .map(|coin| coin.txout)
                             {
                                 slot.insert(output);
                             }

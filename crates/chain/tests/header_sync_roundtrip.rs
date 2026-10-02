@@ -171,7 +171,7 @@ fn next_work_required_is_exactly_what_validate_header_nbits_enforces()
     // The one next-work source: the bits a candidate builder reads are the
     // bits validation demands at the same parent and candidate time.
     let expected = next_work_required(&tree, parent_id, candidate_time, Network::Regtest)?;
-    assert_eq!(expected, bits);
+    assert_eq!(expected.to_consensus(), bits);
 
     let candidate = raw_header_with(parent.compute_hash(), 1, candidate_time, expected);
     validate_header_nbits(&tree, parent_id, &candidate, Network::Regtest)?;
@@ -195,7 +195,7 @@ fn next_work_required_recovers_minimum_difficulty_past_the_spacing_window()
 
     // Within 2*spacing of the parent the difficulty carries over unchanged.
     assert_eq!(
-        next_work_required(&tree, parent_id, spacing, Network::Testnet3)?,
+        next_work_required(&tree, parent_id, spacing, Network::Testnet3)?.to_consensus(),
         bits
     );
 
@@ -207,7 +207,8 @@ fn next_work_required_recovers_minimum_difficulty_past_the_spacing_window()
             parent_id,
             spacing.saturating_mul(2).saturating_add(1),
             Network::Testnet3
-        )?,
+        )?
+        .to_consensus(),
         0x1d00_ffff_u32
     );
     Ok(())

@@ -75,8 +75,7 @@ pub(crate) fn transaction_json(
     let vin: Vec<Value> = tx
         .inputs
         .iter()
-        .enumerate()
-        .map(|(index, input)| input_json(input, index == 0 && coinbase))
+        .map(|input| input_json(input, coinbase))
         .collect();
     let vout: Vec<Value> = tx
         .outputs

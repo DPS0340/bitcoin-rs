@@ -1,6 +1,6 @@
 //! Production-shaped UTXO commit benchmarks.
 //!
-//! The retained cases exercise the public `UtxoSet::commit_block` path with a
+//! The retained cases exercise the public `contract::commit_block_changes` path with a
 //! normal mixed-shard block, a concentrated worst-case block, and a spend-heavy
 //! block. Correctness edge cases belong in the UTXO test suite rather than in
 //! long-lived benchmark arms.

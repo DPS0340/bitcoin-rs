@@ -71,8 +71,6 @@ pub fn open_journal_dir(data_dir: &Path) -> Result<cap_std::fs::Dir> {
 fn restored_initial(
     restored: crate::checkpoint::RestoredChainstate,
     config: ChainstateJournalConfig,
-    open_existing: bool,
-    resume_source: ResumeSource,
 ) -> Result<InitialChainstate> {
     let journal_bootstrap = if config.enabled {
         let node = restored.tree.node(restored.applied_tip.tip_id)?;
@@ -81,7 +79,7 @@ fn restored_initial(
             None => [0_u8; 32],
         };
         Some(JournalBootstrap {
-            open_existing,
+            open_existing: false,
             base_generation: restored.generation,
             height: restored.applied_tip.height,
             block_hash: restored.applied_tip.hash.to_le_bytes(),
@@ -97,7 +95,7 @@ fn restored_initial(
         coin_stats: restored.coin_stats,
         tree: restored.tree,
         applied_tip: Some(restored.applied_tip),
-        resume_source,
+        resume_source: ResumeSource::Checkpoint,
         journal_bootstrap,
     })
 }
@@ -187,7 +185,7 @@ pub fn prepare_initial_chainstate(
             reason = "journal_disabled",
             "chainstate restore selected"
         );
-        return restored_initial(restored, journal_config, false, ResumeSource::Checkpoint);
+        return restored_initial(restored, journal_config);
     }
 
     let base_generation = restored.generation;
@@ -269,7 +267,7 @@ pub fn prepare_initial_chainstate(
             let crate::checkpoint::CheckpointLoad::Complete(reloaded) = reloaded else {
                 bail!("checkpoint disappeared while recovering from journal fallback");
             };
-            restored_initial(*reloaded, journal_config, false, ResumeSource::Checkpoint)
+            restored_initial(*reloaded, journal_config)
         }
     }
 }

@@ -20,7 +20,7 @@ use disconnect::disconnect_block_admitted;
 pub use durable::recover_disconnect_marker;
 use hashbrown::HashMap;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use scratch::{ApplyScratchCapacities, SameBlockSpentSet};
+use scratch::SameBlockSpentSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use window::{PublishMode, apply_window_admitted};
@@ -1072,16 +1072,9 @@ impl Chainstate {
             disposition: WindowApplyDisposition::Operational,
             invalidated: Box::default(),
         })?;
-        match transition.connect_window(blocks, serialized) {
-            Ok(committed) => {
-                drop(transition);
-                Ok(committed)
-            }
-            Err(error) => {
-                drop(transition);
-                Err(error)
-            }
-        }
+        let result = transition.connect_window(blocks, serialized);
+        drop(transition);
+        result
     }
 
     /// See `ARCH-07` in `docs/contracts/architecture.md`.
@@ -1273,11 +1266,12 @@ impl bitcoin_rs_primitives::Sink for ByteEquality<'_> {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct BlockTxPlan {
     only_coinbase: bool,
     needs_local_utxo_overlay: bool,
     overlay_capacity: usize,
-    witness_presence: WitnessPresence,
+    has_witness: bool,
     has_bip68_sequence_locks: bool,
     created_output_count: usize,
     spent_input_count: usize,
@@ -1291,46 +1285,6 @@ impl BlockTxPlan {
         static NONE: std::sync::LazyLock<SameBlockSpentSet> =
             std::sync::LazyLock::new(SameBlockSpentSet::new);
         self.same_block_spent.as_ref().unwrap_or(&NONE)
-    }
-
-    fn into_scratch_parts(
-        self,
-        txids: Vec<Txid>,
-    ) -> (
-        Vec<Txid>,
-        ApplyScratchCapacities,
-        Option<SameBlockSpentSet>,
-        usize,
-    ) {
-        (
-            txids,
-            ApplyScratchCapacities {
-                created_outputs: self.created_output_count,
-                spent_inputs: self.spent_input_count,
-            },
-            self.same_block_spent,
-            self.same_block_spent_input_count,
-        )
-    }
-}
-
-#[derive(Clone, Copy)]
-enum WitnessPresence {
-    Absent,
-    Present,
-}
-
-impl WitnessPresence {
-    const fn from_bool(has_witness: bool) -> Self {
-        if has_witness {
-            Self::Present
-        } else {
-            Self::Absent
-        }
-    }
-
-    const fn is_present(self) -> bool {
-        matches!(self, Self::Present)
     }
 }
 

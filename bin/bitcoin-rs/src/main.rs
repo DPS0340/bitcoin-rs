@@ -22,7 +22,7 @@ mod toml;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn config_from(
-    cli: cli::CliArgs,
+    mut cli: cli::CliArgs,
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> anyhow::Result<bitcoin_rs_node::NodeConfig> {
     let mut layers = Vec::new();
@@ -30,7 +30,7 @@ fn config_from(
         layers.push(toml::user_config_from_path(path)?);
     }
     let env_layer = env::user_config_from_env(vars)?;
-    let bitcoin_conf_path = cli.bitcoin_conf.clone();
+    let bitcoin_conf_path = cli.bitcoin_conf.take();
     let cli_layer = cli.into_user_config();
     if let Some(path) = bitcoin_conf_path {
         let network = network_from_layers(layers.iter().chain([&env_layer, &cli_layer]));
@@ -47,19 +47,16 @@ fn load(
     args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> anyhow::Result<bitcoin_rs_node::NodeConfig> {
-    let cli = match <cli::CliArgs as clap::Parser>::try_parse_from(args) {
-        Ok(cli) => cli,
-        Err(error) => error.exit(),
-    };
+    let cli = <cli::CliArgs as clap::Parser>::try_parse_from(args)?;
     config_from(cli, vars)
 }
 
-fn measure_storage(cli: cli::CliArgs) -> anyhow::Result<()> {
-    let output = cli.measure_storage_output.clone();
+fn measure_storage(mut cli: cli::CliArgs) -> anyhow::Result<()> {
+    let output = cli.measure_storage_output.take();
     let request = MeasureStorageRequest {
         high_water_allocated_bytes: cli.storage_high_water_bytes,
         stop_height: cli.measure_storage_stop_height,
-        stop_hash: cli.measure_storage_stop_hash.clone(),
+        stop_hash: cli.measure_storage_stop_hash.take(),
     };
     let config = config_from(cli, std::env::vars_os())?;
     let evidence = measure_storage_footprint(&config, &request)?;

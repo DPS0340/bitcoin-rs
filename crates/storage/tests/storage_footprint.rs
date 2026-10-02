@@ -9,9 +9,10 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::symlink;
 
+#[cfg(feature = "fjall")]
+use bitcoin_rs_storage::{ColumnFamily, KvStore, logical_store_owners};
 use bitcoin_rs_storage::{
-    ColumnFamily, DataDirAnchor, FootprintError, KvStore, PhysicalObservationKind,
-    logical_column_family, logical_store_owners, measure_physical_tree,
+    DataDirAnchor, FootprintError, PhysicalObservationKind, measure_physical_tree,
 };
 use tempfile::tempdir;
 
@@ -44,8 +45,12 @@ fn logical_owner_bytes_are_exact_key_plus_value() {
             (b"de".to_vec(), vec![0; 10]),
         ],
     );
-    let owner = logical_column_family(&store, ColumnFamily::UndoData)
-        .unwrap_or_else(|error| panic!("logical: {error}"));
+    let owners = logical_store_owners(&store, "chainstate")
+        .unwrap_or_else(|error| panic!("owners: {error}"));
+    let owner = owners
+        .iter()
+        .find(|owner| owner.name == "chainstate.undo_data")
+        .unwrap_or_else(|| panic!("chainstate.undo_data owner missing"));
     assert_eq!(owner.rows, 2);
     assert_eq!(owner.key_bytes, 5);
     assert_eq!(owner.value_bytes, 15);

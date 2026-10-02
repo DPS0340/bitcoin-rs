@@ -405,6 +405,7 @@ impl EntryArena {
         self.free.last().map_or(self.slots.len(), |&index| index)
     }
 
+    #[cfg(any(test, feature = "test-seam"))]
     fn clear(&mut self) {
         for slot in &mut self.slots {
             *slot = None;
@@ -640,6 +641,10 @@ impl Mempool {
     /// transactions return through reconsideration (re-admission), which
     /// keeps the recorded confirmations and re-arms only the re-admitted
     /// entries — so chain recovery cannot silently discard fee history.
+    ///
+    /// Test seam: fixture reset only; production retirements arrive through
+    /// block/reorg/commit paths, never a wholesale clear.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn clear(&mut self) -> MutationResult {
         // Every entry leaves the pool here, so this is the same retire funnel
         // Core walks during a bulk clear: fire `mempool:removed` per entry
@@ -739,6 +744,10 @@ impl Mempool {
 
     /// Inserts trusted entry facts after preflighting cluster and capacity
     /// constraints. A refused insert leaves membership and history unchanged.
+    ///
+    /// Test seam: fixture staging only; production admission verifies through
+    /// the gateway's `submit_transaction`/`capture_admission` path.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn insert_entry(
         &mut self,
         entry: MempoolEntry,
@@ -1397,6 +1406,9 @@ impl Mempool {
     /// connected block. A connected block ages the estimator even when the
     /// pool is empty, so this is the observable proof that `remove_for_block`
     /// fired `block_connected`.
+    ///
+    /// Test seam: the node's fee-history oracle is its only reader.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn estimator_last_decayed_height(&self) -> Option<u32> {
         self.estimator.last_decayed_height()
@@ -1734,6 +1746,7 @@ impl Mempool {
 
     /// Removes the entry identified by `txid` and its descendants with the
     /// supplied reason.
+    #[cfg(any(test, feature = "test-seam"))]
     fn remove_by_txid_into(
         &mut self,
         txid: &Txid,
@@ -1827,6 +1840,10 @@ impl Mempool {
     /// swept with it — commits as one `Removed(PolicyEviction)` change.
     ///
     /// Use this for min-relay-fee tightening or size-bound eviction policies.
+    ///
+    /// Test seam: fee-history fixture door; production trimming runs through
+    /// `enforce_size_limit`'s chunk-ordered eviction.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn evict_below_fee_rate(&mut self, threshold_sat_per_kvb: u64) -> MutationResult {
         let mut to_evict: Vec<Txid> = Vec::new();

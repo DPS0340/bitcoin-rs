@@ -20,8 +20,8 @@ pub use error::StorageError;
 
 pub use footprint::{
     DataDirAnchor, FootprintError, LogicalLedger, LogicalOwner, PhysicalLedger, PhysicalNamespace,
-    PhysicalObservationKind, dir_has_entries, logical_column_family, logical_store_owners,
-    measure_physical_tree, opened_fd_path, opened_path_matches_fd,
+    PhysicalObservationKind, dir_has_entries, logical_store_owners, measure_physical_tree,
+    opened_fd_path, opened_path_matches_fd,
 };
 
 pub use trait_::{
@@ -50,7 +50,7 @@ pub use redb_impl::{
 pub use rocksdb_impl::{ROCKSDB_DEFAULT_CACHE_BYTES, RocksDbStore};
 
 /// Selectable storage backend.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StorageBackend {
     /// `RocksDB`.
     RocksDb,

@@ -390,14 +390,6 @@ pub fn measure_physical_tree(path: &Path) -> Result<PhysicalLedger, FootprintErr
     DataDirAnchor::open(path)?.measure_physical()
 }
 
-/// Exact serialized key and value bytes for one column family.
-pub fn logical_column_family<S: KvStore>(
-    store: &S,
-    cf: ColumnFamily,
-) -> Result<LogicalOwner, StorageError> {
-    logical_column_family_named(store, cf, cf.name())
-}
-
 /// Exact serialized key and value bytes for every column family in `store`.
 ///
 /// Owner names are `{namespace}.{column_family}`.

@@ -33,7 +33,6 @@ mod view;
 use bitcoin_rs_primitives::Hash256;
 use thiserror::Error;
 
-pub(crate) use bip9_cache::CachedState;
 pub use bitcoin_rs_consensus::SoftforkState;
 pub use block_body::BlockBodySource;
 pub use count::ChainTxCount;

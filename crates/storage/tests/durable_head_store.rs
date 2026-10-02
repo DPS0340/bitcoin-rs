@@ -5,6 +5,8 @@
 //! durability fault never leaves a torn state, and the fence refuses a stale
 //! expectation without applying the batch.
 
+#![cfg(feature = "fjall")]
+
 use std::sync::Arc;
 
 use bitcoin_rs_primitives::Hash256;

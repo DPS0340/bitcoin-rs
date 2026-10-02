@@ -9,10 +9,11 @@ use smallvec::SmallVec;
 use crate::{
     UtxoError, UtxoKey,
     contract::UtxoAdd,
-    listener::{UtxoChangeEvents, UtxoChangeListener, UtxoInserted, UtxoRemoved},
+    listener::{UtxoChangeEvents, UtxoInserted, UtxoRemoved},
     record::{OutputParts, OwnedUtxoOut, RemovedRecord, UtxoRecord, vouts_are_strictly_increasing},
     set::{BuildPayload, SpendPayload},
     set::{UtxoCoin, UtxoScan},
+    stats::CoinStatsListener,
 };
 
 /// Per-shard hash table of compact, inline UTXO record owners.
@@ -110,7 +111,7 @@ impl Shard {
         adds: &[UtxoAdd<T>],
         removes: &[OutPoint],
         shard_idx: usize,
-        listener: &(dyn UtxoChangeListener + Send + Sync),
+        listener: &CoinStatsListener,
     ) -> Result<(), UtxoError> {
         let mut table = self.inner.write();
         commit_single_shard_with_listener(&mut table, adds, removes, shard_idx, listener)
@@ -253,7 +254,7 @@ fn commit_batch_collect_events<'a>(
     adds: &'a [(UtxoKey, Hash256, BuildPayload<'a>)],
     removes: &[SpendPayload<'_>],
 ) -> (UtxoChangeEvents<'a>, Result<(), UtxoError>) {
-    let mut events = UtxoChangeEvents::with_capacity_hint(adds.len(), removes.len());
+    let mut events = UtxoChangeEvents::new();
 
     let result = for_each_run(
         removes,
@@ -441,7 +442,7 @@ fn commit_single_shard_with_listener<T: Borrow<TxOut>>(
     adds: &[UtxoAdd<T>],
     removes: &[OutPoint],
     shard_idx: usize,
-    listener: &(dyn UtxoChangeListener + Send + Sync),
+    listener: &CoinStatsListener,
 ) -> Result<(), UtxoError> {
     for_each_run(
         removes,
@@ -548,7 +549,7 @@ fn apply_remove_by_vouts(
 fn apply_remove_run_with_listener(
     table: &mut ShardTable,
     removes: &[SpendPayload<'_>],
-    listener: &(dyn UtxoChangeListener + Send + Sync),
+    listener: &CoinStatsListener,
 ) -> Result<(), UtxoError> {
     let Some(first) = removes.first() else {
         return Ok(());
@@ -634,7 +635,7 @@ fn apply_add_payload_run_with_listener(
     key: UtxoKey,
     txid: Hash256,
     payloads: &[BuildPayload<'_>],
-    listener: &(dyn UtxoChangeListener + Send + Sync),
+    listener: &CoinStatsListener,
 ) -> Result<(), UtxoError> {
     let StagedAdd {
         replacement,
@@ -791,7 +792,7 @@ fn removed_events(
 }
 
 fn replay_add_listener(
-    listener: &(dyn UtxoChangeListener + Send + Sync),
+    listener: &CoinStatsListener,
     payloads: &[BuildPayload<'_>],
     overwritten: &[Option<OwnedUtxoOut>],
 ) {
@@ -866,7 +867,7 @@ fn flush_inserted_events<'add>(
 }
 
 fn flush_inserted_coins(
-    listener: &(dyn UtxoChangeListener + Send + Sync),
+    listener: &CoinStatsListener,
     inserted: &mut SmallVec<[UtxoInserted<'_>; 8]>,
 ) {
     if !inserted.is_empty() {

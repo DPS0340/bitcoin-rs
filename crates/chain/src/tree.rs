@@ -1,6 +1,4 @@
-extern crate alloc;
-
-use alloc::sync::Arc;
+use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_primitives::Hash256;
@@ -8,7 +6,7 @@ use hashbrown::HashTable;
 use slab::Slab;
 
 use crate::{
-    CachedState, ChainError, ChainTxCount,
+    ChainError, ChainTxCount,
     bip9_cache::Bip9Cache,
     node::{BlockHeader, BlockTreeNode, NodeId, NodeStatus},
     tip::TipSnapshot,
@@ -279,19 +277,15 @@ impl BlockTree {
         Arc::clone(&self.tip)
     }
 
-    /// Returns the cached BIP9 deployment state for `(node_id, deployment_id)`, if any.
+    /// Returns the cached BIP9 deployment-state tag for `(node_id, deployment_id)`, if any.
     #[must_use]
-    pub(crate) fn cached_bip9_state(
-        &self,
-        node_id: NodeId,
-        deployment_id: u32,
-    ) -> Option<CachedState> {
+    pub(crate) fn cached_bip9_state(&self, node_id: NodeId, deployment_id: u32) -> Option<u8> {
         self.bip9_cache.get(node_id, deployment_id)
     }
 
-    /// Stores the cached BIP9 deployment state for `(node_id, deployment_id)`.
-    pub(crate) fn cache_bip9_state(&self, node_id: NodeId, deployment_id: u32, state: CachedState) {
-        self.bip9_cache.insert(node_id, deployment_id, state);
+    /// Stores the cached BIP9 deployment-state tag for `(node_id, deployment_id)`.
+    pub(crate) fn cache_bip9_state(&self, node_id: NodeId, deployment_id: u32, tag: u8) {
+        self.bip9_cache.insert(node_id, deployment_id, tag);
     }
 
     /// Builds a block locator starting from `tip_id`. For active tips, returns

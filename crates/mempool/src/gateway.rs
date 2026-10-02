@@ -713,6 +713,9 @@ impl MempoolGateway {
     }
 
     /// Returns `true` when the gateway was constructed with an observer.
+    ///
+    /// Test seam: lifecycle assertions only.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn has_observer(&self) -> bool {
         self.observer.is_some()
@@ -853,6 +856,9 @@ impl MempoolGateway {
     // The public atomic API consumes its prepared request; the private path
     // borrows it so the shared retry owner can recover the Arc after a mismatch.
     #[expect(clippy::needless_pass_by_value)]
+    /// Test seam: the pre-claimed single-shot door; production submissions
+    /// run through `submit_transaction`'s bounded claimed path.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn admit_transaction(&self, request: AdmissionRequest) -> Result<AdmitOutcome, AdmitError> {
         self.admit_transaction_claimed(&request, None, crate::admission::AdmissionFence::Stable)
     }
@@ -1288,6 +1294,10 @@ impl MempoolGateway {
     }
 
     /// Commits `pool.evict_below_fee_rate` and publishes its result.
+    ///
+    /// Test seam: fee-history fixture door; production trimming runs through
+    /// `enforce_size_limit`'s chunk-ordered eviction.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn evict_below_fee_rate(
         &self,
         origin: AdmissionOrigin,
@@ -1325,6 +1335,10 @@ impl MempoolGateway {
     }
 
     /// Commits `pool.clear` and publishes its result.
+    ///
+    /// Test seam: wholesale fixture reset; production retirements arrive
+    /// through block/reorg/commit paths, never a clear.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn clear(&self, origin: AdmissionOrigin) -> MutationResult {
         self.commit_infallible(origin, Mempool::clear)
     }
@@ -2779,9 +2793,9 @@ mod tests {
             bitcoin::consensus::deserialize(&bitcoin_rs_primitives::consensus_bytes(&tx))?;
         let previous = bitcoin::TxOut {
             value: bitcoin::Amount::from_sat(request.prevouts[0].1.value.to_sat()),
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(Vec::from(
-                request.prevouts[0].1.script_pubkey.clone(),
-            )),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(
+                request.prevouts[0].1.script_pubkey.as_bytes().to_vec(),
+            ),
         };
         let cost = oracle.total_sigop_cost(|_| Some(previous.clone()));
         assert!(u32::try_from(cost)? > crate::standardness::MAX_STANDARD_TX_SIGOPS_COST);

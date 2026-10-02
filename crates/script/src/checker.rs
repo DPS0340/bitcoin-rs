@@ -12,7 +12,9 @@
 use bitcoin_rs_primitives::{Amount, Hash256, Sighash, SighashCache, SighashError, Tx, TxOut};
 use secp256k1::{Message, PublicKey, XOnlyPublicKey, ecdsa::Signature as EcdsaSig};
 
+use crate::eval::OP_CODESEPARATOR;
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
+use crate::script::{Instruction, instructions};
 
 /// Signature version context: which sighash algorithm and encoding rules apply.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -21,8 +23,6 @@ pub enum SigVersion {
     Base,
     /// Segwit v0 signatures (BIP143).
     WitnessV0,
-    /// Taproot key-path signatures (BIP341).
-    Taproot,
     /// Taproot script-path signatures (BIP342).
     Tapscript,
 }
@@ -61,54 +61,23 @@ pub struct TxSignatureChecker<'a> {
 
 /// Removes `OP_CODESEPARATOR` (0xab) opcodes from a script, matching Core's
 /// `CTransactionSignatureSerializer::SerializeScriptCode`. Bytes inside data
-/// pushes are preserved. The legacy sighash must exclude CS opcode bytes.
+/// pushes — and any malformed trailing push — are preserved. The legacy
+/// sighash must exclude CS opcode bytes.
 fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(script.len());
-    let mut pos = 0;
-    while pos < script.len() {
-        let op = script[pos];
-        if op == 0xab {
-            // OP_CODESEPARATOR: skip this single byte.
-            pos += 1;
-        } else if (0x01..=0x4b).contains(&op) {
-            // Direct push: copy the opcode and the data bytes.
-            let end = pos + 1 + usize::from(op);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
-        } else if op == 0x4c {
-            // OP_PUSHDATA1: next byte is length.
-            let len_pos = pos + 1;
-            let len = script.get(len_pos).copied().unwrap_or(0);
-            let end = len_pos + 1 + usize::from(len);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
-        } else if op == 0x4d {
-            // OP_PUSHDATA2: next 2 bytes are length (LE).
-            let len_pos = pos + 1;
-            let len = u16::from_le_bytes([
-                script.get(len_pos).copied().unwrap_or(0),
-                script.get(len_pos + 1).copied().unwrap_or(0),
-            ]);
-            let end = len_pos + 2 + usize::from(len);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
-        } else if op == 0x4e {
-            // OP_PUSHDATA4: next 4 bytes are length (LE).
-            let len_pos = pos + 1;
-            let len = u32::from_le_bytes([
-                script.get(len_pos).copied().unwrap_or(0),
-                script.get(len_pos + 1).copied().unwrap_or(0),
-                script.get(len_pos + 2).copied().unwrap_or(0),
-                script.get(len_pos + 3).copied().unwrap_or(0),
-            ]);
-            let end = len_pos + 4 + usize::try_from(len).unwrap_or(usize::MAX);
-            out.extend_from_slice(&script[pos..end.min(script.len())]);
-            pos = end;
+    let mut iter = instructions(script);
+    let mut start = 0_usize;
+    while let Some(item) = iter.next() {
+        // A malformed tail is copied verbatim, as Core's serializer emits it.
+        let end = if item.is_err() {
+            script.len()
         } else {
-            // Other opcode (including OP_0 = 0x00): copy single byte.
-            out.push(op);
-            pos += 1;
+            script.len() - iter.remaining.len()
+        };
+        if !matches!(item, Ok(Instruction::Op(OP_CODESEPARATOR))) {
+            out.extend_from_slice(&script[start..end]);
         }
+        start = end;
     }
     out
 }
@@ -210,10 +179,10 @@ impl<'a> TxSignatureChecker<'a> {
                     )
                     .map_err(|e| sighash_to_script_error(&e))?
             }
-            SigVersion::Taproot | SigVersion::Tapscript => {
-                // ECDSA is not used in taproot/tapscript; this is a caller error.
+            SigVersion::Tapscript => {
+                // ECDSA is not used in tapscript; this is a caller error.
                 return Err(ScriptError::Verification(
-                    "ECDSA signature check requested for taproot/tapscript".to_owned(),
+                    "ECDSA signature check requested for tapscript".to_owned(),
                 ));
             }
         };
@@ -234,11 +203,12 @@ impl<'a> TxSignatureChecker<'a> {
         Ok(verified)
     }
 
-    /// Verifies a Schnorr signature against the BIP341/BIP342 sighash.
+    /// Verifies a Schnorr signature against the BIP342 tapscript sighash.
+    /// Key-path spends do not go through the checker.
     ///
-    /// `leaf_hash` is `Some` for tapscript (script-path) spends and `None` for
-    /// key-path spends. `codesep_pos` is the position of the last
-    /// `OP_CODESEPARATOR` (or `CODESEPARATOR_POSITION` when none executed).
+    /// `leaf_hash` is the tapscript leaf hash. `codesep_pos` is the position
+    /// of the last `OP_CODESEPARATOR` (or `CODESEPARATOR_POSITION` when none
+    /// executed).
     ///
     /// Returns `Ok(true)` when valid, `Ok(false)` when the signature is empty
     /// (tapscript empty-sig convention), and `Err` for size/hashtype/verification
@@ -247,26 +217,12 @@ impl<'a> TxSignatureChecker<'a> {
         &mut self,
         sig: &[u8],
         pubkey: &[u8],
-        sigversion: SigVersion,
         leaf_hash: Option<&Hash256>,
         codesep_pos: u32,
     ) -> Result<bool, ScriptError> {
-        // Schnorr is only valid for taproot/tapscript.
-        if sigversion != SigVersion::Taproot && sigversion != SigVersion::Tapscript {
-            return Err(ScriptError::Verification(
-                "Schnorr signature check requires taproot or tapscript version".to_owned(),
-            ));
-        }
-
-        // Empty signature: in tapscript this is a clean false (invalid but not
-        // an error); in key-path it's an error (wrong size).
+        // Empty signature: a clean false in tapscript (invalid but not an error).
         if sig.is_empty() {
-            if sigversion == SigVersion::Tapscript {
-                return Ok(false);
-            }
-            return Err(ScriptError::Invalid {
-                code: ScriptErrCode::SchnorrSigSize,
-            });
+            return Ok(false);
         }
 
         // Schnorr signatures are 64 or 65 bytes.
@@ -575,6 +531,7 @@ fn is_valid_der_encoding(sig: &[u8]) -> bool {
 }
 
 /// Core's `IsLowDERSignature`: checks that the S value is at most half the
+/// group order.
 fn is_low_der_signature(sig: &[u8]) -> bool {
     // secp256k1's group order / 2 in big-endian:
     // n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141

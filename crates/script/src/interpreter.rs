@@ -442,9 +442,8 @@ impl Interpreter {
                 index: input_idx,
                 inputs,
             })?;
-        let prevout = prevouts
-            .get(input_idx)
-            .ok_or(ScriptError::TaprootPrevoutsUnavailable)?;
+        // In-bounds: prevouts.len() == tx.inputs.len() and input_idx < len.
+        let prevout = &prevouts[input_idx];
 
         let matches_tx = input.script_sig.as_slice() == script_sig
             && input.witness.len() == witness.len()
@@ -457,14 +456,8 @@ impl Interpreter {
             Cow::Borrowed(tx)
         } else {
             let mut grafted = tx.clone();
-            let grafted_input =
-                grafted
-                    .inputs
-                    .get_mut(input_idx)
-                    .ok_or(ScriptError::InputIndexOutOfRange {
-                        index: input_idx,
-                        inputs,
-                    })?;
+            // `grafted` is a clone of `tx`; input_idx was proven in-bounds.
+            let grafted_input = &mut grafted.inputs[input_idx];
             grafted_input.script_sig = Script::from_bytes(script_sig.to_vec());
             grafted_input.witness = Witness::from_stack(witness.to_vec());
             Cow::Owned(grafted)

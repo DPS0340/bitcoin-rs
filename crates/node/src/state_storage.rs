@@ -312,7 +312,7 @@ pub(super) struct NodePruneService<S: KvStore> {
 
 impl<S: KvStore> NodePruneService<S> {
     /// Creates a manual pruning service over the chainstate store and RPC block cache.
-    pub(crate) fn new(
+    pub(super) fn new(
         store: Arc<S>,
         block_files: Arc<FlatFileBlockStore>,
         authority: bitcoin_rs_chainstate::PruneAuthority,

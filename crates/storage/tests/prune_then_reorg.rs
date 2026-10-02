@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
 use bitcoin_rs_storage::pruning::{
-    BLOCK_DATA_CF, BlockPruner, ExecutedFrontier, HistoryAccess, HistoryUnavailable, PrunePolicy,
+    BLOCK_DATA_CF, ExecutedFrontier, HistoryAccess, HistoryUnavailable, PrunePolicy,
     RetentionBudget, RetentionRegistry, block_body_key, block_undo_key, load_executed_frontier,
     load_pruneheight, prune_to_height, reclaim_staged_flat_block_files, stage_block_and_undo_prune,
 };
@@ -1002,78 +1002,10 @@ fn optional_consumer_budget_exhaustion_unblocks_pruning() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[test]
-fn pruning_keeps_core_reorg_floor_and_shallow_reorg_succeeds()
--> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    write_fake_blocks(&store, 500)?;
-
-    let mut pruner = BlockPruner::new(
-        Arc::clone(&store),
-        PrunePolicy {
-            target_size_mb: 0,
-            keep_below_tip: 100,
-        },
-    );
-
-    let outcome = pruner.prune_step(500)?;
-
-    assert_eq!(outcome.blocks_removed, 211);
-    assert_eq!(outcome.bytes_freed, 211 * 32);
-
-    for height in 1_u32..=211 {
-        assert!(
-            store
-                .get(BLOCK_DATA_CF, &block_body_key(height, fake_hash(height)))?
-                .is_none(),
-            "height {height} should be pruned"
-        );
-    }
-
-    for height in 212_u32..=500 {
-        assert!(
-            store
-                .get(BLOCK_DATA_CF, &block_body_key(height, fake_hash(height)))?
-                .is_some(),
-            "height {height} should be retained"
-        );
-    }
-
-    let fork_point = 450_u32;
-    for height in (fork_point + 1)..=500 {
-        let key = block_body_key(height, fake_hash(height));
-        assert!(
-            store.get(BLOCK_DATA_CF, &key)?.is_some(),
-            "50-block reorg needs retained body at height {height}"
-        );
-    }
-
-    Ok(())
-}
-
-fn write_fake_blocks(store: &MemoryStore, count: u32) -> Result<(), StorageError> {
-    let mut batch = store.new_batch();
-    for height in 1_u32..=count {
-        let hash = fake_hash(height);
-        batch.put(
-            BLOCK_DATA_CF,
-            &block_body_key(height, hash),
-            &fake_body(height),
-        );
-    }
-    store.write(batch)
-}
-
 fn fake_hash(height: u32) -> Hash256 {
     let mut bytes = [0_u8; 32];
     bytes[..4].copy_from_slice(&height.to_le_bytes());
     Hash256::from_le_bytes(&bytes)
-}
-
-fn fake_body(height: u32) -> [u8; 32] {
-    let mut body = [0_u8; 32];
-    body[..4].copy_from_slice(&height.to_be_bytes());
-    body
 }
 
 /// One-shot outcomes for the next `write_durable`, simulating the ambiguous

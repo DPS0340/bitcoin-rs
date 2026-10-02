@@ -2,6 +2,8 @@
 //! durability path, and explicit budgeted cache sizes are configured verbatim
 //! (no backend floor may raise a share above its allocation).
 
+#![cfg(any(feature = "fjall", feature = "redb", feature = "rocksdb"))]
+
 use hashbrown::HashMap;
 use std::sync::Arc;
 

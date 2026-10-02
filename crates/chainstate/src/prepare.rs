@@ -3,7 +3,7 @@
 use super::scratch::SameBlockSpentSet;
 use super::{
     BlockLocalUtxoView, BlockProvenance, BlockTxPlan, BlockValidationContext, ByteEquality,
-    Chainstate, LOCAL_OVERLAY_TXID_SET_THRESHOLD, PreparedApply, ResolvedUtxoView, WitnessPresence,
+    Chainstate, LOCAL_OVERLAY_TXID_SET_THRESHOLD, PreparedApply, ResolvedUtxoView,
 };
 use crate::error::ApplyError;
 use bitcoin_rs_consensus::UtxoView;
@@ -164,7 +164,7 @@ pub(super) fn plan_block_transactions(block: &Block, txids: &[Txid]) -> BlockTxP
         only_coinbase,
         needs_local_utxo_overlay,
         overlay_capacity,
-        witness_presence: WitnessPresence::from_bool(has_witness),
+        has_witness,
         has_bip68_sequence_locks,
         created_output_count,
         spent_input_count,

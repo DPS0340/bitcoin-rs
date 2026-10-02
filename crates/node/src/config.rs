@@ -555,7 +555,7 @@ pub enum NetworkSelection {
 impl NetworkSelection {
     /// Parses the accepted network spellings.
     #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
+    fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "main" | "mainnet" | "bitcoin" => Some(Self::Mainnet),
             "test" | "testnet" | "testnet3" => Some(Self::Testnet3),
