@@ -691,6 +691,13 @@ mod tests {
         }
     }
 
+    struct NoSpend;
+    impl SpentOutputLookup for NoSpend {
+        fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
+            None
+        }
+    }
+
     /// `FUNDED` at height 1, then the block at `HEIGHT` spending it and
     /// creating `CREATED`; returns the set, its listener, the observable state
     /// before that block, and the block's undo.
@@ -1157,13 +1164,6 @@ mod tests {
     /// reporting success. The build refuses the mismatch before iterating.
     #[test]
     fn short_txid_list_is_refused_before_iterating() {
-        struct NoSpend;
-        impl SpentOutputLookup for NoSpend {
-            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
-                None
-            }
-        }
-
         let (block, txids) = block_with_short_txids();
         let outcome = build_block_changes(&block, HEIGHT, &txids, None, 4, 4, &NoSpend, None, 64);
         assert!(
@@ -1182,13 +1182,6 @@ mod tests {
     /// `txids` slice is refused at height 0 too, as the contract documents.
     #[test]
     fn short_txid_list_is_refused_at_genesis_height() {
-        struct NoSpend;
-        impl SpentOutputLookup for NoSpend {
-            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
-                None
-            }
-        }
-
         let (block, txids) = block_with_short_txids();
         let outcome = build_block_changes(&block, 0, &txids, None, 4, 4, &NoSpend, None, 64);
         assert!(
