@@ -627,7 +627,7 @@ where
 }
 
 /// How far a loaded branch-switch walk got before it stopped.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct LoadedPlanProgress {
     /// Fully disconnected blocks, in plan (old-tip-down) order.
     disconnected: usize,
