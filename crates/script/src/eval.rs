@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 
 use bitcoin_rs_primitives::{CODESEPARATOR_POSITION, Hash256};
-use sha2::{Digest, Sha256};
+use sha2::Digest as _;
 use smallvec::SmallVec;
 
 use crate::checker::{SigVersion, TxSignatureChecker};
@@ -25,17 +25,17 @@ use bitcoin_hashes::{Hash as _, ripemd160, sha1};
 /// `OP_NOP` (0x61).
 pub(crate) const OP_NOP: u8 = 0x61;
 /// `OP_IF` (0x63).
-pub(crate) const OP_IF: u8 = 0x63;
+pub(crate) const OP_IF: u8 = crate::script::opcode::OP_IF;
 /// `OP_NOTIF` (0x64).
 pub(crate) const OP_NOTIF: u8 = 0x64;
 /// `OP_ELSE` (0x67).
 pub(crate) const OP_ELSE: u8 = 0x67;
 /// `OP_ENDIF` (0x68).
-pub(crate) const OP_ENDIF: u8 = 0x68;
+pub(crate) const OP_ENDIF: u8 = crate::script::opcode::OP_ENDIF;
 /// `OP_VERIFY` (0x69).
 pub(crate) const OP_VERIFY: u8 = 0x69;
 /// `OP_RETURN` (0x6a).
-pub(crate) const OP_RETURN: u8 = 0x6a;
+pub(crate) const OP_RETURN: u8 = crate::script::opcode::OP_RETURN;
 /// `OP_TOALTSTACK` (0x6b).
 pub(crate) const OP_TOALTSTACK: u8 = 0x6b;
 /// `OP_FROMALTSTACK` (0x6c).
@@ -59,7 +59,7 @@ pub(crate) const OP_DEPTH: u8 = 0x74;
 /// `OP_DROP` (0x75).
 pub(crate) const OP_DROP: u8 = crate::script::opcode::OP_DROP;
 /// `OP_DUP` (0x76).
-pub(crate) const OP_DUP: u8 = 0x76;
+pub(crate) const OP_DUP: u8 = crate::script::opcode::OP_DUP;
 /// `OP_NIP` (0x77).
 pub(crate) const OP_NIP: u8 = 0x77;
 /// `OP_OVER` (0x78).
@@ -77,11 +77,11 @@ pub(crate) const OP_TUCK: u8 = 0x7d;
 /// `OP_SIZE` (0x82).
 pub(crate) const OP_SIZE: u8 = 0x82;
 /// `OP_EQUAL` (0x87).
-pub(crate) const OP_EQUAL: u8 = 0x87;
+pub(crate) const OP_EQUAL: u8 = crate::script::opcode::OP_EQUAL;
 /// `OP_EQUALVERIFY` (0x88).
-pub(crate) const OP_EQUALVERIFY: u8 = 0x88;
+pub(crate) const OP_EQUALVERIFY: u8 = crate::script::opcode::OP_EQUALVERIFY;
 /// `OP_1NEGATE` (0x4f).
-pub(crate) const OP_1NEGATE: u8 = 0x4f;
+pub(crate) const OP_1NEGATE: u8 = crate::script::opcode::OP_1NEGATE;
 /// `OP_1ADD` (0x8b).
 pub(crate) const OP_1ADD: u8 = 0x8b;
 /// `OP_1SUB` (0x8c).
@@ -129,19 +129,19 @@ pub(crate) const OP_SHA1: u8 = 0xa7;
 /// `OP_SHA256` (0xa8).
 pub(crate) const OP_SHA256: u8 = 0xa8;
 /// `OP_HASH160` (0xa9).
-pub(crate) const OP_HASH160: u8 = 0xa9;
+pub(crate) const OP_HASH160: u8 = crate::script::opcode::OP_HASH160;
 /// `OP_HASH256` (0xaa).
 pub(crate) const OP_HASH256: u8 = 0xaa;
 /// `OP_CODESEPARATOR` (0xab).
 pub(crate) const OP_CODESEPARATOR: u8 = 0xab;
 /// `OP_CHECKSIG` (0xac).
-pub(crate) const OP_CHECKSIG: u8 = 0xac;
+pub(crate) const OP_CHECKSIG: u8 = crate::script::opcode::OP_CHECKSIG;
 /// `OP_CHECKSIGVERIFY` (0xad).
-pub(crate) const OP_CHECKSIGVERIFY: u8 = 0xad;
+pub(crate) const OP_CHECKSIGVERIFY: u8 = crate::script::opcode::OP_CHECKSIGVERIFY;
 /// `OP_CHECKMULTISIG` (0xae).
-pub(crate) const OP_CHECKMULTISIG: u8 = 0xae;
+pub(crate) const OP_CHECKMULTISIG: u8 = crate::script::opcode::OP_CHECKMULTISIG;
 /// `OP_CHECKMULTISIGVERIFY` (0xaf).
-pub(crate) const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+pub(crate) const OP_CHECKMULTISIGVERIFY: u8 = crate::script::opcode::OP_CHECKMULTISIGVERIFY;
 /// `OP_NOP1` (0xb0).
 pub(crate) const OP_NOP1: u8 = 0xb0;
 /// `OP_CHECKLOCKTIMEVERIFY` (0xb1).
@@ -164,7 +164,7 @@ pub(crate) const MAX_OPS_PER_SCRIPT: usize = 201;
 /// Maximum public keys in a bare multisig.
 pub(crate) const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
 /// Maximum combined depth of the main and alt stacks.
-pub(crate) const MAX_STACK_SIZE: usize = 1000;
+pub(crate) const MAX_STACK_SIZE: usize = Stack::MAX_DEPTH;
 /// Bytes per passed signature charged against BIP342's validation weight.
 pub(crate) const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 /// BIP342 validation-weight offset accounting for the witness itself.
@@ -557,10 +557,6 @@ fn dispatch(
     tapleaf_hash: Option<&Hash256>,
     script: &[u8],
 ) -> Result<(), ScriptError> {
-    let invalid_stack = || ScriptError::Invalid {
-        code: ScriptErrCode::InvalidStackOperation,
-    };
-
     // Push value: OP_1NEGATE and the OP_1..OP_16 small integers. OP_RESERVED
     // (0x50) sits between them and pushes nothing - it falls through to the
     // dispatch below, where an executed OP_RESERVED is a BAD_OPCODE.
@@ -816,10 +812,7 @@ fn dispatch(
                     code: ScriptErrCode::StackSize,
                 })?;
             } else {
-                let item = stack.remove_at(depth).map_err(|_| invalid_stack())?;
-                stack.push(item).map_err(|_| ScriptError::Invalid {
-                    code: ScriptErrCode::StackSize,
-                })?;
+                stack.roll(depth).map_err(|_| invalid_stack())?;
             }
         }
         OP_ROT => {
@@ -1031,16 +1024,19 @@ fn dispatch(
     Ok(())
 }
 
+/// Underflow/invalid-depth error for stack-op dispatch.
+fn invalid_stack() -> ScriptError {
+    ScriptError::Invalid {
+        code: ScriptErrCode::InvalidStackOperation,
+    }
+}
+
 /// Computes the digest for a hash opcode.
 fn hash_bytes(op: u8, data: &[u8]) -> SmallVec<[u8; 32]> {
     match op {
         OP_RIPEMD160 => SmallVec::from_slice(&ripemd160::Hash::hash(data)[..]),
         OP_SHA1 => SmallVec::from_slice(&sha1::Hash::hash(data)[..]),
-        OP_SHA256 => {
-            let mut engine = Sha256::new();
-            Digest::update(&mut engine, data);
-            SmallVec::from_slice(&Digest::finalize(engine))
-        }
+        OP_SHA256 => SmallVec::from_slice(&sha2::Sha256::digest(data)),
         OP_HASH160 => {
             let sha = sha2::Sha256::digest(data);
             SmallVec::from_slice(&ripemd160::Hash::hash(&sha)[..])
@@ -1067,7 +1063,7 @@ fn script_code(codeseparator_pos: u32, instruction_start: usize, script: &[u8]) 
 
 /// Removes every byte-identical occurrence of `needle` from `haystack`,
 /// returning the cleaned script and the number of removals.
-fn remove_all(haystack: &[u8], needle: &[u8]) -> (Vec<u8>, usize) {
+pub(crate) fn remove_all(haystack: &[u8], needle: &[u8]) -> (Vec<u8>, usize) {
     if needle.is_empty() {
         return (haystack.to_vec(), 0);
     }
@@ -1190,9 +1186,6 @@ fn check_multisig(
     script: &[u8],
     verify_only: bool,
 ) -> Result<(), ScriptError> {
-    let invalid_stack = || ScriptError::Invalid {
-        code: ScriptErrCode::InvalidStackOperation,
-    };
     if stack.is_empty() {
         return Err(invalid_stack());
     }

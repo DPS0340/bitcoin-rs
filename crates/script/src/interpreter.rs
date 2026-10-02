@@ -464,14 +464,15 @@ impl Interpreter {
         };
 
         if is_p2tr(script_pubkey) && flags.contains(VerifyFlags::TAPROOT) {
-            return verify_taproot(
+            verify_taproot(
                 &spending,
                 input_idx,
                 script_pubkey,
                 witness,
                 prevouts,
                 flags,
-            );
+            )?;
+            return Ok(true);
         }
 
         let mut checker = TxSignatureChecker::new(&spending, input_idx, prevout.value, prevouts);
@@ -623,7 +624,7 @@ fn verify_witness_program(
             let Some((script, rest)) = witness.split_last() else {
                 return Err(invalid(ScriptErrCode::WitnessProgramWitnessEmpty));
             };
-            if sha256_of(script) != program {
+            if Sha256::digest(script).as_slice() != program {
                 return Err(invalid(ScriptErrCode::WitnessProgramMismatch));
             }
             (script.clone(), rest)
@@ -670,19 +671,13 @@ fn verify_witness_program(
 /// The implicit P2WPKH witness script: `DUP HASH160 <program> EQUALVERIFY CHECKSIG`.
 fn p2wpkh_script_code(program: &[u8]) -> Vec<u8> {
     let mut script = Vec::with_capacity(5 + program.len());
-    script.push(0x76);
-    script.push(0xa9);
+    script.push(crate::script::opcode::OP_DUP);
+    script.push(crate::script::opcode::OP_HASH160);
     script.push(0x14);
     script.extend_from_slice(program);
-    script.push(0x88);
-    script.push(0xac);
+    script.push(crate::script::opcode::OP_EQUALVERIFY);
+    script.push(crate::script::opcode::OP_CHECKSIG);
     script
-}
-
-fn sha256_of(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
 }
 
 fn item_bytes_owned(item: &ScriptItem) -> Vec<u8> {
@@ -716,7 +711,7 @@ fn verify_taproot(
     witness: &[Vec<u8>],
     prevouts: &[TxOut],
     flags: VerifyFlags,
-) -> Result<bool, ScriptError> {
+) -> Result<(), ScriptError> {
     // scriptPubKey). `is_p2tr` already confirmed the shape.
     let program = script_pubkey
         .get(2..34)
@@ -778,7 +773,7 @@ fn verify_taproot_keypath(
     stack: &[Vec<u8>],
     annex_bytes: Option<&[u8]>,
     prevouts: &[TxOut],
-) -> Result<bool, ScriptError> {
+) -> Result<(), ScriptError> {
     let signature_bytes = &stack[0];
     let sighash_type = match signature_bytes.len() {
         64 => Sighash::Default,
@@ -800,7 +795,7 @@ fn verify_taproot_keypath(
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let message = Message::from_digest(*sighash.as_byte_array());
     if taproot::verify_taproot_keypath(&signature, &message, &public_key) {
-        Ok(true)
+        Ok(())
     } else {
         Err(ScriptError::Verification(
             "taproot key-path Schnorr verification failed".to_owned(),
@@ -818,7 +813,7 @@ fn verify_taproot_scriptpath(
     annex_bytes: Option<Vec<u8>>,
     prevouts: &[TxOut],
     flags: VerifyFlags,
-) -> Result<bool, ScriptError> {
+) -> Result<(), ScriptError> {
     // Core: "const valtype& control = SpanPopBack(stack); const valtype& script = SpanPopBack(stack);"
     let control = stack
         .pop()
@@ -851,7 +846,7 @@ fn verify_taproot_scriptpath(
         if flags.contains(VerifyFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
             return Err(invalid(ScriptErrCode::DiscourageUpgradableTaprootVersion));
         }
-        return Ok(true);
+        return Ok(());
     }
 
     // Build the witness stack for the evaluator: the remaining elements
@@ -903,7 +898,7 @@ fn verify_taproot_scriptpath(
         return Err(invalid(ScriptErrCode::CleanStack));
     }
     require_true_top(&witness_stack)?;
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]

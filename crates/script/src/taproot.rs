@@ -24,7 +24,7 @@ pub(crate) const TAPROOT_CONTROL_MAX_SIZE: usize =
 pub(crate) const TAPROOT_LEAF_MASK: u8 = 0xfe;
 
 /// Leaf version for BIP342 tapscript.
-pub const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
+pub(crate) const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
 
 /// Verifies a taproot key-path Schnorr signature.
 #[must_use]
@@ -67,7 +67,7 @@ fn compute_tapbranch_hash(prefix: &Sha256, a: &[u8; 32], b: &[u8; 32]) -> [u8; 3
 /// Mirrors Core's `ComputeTaprootMerkleRoot`. The caller must have already
 /// validated the control block size.
 #[must_use]
-pub fn compute_taproot_merkle_root(control: &[u8], tapleaf_hash: &Hash256) -> Hash256 {
+pub(crate) fn compute_taproot_merkle_root(control: &[u8], tapleaf_hash: &Hash256) -> Hash256 {
     let mut k = *tapleaf_hash.as_byte_array();
     let path = control.get(TAPROOT_CONTROL_BASE_SIZE..).unwrap_or(&[]);
     let nodes = path.as_chunks::<TAPROOT_CONTROL_NODE_SIZE>().0;
@@ -89,7 +89,11 @@ pub fn compute_taproot_merkle_root(control: &[u8], tapleaf_hash: &Hash256) -> Ha
 /// Returns `false` (not an error) when the internal pubkey is invalid or the
 /// tweak check fails, matching Core's behavior.
 #[must_use]
-pub fn verify_taproot_commitment(control: &[u8], program: &[u8], tapleaf_hash: &Hash256) -> bool {
+pub(crate) fn verify_taproot_commitment(
+    control: &[u8],
+    program: &[u8],
+    tapleaf_hash: &Hash256,
+) -> bool {
     // Internal x-only pubkey: bytes 1..33 of the control block.
     let Some(internal_bytes) = control.get(1..TAPROOT_CONTROL_BASE_SIZE) else {
         return false;
