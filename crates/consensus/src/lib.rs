@@ -32,7 +32,7 @@ pub mod bip68;
 /// BIP9 versionbits checks.
 pub mod bip9;
 /// Parse-once block state shared by the native apply path.
-pub mod block_view;
+mod block_view;
 /// The one runtime validation-engine selector.
 mod engine;
 /// Feature-gated bitcoinkernel wrapper.
@@ -53,7 +53,7 @@ pub use bip9::{
     SoftforkState, compute_state, deployment_params,
 };
 pub use bip113::{MEDIAN_TIME_PAST_WINDOW, locktime_cutoff};
-pub use block_view::BlockView;
+pub use block_view::{BlockFacts, BlockView};
 pub use engine::ValidationEngine;
 pub use sigops::transaction_sigop_cost;
 pub use verify_block::{
