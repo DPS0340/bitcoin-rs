@@ -709,7 +709,6 @@ impl Mempool {
             RemovalReason::Conflict => "conflict",
             RemovalReason::Replaced | RemovalReason::Descendant => "replaced",
             RemovalReason::PolicyEviction => "sizelimit",
-            RemovalReason::Expiry => "expiry",
             RemovalReason::Reorg => "reorg",
             RemovalReason::Clear => "unknown",
         }

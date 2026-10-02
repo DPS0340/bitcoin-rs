@@ -50,8 +50,6 @@ pub enum RemovalReason {
     Descendant,
     /// Size or fee-rate policy evicted the entry.
     PolicyEviction,
-    /// The entry outlived its expiry.
-    Expiry,
     /// A wholesale clear emptied the pool.
     Clear,
     /// A reorg disconnected the entry's containing state.
