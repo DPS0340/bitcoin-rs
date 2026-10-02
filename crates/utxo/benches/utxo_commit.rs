@@ -275,7 +275,7 @@ fn measure_memory(arm: &str) -> Result<(), String> {
     if let Err(error) = contract::commit_block_changes(&set, &changes, &commit_txid) {
         return Err(format!("measurement commit failed: {error}"));
     }
-    let report = set.memory_report();
+    let report = set.lock_stable_view().memory_report();
     println!(
         "{{\"arm\":\"{arm}\",\"records\":{},\"outputs\":{},\"record_payload_bytes\":{},\"table_bytes\":{},\"accounted_bytes\":{}}}",
         report.records,

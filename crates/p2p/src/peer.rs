@@ -54,13 +54,13 @@ pub struct CompactBlockNegotiation {
 
 impl CompactBlockNegotiation {
     /// Record the latest remote `sendcmpct` preference.
-    pub const fn record_remote_preference(&mut self, preference: &SendCmpct) {
+    pub(crate) const fn record_remote_preference(&mut self, preference: &SendCmpct) {
         self.remote_send_compact = Some(preference.send_compact);
         self.remote_version = Some(preference.version);
     }
 
     /// Record the version this node sent in its handshake `sendcmpct`.
-    pub const fn record_local_advertised(&mut self, version: u64) {
+    pub(crate) const fn record_local_advertised(&mut self, version: u64) {
         self.local_version = Some(version);
     }
 
@@ -72,7 +72,7 @@ impl CompactBlockNegotiation {
     /// the base v1 profile: short IDs are hints, so a wrong guess only costs
     /// round trips, never a wrong block.
     #[must_use]
-    pub const fn negotiated_version(&self) -> u64 {
+    const fn negotiated_version(&self) -> u64 {
         match self.remote_version {
             Some(2) => 2,
             _ => 1,
@@ -84,7 +84,7 @@ impl CompactBlockNegotiation {
     /// profile is the peer's recorded `sendcmpct` version; short IDs are
     /// hints, so an unknown recorded version degrades to the v1 profile.
     #[must_use]
-    pub const fn servable_version(&self) -> Option<u64> {
+    pub(crate) const fn servable_version(&self) -> Option<u64> {
         match self.remote_send_compact {
             Some(_) => Some(self.negotiated_version()),
             None => None,
@@ -146,7 +146,7 @@ impl<S> Peer<S> {
     }
 
     /// Mark the peer ready once both version and verack have arrived.
-    pub const fn refresh_ready_state(&mut self) {
+    pub(crate) const fn refresh_ready_state(&mut self) {
         if self.remote_version.is_some() && self.received_verack {
             self.state = PeerState::Ready;
         }

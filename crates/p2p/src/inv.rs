@@ -105,7 +105,7 @@ pub(crate) fn inventory_tx_hash(item: &Inventory) -> Option<Hash256> {
 }
 
 /// Return true when the inventory list is within the protocol bound.
-pub const fn is_within_inventory_bound(items: &[Inventory]) -> bool {
+pub(crate) const fn is_within_inventory_bound(items: &[Inventory]) -> bool {
     items.len() <= MAX_INV_PER_MSG
 }
 

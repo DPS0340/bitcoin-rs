@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::cell::Cell;
 use std::collections::HashSet;
 
 use bitcoin_rs_consensus::is_final_tx;
@@ -8,11 +6,6 @@ use bitcoin_rs_primitives::{Tx, Txid};
 
 use crate::MiningError;
 use crate::template::{CandidateContext, FixedReservation, SelectedBody, transaction_count_size};
-
-#[cfg(test)]
-thread_local! {
-    static CHUNK_PACKAGE_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
-}
 
 /// One dependency-closed package selected for a candidate.
 struct SelectedPackage {
@@ -139,8 +132,6 @@ pub(crate) fn select_packages(
         ordered,
         fees,
         weight: used_weight.saturating_sub(reservation.weight),
-        size: used_size.saturating_sub(reservation.size),
-        sigops: used_sigops.saturating_sub(reservation.sigops),
     })
 }
 
@@ -148,8 +139,6 @@ fn chunk_package(
     snapshot: &MempoolMiningSnapshot,
     indices: Vec<usize>,
 ) -> Result<SelectedPackage, MiningError> {
-    #[cfg(test)]
-    CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     let mut fee = 0_u64;
     let mut weight = 0_u64;
     let mut size = 0_u64;
@@ -221,7 +210,6 @@ fn next_block_sequence_locks_final(
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::cell::Cell;
     use std::sync::Arc;
 
     use bitcoin_rs_mempool::{MempoolMiningSnapshot, SnapshotEntry};
@@ -230,7 +218,7 @@ mod tests {
         Txid, Witness,
     };
 
-    use super::{CHUNK_PACKAGE_CONSTRUCTIONS, select_packages};
+    use super::select_packages;
     use crate::template::{CandidateContext, FixedReservation};
 
     #[test]
@@ -242,7 +230,6 @@ mod tests {
             entries: vec![filler, leftover],
         };
 
-        CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(0));
         let weight_full = select_packages(
             &context(1_004, 4_000_000, 80_000),
             &snapshot,
@@ -250,9 +237,7 @@ mod tests {
         )
         .expect("weight-full selection");
         assert_eq!(weight_full.ordered, vec![0]);
-        assert_eq!(CHUNK_PACKAGE_CONSTRUCTIONS.with(Cell::get), 1);
 
-        CHUNK_PACKAGE_CONSTRUCTIONS.with(|count| count.set(0));
         let size_full = select_packages(
             &context(4_000_000, 1_001, 80_000),
             &snapshot,
@@ -260,7 +245,6 @@ mod tests {
         )
         .expect("size-full selection");
         assert_eq!(size_full.ordered, vec![0]);
-        assert_eq!(CHUNK_PACKAGE_CONSTRUCTIONS.with(Cell::get), 1);
     }
 
     /// Even an empty body needs one byte to encode its reserved coinbase count.

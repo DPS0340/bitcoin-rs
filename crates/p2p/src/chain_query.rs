@@ -13,7 +13,7 @@ use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
 use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, ChainWork, TipReader};
 use bitcoin_rs_primitives::layout::{ParsedBlock, ParsedTransaction};
-use bitcoin_rs_primitives::{BlockHash, Hash256, Header, Network};
+use bitcoin_rs_primitives::{BlockHash, Hash256, Header, Network, deserialize};
 #[cfg(test)]
 use parking_lot::RwLock;
 
@@ -98,7 +98,7 @@ impl ActiveChainQuery {
         let bytes = self.block_body_source.as_ref()?.block_body(height, hash)?;
         let header = bytes
             .get(..80)
-            .and_then(|header| Header::consensus_decode(header).ok())?;
+            .and_then(|header| deserialize::<Header>(header).ok())?;
         if header.compute_hash() != hash {
             return None;
         }
@@ -482,7 +482,7 @@ mod tests {
             let Message::BlockPayload(payload) = message else {
                 return Ok(());
             };
-            blocks.borrow_mut().push(Block::consensus_decode(&payload)?);
+            blocks.borrow_mut().push(deserialize::<Block>(&payload)?);
             Ok(())
         })?;
         Ok((outcome, blocks.into_inner()))
@@ -777,7 +777,7 @@ mod tests {
             let mut unknown_flag = superfluous_witness.clone();
             unknown_flag[Header::LEN + 6] = 2;
             for malformed in [&trailing, &superfluous_witness, &unknown_flag] {
-                assert!(Block::consensus_decode(malformed).is_err());
+                assert!(deserialize::<Block>(malformed).is_err());
                 assert!(bitcoin::consensus::deserialize::<RegistryBlock>(malformed).is_err());
             }
             for unavailable in [

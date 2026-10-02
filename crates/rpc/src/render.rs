@@ -10,7 +10,7 @@ use sonic_rs::{Value, json};
 use crate::tx_render::transaction_json;
 
 /// Applied-chain facts required to project a header or block.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct BlockChainContext {
     /// Height of this block on the applied chain when active; still reported
     /// for known headers that are not active.

@@ -22,7 +22,7 @@ pub struct ChainSnapshot {
 }
 
 /// Which committed chain event a [`ChainEventHint`] describes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HintKind {
     /// A block was committed onto the tip.
     Connected,
@@ -32,7 +32,7 @@ pub enum HintKind {
 
 /// One committed chain event as sequenced by
 /// [`ChainEventPublisher::record`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChainEventHint {
     /// Whether the block was added to or removed from the tip.
     pub kind: HintKind,

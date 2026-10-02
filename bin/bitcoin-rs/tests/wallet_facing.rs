@@ -17,14 +17,16 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bitcoin_rs_e2e::helpers::assemble_block_from_template;
+use bitcoin_rs_e2e::helpers::{
+    COINBASE_MATURITY, REGTEST_SUBSIDY_SATS, assemble_block_from_template,
+};
 use bitcoin_rs_e2e::node::HttpResponse;
 use bitcoin_rs_e2e::rpc::Connection;
 
 use bitcoin::absolute::LockTime;
 
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::constants::{COINBASE_MATURITY, genesis_block};
+use bitcoin::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256;
 use bitcoin::opcodes::all::OP_PUSHNUM_1;
@@ -40,7 +42,6 @@ use serde_json::{Value, json};
 const RPC_USER: &str = "bitcoin-rs";
 const RPC_PASSWORD: &str = "bitcoin-rs";
 const FEE_SATS: u64 = 10_000;
-const REGTEST_SUBSIDY_SATS: u64 = 5_000_000_000;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const INDEX_TIMEOUT: Duration = Duration::from_mins(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -453,7 +454,7 @@ impl Client {
     fn esplora_get(&self, path: &str) -> TestResult<HttpResponse> {
         let deadline = Instant::now() + INDEX_TIMEOUT;
         loop {
-            let response = self.exchange("GET", path, false, b"")?;
+            let response = self.exchange("GET", path, b"")?;
             if response.status != 503 || Instant::now() >= deadline {
                 return Ok(response);
             }
@@ -462,7 +463,7 @@ impl Client {
     }
 
     fn esplora_post(&self, path: &str, body: &[u8]) -> TestResult<HttpResponse> {
-        self.exchange("POST", path, false, body)
+        self.exchange("POST", path, body)
     }
 
     fn rpc(&self, method: &str, params: &Value) -> TestResult<Value> {
@@ -483,23 +484,14 @@ impl Client {
         Ok(value.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Sends one request through the shared keep-alive connection.
-    fn exchange(
-        &self,
-        method: &str,
-        path: &str,
-        auth: bool,
-        body: &[u8],
-    ) -> TestResult<HttpResponse> {
+    /// Sends one unauthenticated request through the shared keep-alive
+    /// connection; wallet-facing surfaces never carry the RPC credentials.
+    fn exchange(&self, method: &str, path: &str, body: &[u8]) -> TestResult<HttpResponse> {
         Ok(self.conn.borrow_mut().http(
             method,
             path,
             body,
-            if auth {
-                Some((RPC_USER, RPC_PASSWORD))
-            } else {
-                None
-            },
+            None,
             Instant::now() + REQUEST_TIMEOUT,
         )?)
     }
@@ -576,14 +568,14 @@ fn assert_esplora_namespace(
         "GET /api/internal/* is not wallet-facing: {}",
         backend.body_text()
     );
-    let head_tx = client.exchange("HEAD", "/api/tx", false, b"")?;
+    let head_tx = client.exchange("HEAD", "/api/tx", b"")?;
     assert_eq!(
         head_tx.status,
         404,
         "HEAD /api/tx must not run POST /tx: {}",
         head_tx.body_text()
     );
-    let put_root = client.exchange("PUT", "/", false, b"")?;
+    let put_root = client.exchange("PUT", "/", b"")?;
     assert_eq!(
         put_root.status,
         404,

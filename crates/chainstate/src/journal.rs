@@ -1,7 +1,7 @@
 //! Maps block changes into journal records and replays authenticated records at boot.
 
 use bitcoin_rs_chain::{BlockTree, ChainTxCount, NodeStatus};
-use bitcoin_rs_primitives::{Hash256, Header};
+use bitcoin_rs_primitives::{Hash256, Header, deserialize};
 use bitcoin_rs_storage::chainstate_journal::{
     Coin, JournalRecord, JournalReplayBase, JournalReplayError, Mutation, replay_committed_range,
 };
@@ -230,7 +230,7 @@ fn insert_replayed_header(
     expected_prev: [u8; 32],
     chain_tx_count: u64,
 ) -> Result<bitcoin_rs_chain::TipSnapshot, JournalReplayError> {
-    let header = Header::consensus_decode(&record.raw_header[..]).map_err(|error| {
+    let header = deserialize::<Header>(&record.raw_header[..]).map_err(|error| {
         JournalReplayError::HeaderRebuildRejected(format!("height {}: {error}", record.height))
     })?;
     if expected_prev != record.prev_hash

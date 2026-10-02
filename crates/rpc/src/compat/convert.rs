@@ -294,7 +294,7 @@ fn omit_json_nulls(value: &mut Value) {
 /// Converts a transport value into a typed Core wire value, enforcing the
 /// pinned strict field set (`deny_unknown_fields` where the upstream type
 /// opts in).
-pub(crate) fn sonic_to_typed<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, RpcError> {
+fn sonic_to_typed<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, RpcError> {
     sonic_rs::from_value(value).map_err(RpcError::from)
 }
 
@@ -309,7 +309,7 @@ pub(crate) fn script_pub_key_typed(
 
 /// Input script object (`asm` + `hex`).
 #[must_use]
-pub(crate) fn script_sig_typed(script: &[u8]) -> corepc_types::ScriptSig {
+fn script_sig_typed(script: &[u8]) -> corepc_types::ScriptSig {
     corepc_types::ScriptSig {
         asm: script_asm(script),
         hex: script.to_lower_hex_string(),
@@ -336,7 +336,7 @@ pub(crate) fn coinbase_transaction_typed(
 }
 
 /// Confirmed-chain context attached to a verbose transaction projection.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct VerboseTxChain {
     /// Confirming block hash.
     pub block_hash: String,
@@ -544,14 +544,14 @@ pub(crate) mod fixtures {
     }
 
     /// `OP_0 <32>`.
-    pub(crate) fn p2wsh() -> Vec<u8> {
+    fn p2wsh() -> Vec<u8> {
         let mut script = vec![0x00, 0x20];
         script.extend([0x11; 32]);
         script
     }
 
     /// `OP_1 <32>`.
-    pub(crate) fn p2tr() -> Vec<u8> {
+    fn p2tr() -> Vec<u8> {
         let mut script = vec![0x51, 0x20];
         script.extend([0x11; 32]);
         script

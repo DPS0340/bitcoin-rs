@@ -12,13 +12,12 @@
 use bitcoin_rs_primitives::{Amount, Hash256, Sighash, SighashCache, SighashError, Tx, TxOut};
 use secp256k1::{Message, PublicKey, XOnlyPublicKey, ecdsa::Signature as EcdsaSig};
 
-use crate::eval::OP_CODESEPARATOR;
+use crate::eval::{OP_CODESEPARATOR, remove_all};
 use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
-use crate::script::{Instruction, instructions};
 
 /// Signature version context: which sighash algorithm and encoding rules apply.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum SigVersion {
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum SigVersion {
     /// Pre-segwit legacy signatures (double-SHA256 legacy sighash).
     Base,
     /// Segwit v0 signatures (BIP143).
@@ -48,7 +47,7 @@ const SIGHASH_ANYONECANPAY: u8 = 0x80;
 
 /// Transaction signature checker that holds a transaction, input index, amount,
 /// prevouts, and a lazily-initialized sighash cache.
-pub struct TxSignatureChecker<'a> {
+pub(crate) struct TxSignatureChecker<'a> {
     tx: &'a Tx,
     input_index: usize,
     amount: Amount,
@@ -59,34 +58,16 @@ pub struct TxSignatureChecker<'a> {
     annex: Option<Vec<u8>>,
 }
 
-/// Removes `OP_CODESEPARATOR` (0xab) opcodes from a script, matching Core's
-/// `CTransactionSignatureSerializer::SerializeScriptCode`. Bytes inside data
-/// pushes — and any malformed trailing push — are preserved. The legacy
-/// sighash must exclude CS opcode bytes.
-fn remove_codeseparators(script: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(script.len());
-    let mut iter = instructions(script);
-    let mut start = 0_usize;
-    while let Some(item) = iter.next() {
-        // A malformed tail is copied verbatim, as Core's serializer emits it.
-        let end = if item.is_err() {
-            script.len()
-        } else {
-            script.len() - iter.remaining.len()
-        };
-        if !matches!(item, Ok(Instruction::Op(OP_CODESEPARATOR))) {
-            out.extend_from_slice(&script[start..end]);
-        }
-        start = end;
-    }
-    out
-}
-
 impl<'a> TxSignatureChecker<'a> {
     /// Builds a checker for one input of `tx`, with `prevouts` covering every
     /// input so taproot sighashes can commit to all spent outputs.
     #[must_use]
-    pub fn new(tx: &'a Tx, input_index: usize, amount: Amount, prevouts: &'a [TxOut]) -> Self {
+    pub(crate) fn new(
+        tx: &'a Tx,
+        input_index: usize,
+        amount: Amount,
+        prevouts: &'a [TxOut],
+    ) -> Self {
         Self {
             tx,
             input_index,
@@ -115,7 +96,7 @@ impl<'a> TxSignatureChecker<'a> {
     /// Returns `Ok(true)` when the signature is valid, `Ok(false)` when it is
     /// empty (clean failure), and `Err` when encoding or verification fails
     /// under the active flags.
-    pub fn check_ecdsa_signature(
+    pub(crate) fn check_ecdsa_signature(
         &mut self,
         sig: &[u8],
         pubkey: &[u8],
@@ -162,7 +143,7 @@ impl<'a> TxSignatureChecker<'a> {
         let sighash = match sigversion {
             SigVersion::Base => {
                 let raw_hashtype = u32::from(*hashtype_byte);
-                let cleaned = remove_codeseparators(script_code);
+                let cleaned = remove_all(script_code, &[OP_CODESEPARATOR]).0;
                 self.cache
                     .legacy_signature_hash(self.input_index, &cleaned, raw_hashtype)
                     .map_err(|e| sighash_to_script_error(&e))?
@@ -624,13 +605,14 @@ mod tests {
     use bitcoin::hex::FromHex;
     use bitcoin_rs_primitives::{
         Amount, Hash256, LockTime, OutPoint, Script, Sequence, SighashCache, Tx, TxIn, TxOut, Txid,
-        Witness,
+        Witness, deserialize,
     };
 
     use super::{
         LOCKTIME_THRESHOLD, SEQUENCE_FINAL, SEQUENCE_LOCKTIME_DISABLE_FLAG,
-        SEQUENCE_LOCKTIME_TYPE_FLAG, SigVersion, TxSignatureChecker, remove_codeseparators,
+        SEQUENCE_LOCKTIME_TYPE_FLAG, SigVersion, TxSignatureChecker,
     };
+    use crate::eval::{OP_CODESEPARATOR, remove_all};
     use crate::interpreter::{ScriptErrCode, ScriptError, VerifyFlags};
 
     // --- Helper: build a minimal 1-input, 1-output transaction ---
@@ -1107,13 +1089,13 @@ mod tests {
                 .expect("expected hash");
 
             let tx_bytes = hex_decode(tx_hex);
-            let tx = Tx::consensus_decode(&tx_bytes)
+            let tx = deserialize::<Tx>(&tx_bytes)
                 .unwrap_or_else(|e| panic!("tx decode at row {tested}: {e}"));
 
             // Core's SignatureHash removes OP_CODESEPARATOR (0xab) from
             // script_code before hashing; our legacy_signature_hash expects
             // the pre-processed script. Match Core's SerializeScriptCode.
-            let script_code = remove_codeseparators(&hex_decode(script_hex));
+            let script_code = remove_all(&hex_decode(script_hex), &[OP_CODESEPARATOR]).0;
 
             // The hashtype in sighash.json is a signed 32-bit integer;
             // Core casts `int nHashType` to `uint32_t` (bit-preserving).

@@ -119,7 +119,7 @@ fn decode_block_header(hex: &str) -> Result<Header, RpcError> {
             "Block header decode failed".to_owned(),
         ));
     };
-    Header::consensus_decode(header_bytes)
+    deserialize::<Header>(header_bytes)
         .map_err(|_| RpcError::Deserialization("Block header decode failed".to_owned()))
 }
 
@@ -801,13 +801,8 @@ mod tests {
                 lock_time: LockTime::ZERO,
             },
             coinbase_value: 5_000_000_000,
-            fees: 0,
             weight: 1_000,
-            size: 250,
-            sigop_cost: 0,
             transactions: Vec::new(),
-            witness_merkle_root: None,
-            witness_reserved_value: None,
             witness_commitment: Some(Hash256::from_le_bytes(&[0xab; 32])),
         }
     }
@@ -1562,8 +1557,6 @@ mod tests {
             txid,
             wtxid,
             fee: 100,
-            fee_delta: 0,
-            modified_fee: 100,
             sigop_cost: 2,
             weight: 400,
             depends: vec![],

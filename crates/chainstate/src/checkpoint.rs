@@ -12,8 +12,6 @@ pub(crate) use bitcoin_rs_storage::checkpoint::COINSTATS_PAYLOAD_LEN;
 pub(crate) use bitcoin_rs_storage::checkpoint::COINSTATS_VERSION;
 #[cfg(test)]
 pub(crate) use bitcoin_rs_storage::checkpoint::CURRENT_FILE;
-#[cfg(test)]
-pub(crate) use bitcoin_rs_storage::checkpoint::CheckpointCorruption;
 use bitcoin_rs_storage::checkpoint::CheckpointError as StoreError;
 pub(crate) use bitcoin_rs_storage::checkpoint::CheckpointFailpoint;
 use bitcoin_rs_storage::checkpoint::CheckpointIdentity;

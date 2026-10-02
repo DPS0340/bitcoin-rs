@@ -18,9 +18,9 @@ use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
 use super::{
-    CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointCorruption, CheckpointLoad,
-    CheckpointLoadError, CheckpointManifestV1, CheckpointWrite, CurrentV1, HEADERS_FILE,
-    MANIFEST_FILE, UTXO_FILE, load_checkpoint,
+    CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointLoad, CheckpointLoadError,
+    CheckpointManifestV1, CheckpointWrite, CurrentV1, HEADERS_FILE, MANIFEST_FILE, UTXO_FILE,
+    load_checkpoint,
 };
 
 const NETWORK: Network = Network::Regtest;

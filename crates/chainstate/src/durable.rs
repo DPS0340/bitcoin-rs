@@ -13,7 +13,7 @@ use bitcoin_rs_utxo::contract::{
 /// What one durable head commit certified: the commit id and the exact
 /// cumulative transaction count publication may carry. A receipt exists only
 /// for a committed head, so publication cannot carry an uncommitted count.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct DurableReceipt {
     pub(super) commit_id: u64,
     pub(super) chain_tx_count: ChainTxCount,
@@ -259,7 +259,6 @@ pub fn recover_disconnect_marker(handles: &Chainstate) -> Result<(), ApplyError>
 /// and `above` is empty; otherwise the anchor is the first head-chain
 /// ancestor the tree knows, found by walking the self-authenticating durable
 /// body chain down from `head.tip`.
-#[derive(Debug)]
 struct HeadChainAnchor {
     pub(super) anchor_height: u32,
     pub(super) anchor: Hash256,

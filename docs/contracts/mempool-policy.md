@@ -146,5 +146,5 @@ model matrix remain unmeasured. Correctness tests do not promote defaults.
 
 ## Vocabulary
 
-[ReadStamp](../../CONCEPTS.md),
+[Chain generation](../../CONCEPTS.md),
 [MempoolGateway](../../CONCEPTS.md).

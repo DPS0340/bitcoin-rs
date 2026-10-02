@@ -498,7 +498,7 @@ mod tests {
     use bitcoin::p2p::message_compact_blocks::BlockTxn;
     use bitcoin_rs_primitives::{
         Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Sequence, Tx, Txid,
-        Witness, Wtxid,
+        Witness, Wtxid, deserialize,
     };
 
     use super::{
@@ -779,7 +779,7 @@ mod tests {
         else {
             panic!("expected block payload plus notfound, got {responses:?}");
         };
-        let found = Block::consensus_decode(found)
+        let found = deserialize::<Block>(found)
             .unwrap_or_else(|error| panic!("served payload must decode: {error}"));
         assert_eq!(found.block_hash(), chain.headers[0].compute_hash());
         assert_eq!(not_found, &vec![missing]);

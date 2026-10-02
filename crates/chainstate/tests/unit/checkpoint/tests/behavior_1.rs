@@ -213,9 +213,7 @@ fn unsupported_utxo_snapshot_version_requires_explicit_resync()
         manifest.utxo.version = 3;
     })?;
 
-    let Err(CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid { reason })) =
-        load_checkpoint(dir.path(), config())
-    else {
+    let Err(CheckpointLoadError::Corrupt(reason)) = load_checkpoint(dir.path(), config()) else {
         return Err("unsupported UTXO snapshot unexpectedly loaded".into());
     };
     assert!(reason.contains("UTXO checkpoint version 3 is not current"));
@@ -284,9 +282,7 @@ fn authenticated_inner_header_version_is_fatal() -> Result<(), Box<dyn std::erro
 
     assert!(matches!(
         load_checkpoint(dir.path(), config()),
-        Err(super::super::CheckpointLoadError::Corrupt(
-            super::super::CheckpointCorruption::Invalid { .. }
-        ))
+        Err(super::super::CheckpointLoadError::Corrupt(_))
     ));
     Ok(())
 }

@@ -21,9 +21,6 @@
 
 #![expect(clippy::expect_used, reason = "process test assertions")]
 
-#[path = "support/wire.rs"]
-mod wire;
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write as _;
@@ -44,10 +41,21 @@ use bitcoin_rs_e2e::helpers::{
     best_hash, block_count, build_chain, genesis_block, segwit_coinbase_block, wait_for,
 };
 use bitcoin_rs_e2e::node::workspace;
-use bitcoin_rs_e2e::process_peer::{FrameBuffer, connect_loopback, decode_frame, read_frame};
+use bitcoin_rs_e2e::process_peer::{
+    FrameBuffer, connect_loopback, decode_frame, is_soft_recv_error, read_frame,
+};
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
 use serde_json::json;
-use wire::{is_soft_recv_error, remaining};
+
+/// The remaining slice of `deadline` as a socket timeout, or an error
+/// naming `message` once the deadline has already passed.
+fn remaining(deadline: Instant, message: &str) -> Result<Option<Duration>, Error> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| *d >= Duration::from_micros(1))
+        .map(Some)
+        .ok_or_else(|| Error::Protocol(format!("{message} ran past the deadline")))
+}
 
 /// Blocks applied before the serving probes: deep enough that a request 11
 /// below the tip exists on the active chain.
@@ -63,8 +71,6 @@ struct CompactPeer {
     blocks: BTreeMap<BlockHash, Block>,
     /// The header chain, so a `getheaders` probe is answered.
     headers: Vec<bitcoin::block::Header>,
-    /// Every block-typed `getdata` item the node sent, in arrival order.
-    requested: Vec<(u32, BlockHash)>,
     /// The peer socket died (node disconnected or transport error).
     dropped: bool,
     /// Partial bytes of an in-flight frame carried between reads.
@@ -72,10 +78,9 @@ struct CompactPeer {
 }
 
 impl CompactPeer {
-    /// Handshakes at v70016 and, when `cmpct_version` is given, negotiates
-    /// BIP152 with that recorded version so the node will serve compact
-    /// requests at it.
-    fn connect(node: &ProcessNode, name: &str, cmpct_version: Option<u64>) -> Result<Self, Error> {
+    /// Handshakes at v70016 and negotiates BIP152 at `cmpct_version` so the
+    /// node will serve compact requests at it.
+    fn connect(node: &ProcessNode, name: &str, cmpct_version: u64) -> Result<Self, Error> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let stream = connect_loopback(node.p2p_addr, deadline)?;
         stream.set_nodelay(true)?;
@@ -86,7 +91,6 @@ impl CompactPeer {
             t0: Instant::now(),
             blocks: BTreeMap::new(),
             headers: Vec::new(),
-            requested: Vec::new(),
             dropped: false,
             pending: FrameBuffer::default(),
         };
@@ -123,15 +127,13 @@ impl CompactPeer {
                     peer.send(NetworkMessage::Verack, deadline)?;
                 }
                 NetworkMessage::Verack if saw_version => {
-                    if let Some(v) = cmpct_version {
-                        peer.send(
-                            NetworkMessage::SendCmpct(SendCmpct {
-                                send_compact: false,
-                                version: v,
-                            }),
-                            deadline,
-                        )?;
-                    }
+                    peer.send(
+                        NetworkMessage::SendCmpct(SendCmpct {
+                            send_compact: false,
+                            version: cmpct_version,
+                        }),
+                        deadline,
+                    )?;
                     return Ok(peer);
                 }
                 NetworkMessage::Ping(nonce) => peer.send(NetworkMessage::Pong(nonce), deadline)?,
@@ -196,7 +198,6 @@ impl CompactPeer {
             | Inventory::Block(hash) => *hash,
             _ => return Ok(()),
         };
-        self.requested.push((inv_type(item), hash));
         // The wire takes an owned body; the map keeps serving further requests.
         let Some(body) = self.blocks.get(&hash).cloned() else {
             return self.send(NetworkMessage::NotFound(vec![*item]), deadline);
@@ -259,15 +260,6 @@ impl CompactPeer {
     }
 }
 
-fn inv_type(item: &Inventory) -> u32 {
-    match item {
-        Inventory::Block(_) => 0x0000_0002,
-        Inventory::CompactBlock(_) => 0x0000_0004,
-        Inventory::WitnessBlock(_) => 0x4000_0002,
-        _ => 0,
-    }
-}
-
 /// The offered block `depth` below the applied tip. `chain[0]` is height 1, so
 /// a tip at `tip_height` puts depth `d` at index `tip_height - 1 - d`.
 fn block_at_depth(chain: &[Block], tip_height: u32, depth: u32) -> &Block {
@@ -277,7 +269,7 @@ fn block_at_depth(chain: &[Block], tip_height: u32, depth: u32) -> &Block {
 
 fn synced_peer(name: &str) -> Result<(ProcessNode, CompactPeer, Vec<Block>), Error> {
     let mut node = ProcessNode::spawn(Kind::BitcoinRs)?;
-    let mut peer = CompactPeer::connect(&node, name, Some(2))?;
+    let mut peer = CompactPeer::connect(&node, name, 2)?;
     if !wait_for(Duration::from_secs(10), &mut || {
         node.rpc("getconnectioncount", &json!([]))
             .ok()

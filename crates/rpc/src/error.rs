@@ -63,9 +63,9 @@ pub enum RpcError {
 
 impl RpcError {
     /// Standard JSON-RPC parse error code.
-    pub(crate) const PARSE_ERROR: i64 = -32_700;
+    const PARSE_ERROR: i64 = -32_700;
     /// Standard JSON-RPC invalid request code.
-    pub(crate) const INVALID_REQUEST: i64 = -32_600;
+    const INVALID_REQUEST: i64 = -32_600;
     /// Standard JSON-RPC unknown method code.
     pub const METHOD_NOT_FOUND: i64 = -32_601;
     /// Standard JSON-RPC invalid params code.

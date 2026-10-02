@@ -7,7 +7,7 @@
 use core::fmt;
 
 /// An amount in satoshis.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Amount(u64);
 
 impl Amount {
@@ -52,7 +52,7 @@ impl PartialEq<u64> for Amount {
 }
 
 /// A transaction input sequence number.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Sequence(u32);
 
 impl Sequence {
@@ -103,7 +103,7 @@ impl core::ops::BitAnd<u32> for Sequence {
 }
 
 /// A transaction lock time (`nLockTime`).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LockTime(u32);
 
 impl LockTime {
@@ -136,7 +136,7 @@ impl fmt::Display for LockTime {
 }
 
 /// Compact proof-of-work target (`nBits`).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactTarget(u32);
 
 impl CompactTarget {

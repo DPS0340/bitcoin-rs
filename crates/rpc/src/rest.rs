@@ -52,7 +52,7 @@ pub const REGISTRATIONS: [&str; 12] = [
 ];
 
 /// HTTP response produced by a REST route.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct Response {
     /// HTTP status code.
     pub status: u16,
@@ -64,7 +64,6 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone)]
 struct HeaderRecord {
     hash: Hash256,
     height: u32,
@@ -377,7 +376,7 @@ fn release_applied_capture() {
 
 /// Arms a one-shot closure that runs immediately after the next route capture.
 #[cfg(test)]
-pub(crate) fn arm_capture_hook(hook: impl FnOnce() + 'static) {
+fn arm_capture_hook(hook: impl FnOnce() + 'static) {
     AFTER_APPLIED_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
@@ -918,7 +917,7 @@ pub(crate) fn json_ok<T: serde::Serialize>(value: T) -> Response {
     }
 }
 
-pub(crate) fn json_response(result: Result<Value, RpcError>) -> Response {
+fn json_response(result: Result<Value, RpcError>) -> Response {
     match result {
         Ok(value) => text_response("application/json", sonic_bytes(&value)),
         Err(error) => match error {
@@ -943,7 +942,7 @@ pub(crate) fn text_response(content_type: &'static str, body: Vec<u8>) -> Respon
     }
 }
 
-pub(crate) fn binary_response(content_type: &'static str, body: &[u8]) -> Response {
+fn binary_response(content_type: &'static str, body: &[u8]) -> Response {
     text_response(content_type, body.to_vec())
 }
 
@@ -978,7 +977,7 @@ pub(crate) fn not_found() -> Response {
     not_found_with("not found")
 }
 
-pub(crate) fn not_found_with(message: impl Into<String>) -> Response {
+fn not_found_with(message: impl Into<String>) -> Response {
     Response {
         status: 404,
         reason: "Not Found",

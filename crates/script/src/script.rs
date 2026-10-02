@@ -274,7 +274,7 @@ pub fn is_p2tr(script: &[u8]) -> bool {
 /// Returns `true` for `OP_1 OP_PUSHBYTES_2 0x4e73` (pay-to-anchor).
 #[must_use]
 pub fn is_p2a(script: &[u8]) -> bool {
-    script == [0x51, 0x02, 0x4e, 0x73]
+    script == [opcode::OP_PUSHNUM_1, 0x02, 0x4e, 0x73]
 }
 
 /// Returns the witness version and program of a segwit output script, or

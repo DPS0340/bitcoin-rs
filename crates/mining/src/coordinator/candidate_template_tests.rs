@@ -51,13 +51,8 @@ fn candidate_cache_evicts_the_oldest_entry_at_the_bound() {
             mempool_sequence: seq,
             coinbase: coinbase.clone(),
             coinbase_value: 50,
-            fees: 0,
             weight: 800,
-            size: 200,
-            sigop_cost: 0,
             transactions: Vec::new(),
-            witness_merkle_root: None,
-            witness_reserved_value: None,
             witness_commitment: None,
         });
         state.cache_insert(id, candidate);
@@ -97,13 +92,8 @@ fn sample_candidate(previous: Hash256, csv_active: bool, segwit_active: bool) ->
             }],
         },
         coinbase_value: 50,
-        fees: 0,
         weight: 800,
-        size: 200,
-        sigop_cost: 0,
         transactions: Vec::new(),
-        witness_merkle_root: None,
-        witness_reserved_value: None,
         witness_commitment: None,
     }
 }

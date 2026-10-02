@@ -182,7 +182,7 @@ impl PeerTable {
     ///   write operation; every reserved lease is counted until its
     ///   identity is removed.
     #[must_use]
-    pub fn try_register_inbound(
+    pub(crate) fn try_register_inbound(
         &self,
         addr: SocketAddr,
         lease: PeerLease,
@@ -232,7 +232,7 @@ impl PeerTable {
     /// active-chain credit when `height` is supplied. See P2P-03 in
     /// `docs/contracts/p2p-wire.md`. Returns `false` for a stale or unpublished
     /// connection and `true` for any live published connection.
-    pub fn note_announced_tip(
+    pub(crate) fn note_announced_tip(
         &self,
         source: PeerSource,
         tip_hash: Hash256,
@@ -276,7 +276,7 @@ impl PeerTable {
 
     /// Raises the active-chain credit for `source`. See P2P-03 in
     /// `docs/contracts/p2p-wire.md`.
-    pub fn note_announced_height(&self, source: PeerSource, height: i32) -> bool {
+    pub(crate) fn note_announced_height(&self, source: PeerSource, height: i32) -> bool {
         let mut entries = self.entries.write();
         match entries.get_mut(&source.addr) {
             Some(entry) if entry.lease.is_current(source) && !entry.lease.is_cancelled() => {

@@ -129,7 +129,7 @@ impl BlockSync {
         }
     }
 
-    pub(super) fn fill_inbound_block_chunk(
+    fn fill_inbound_block_chunk(
         &self,
         blocks: &mut Vec<InboundBlock>,
         saw_block: &mut bool,

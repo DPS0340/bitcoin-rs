@@ -15,7 +15,7 @@ use super::{
 use crate::error::ApplyError;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chain::node::NodeId;
-use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, MEDIAN_TIME_PAST_WINDOW, UtxoView};
+use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, UtxoView};
 use bitcoin_rs_primitives::{Block, Hash256, Txid, consensus_bytes};
 use bitcoin_rs_storage::CommitRecords;
 use bitcoin_rs_utxo::contract::{BlockChangeError, build_block_changes, is_coinbase_tx};
@@ -138,9 +138,7 @@ pub(super) fn apply_block_admitted<'b>(
 
     let (prev_median_time_past, softfork_state) = if let Some(tip) = prior.as_deref() {
         let tree = handles.block_tree.read();
-        let mtp = tree
-            .median_time_past_at(tip.tip_id, MEDIAN_TIME_PAST_WINDOW)
-            .unwrap_or(0);
+        let mtp = tree.median_time_past_at(tip.tip_id).unwrap_or(0);
         let softfork_state =
             bitcoin_rs_chain::softfork_state(&tree, handles.network, Some(tip.tip_id), height);
         (mtp, softfork_state)

@@ -221,24 +221,19 @@ impl BlockTree {
     /// Order is iteration order of the underlying slab.
     #[must_use]
     pub fn leaf_node_ids(&self) -> Vec<NodeId> {
-        let mut parents: hashbrown::HashSet<u32> = hashbrown::HashSet::new();
+        let mut parents: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
         for (_index, node) in &self.nodes {
-            if let Some(parent_id) = node.parent
-                && let Some(parent_index) = parent_id.index()
-            {
-                // NodeId stores a u32; track parent indices to skip them later.
-                if let Ok(idx_u32) = u32::try_from(parent_index) {
-                    parents.insert(idx_u32);
-                }
+            if let Some(parent_index) = node.parent.and_then(NodeId::index) {
+                parents.insert(parent_index);
             }
         }
 
         let mut leaves = Vec::new();
         for (index, _node) in &self.nodes {
-            if let Ok(idx_u32) = u32::try_from(index)
-                && !parents.contains(&idx_u32)
+            if !parents.contains(&index)
+                && let Ok(id_u32) = u32::try_from(index)
             {
-                leaves.push(NodeId::new(idx_u32));
+                leaves.push(NodeId::new(id_u32));
             }
         }
         leaves
@@ -468,65 +463,40 @@ impl BlockTree {
             return None;
         }
         let node = self.node_at_height_from(tip, height - 1)?;
-        self.median_time_past_at(node, bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW)
+        self.median_time_past_at(node)
     }
 
-    /// Returns the median time of the most recent `window` blocks, inclusive
-    /// of `start_id`, walking backward via parent pointers.
+    /// Returns the BIP113 median time of the most recent
+    /// [`bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW`] blocks, inclusive of
+    /// `start_id`, walking backward via parent pointers.
     ///
-    /// BIP113 uses `window = 11`. When the chain has fewer than `window`
-    /// blocks, the median is computed over however many exist. Returns `None`
-    /// only when `start_id` is not in the tree.
+    /// When the chain has fewer blocks than the window, the median is
+    /// computed over however many exist. Returns `None` only when `start_id`
+    /// is not in the tree.
     #[must_use]
-    pub fn median_time_past_at(&self, start_id: NodeId, window: usize) -> Option<u32> {
-        if window == 0 {
-            return Some(0);
-        }
-
-        if window == 11 {
-            let mut times = [0_u32; 11];
-            let mut len = 0;
-            let mut cursor = start_id;
-            while len < times.len() {
-                let Ok(node) = self.node(cursor) else {
-                    if len == 0 {
-                        return None;
-                    }
-                    break;
-                };
-                times[len] = node.header.time;
-                len += 1;
-                let Some(parent) = node.parent else {
-                    break;
-                };
-                cursor = parent;
-            }
-
-            times[..len].sort_unstable();
-            return Some(times[len / 2]);
-        }
-
-        let mut times = Vec::with_capacity(window);
+    pub fn median_time_past_at(&self, start_id: NodeId) -> Option<u32> {
+        const WINDOW: usize = bitcoin_rs_consensus::MEDIAN_TIME_PAST_WINDOW;
+        let mut times = [0_u32; WINDOW];
+        let mut len = 0usize;
         let mut cursor = start_id;
-        while times.len() < window {
+        while len < WINDOW {
             let Ok(node) = self.node(cursor) else {
-                if times.is_empty() {
+                if len == 0 {
                     return None;
                 }
                 break;
             };
-            times.push(node.header.time);
+            times[len] = node.header.time;
+            len += 1;
             let Some(parent) = node.parent else {
                 break;
             };
             cursor = parent;
         }
 
-        if times.is_empty() {
-            return None;
-        }
+        let times = &mut times[..len];
         times.sort_unstable();
-        Some(times[times.len() / 2])
+        Some(times[len / 2])
     }
 
     /// Inserts a header whose parent is inferred from `prev_blockhash`.
@@ -579,7 +549,7 @@ impl BlockTree {
             return Err(ChainError::DuplicateHeader { hash });
         }
 
-        let block_work = crate::header_sync::pow::work_from_header(&header);
+        let block_work = crate::block_work(&header);
         let (height, chainwork, status) = match parent {
             Some(parent_id) => {
                 let parent_node = self.node(parent_id)?;
@@ -1163,7 +1133,7 @@ mod tests {
         let Some(tip) = tip else {
             panic!("chain has 11 blocks should yield a tip");
         };
-        let Some(mtp) = tree.median_time_past_at(tip, 11) else {
+        let Some(mtp) = tree.median_time_past_at(tip) else {
             panic!("chain has 11 blocks should yield Some");
         };
         assert_eq!(mtp, 1_003_000);
@@ -1199,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn median_time_past_at_parity_across_zero_short_eleven_and_wider_windows()
+    fn median_time_past_at_handles_short_chain_and_unknown_start()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let mut prev_hash = BlockHash::default();
@@ -1227,32 +1197,19 @@ mod tests {
             panic!("chain has 15 blocks should yield a tip");
         };
 
-        assert_eq!(tree.median_time_past_at(tip, 0), Some(0));
         assert_eq!(
-            tree.median_time_past_at(tip, 5),
-            Some(expected_median_time_past(&times, 5))
-        );
-        assert_eq!(
-            tree.median_time_past_at(tip, 11),
+            tree.median_time_past_at(tip),
             Some(expected_median_time_past(&times, 11))
-        );
-        assert_eq!(
-            tree.median_time_past_at(tip, 15),
-            Some(expected_median_time_past(&times, 15))
         );
 
         let short_tip = ids[2];
         assert_eq!(
-            tree.median_time_past_at(short_tip, 11),
+            tree.median_time_past_at(short_tip),
             Some(expected_median_time_past(&times[..=2], 11))
         );
 
         assert_eq!(
-            tree.median_time_past_at(crate::node::NodeId::new(u32::MAX), 11),
-            None
-        );
-        assert_eq!(
-            tree.median_time_past_at(crate::node::NodeId::new(u32::MAX), 5),
+            tree.median_time_past_at(crate::node::NodeId::new(u32::MAX)),
             None
         );
         Ok(())

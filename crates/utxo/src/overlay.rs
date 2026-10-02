@@ -89,7 +89,7 @@ impl<'u> WindowOverlay<'u> {
 }
 
 /// Why the view refused to fold in a block.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
 #[expect(missing_docs)]
 pub enum WindowOverlayError {
     #[error("block has {transactions} transactions but {txids} txids were supplied")]

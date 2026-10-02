@@ -88,7 +88,7 @@ use bitcoin_rs_index::block_log::{BlockLog, BlockRecord, record_at_height, recor
 use bitcoin_rs_index::query_api::RollbackWarningSource;
 
 /// Typed synchronization progress behind `getblockchaininfo`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct SyncProgress {
     /// Consensus network the node follows.
     pub network: Network,
@@ -119,7 +119,7 @@ pub struct SyncProgress {
 }
 
 /// Current pruning state reported by chain RPCs.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct PruneStatus {
     /// Whether block pruning is enabled for this node.
     pub pruned: bool,
@@ -128,14 +128,14 @@ pub struct PruneStatus {
 }
 
 /// Summary of one completed manual prune request.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct PruneResult {
     /// Highest prune height now recorded by the service.
     pub pruneheight: u32,
 }
 
 /// Error returned by the node-owned pruning implementation.
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum PruneServiceError {
     /// Storage or backend-specific pruning failure.
     #[error("{0}")]
@@ -169,7 +169,7 @@ pub trait ChainControl: Send + Sync {
 }
 
 /// Failure from a node-owned chain mutation.
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ChainControlError {
     /// The requested block is unknown.
     #[error("unknown block")]
@@ -198,7 +198,6 @@ pub use bitcoin_rs_index::{
 /// these capability groups — RPC consumes node capabilities and never names a
 /// storage backend or backend engine type, and production wiring attaches
 /// nothing to a constructed `Context` afterwards.
-#[derive(Clone)]
 pub struct ContextHandles {
     /// Chain capability: tips, block log, UTXO set, block tree, transition
     /// barrier, and the chain-owned control surfaces.
@@ -218,7 +217,6 @@ pub struct ContextHandles {
 }
 
 /// Chain capability handles.
-#[derive(Clone)]
 pub struct ChainHandles {
     /// Best header-chain tip. Read-only: only Chainstate publishes.
     pub chain_tip: TipReader,
@@ -298,7 +296,7 @@ impl AdmissionChain for ChainAdmissionView {
         let tree = self.block_tree.read();
         let tip_node = tip.as_ref().and_then(|tip| tree.lookup(tip.hash));
         let locktime_cutoff = tip_node
-            .and_then(|node| tree.median_time_past_at(node, 11))
+            .and_then(|node| tree.median_time_past_at(node))
             .unwrap_or(0);
         // CSV activation at the next block gates BIP68 relative locks,
         // matching the block-connect and mining evaluation contexts.
@@ -322,7 +320,7 @@ impl AdmissionChain for ChainAdmissionView {
                             .checked_sub(1)
                             .and_then(|prior| tree.node_at_height_from(tip, prior))
                     })
-                    .and_then(|prior| tree.median_time_past_at(prior, 11))
+                    .and_then(|prior| tree.median_time_past_at(prior))
                     .unwrap_or(0)
             });
             prevout_meta.insert(
@@ -353,14 +351,13 @@ impl AdmissionChain for ChainAdmissionView {
 }
 
 /// Mempool capability handles.
-#[derive(Clone)]
 pub struct MempoolHandles {
     /// The process-wide mutation gateway in front of the in-memory pool.
     pub gateway: Arc<MempoolGateway>,
 }
 
 /// Index capability handles.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct IndexHandles {
     /// Complete transaction-index query adapter.
     pub derived_index: Option<Arc<dyn DerivedIndexQuery>>,
@@ -375,7 +372,6 @@ pub struct IndexHandles {
 }
 
 /// Network capability handles.
-#[derive(Clone)]
 pub struct NetworkHandles {
     /// Whether the node accepts or starts P2P connections.
     pub network_active: Arc<core::sync::atomic::AtomicBool>,
@@ -394,7 +390,7 @@ pub struct NetworkHandles {
 }
 
 /// Mining capability handles.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct MiningHandles {
     /// Node-owned mining coordinator. `None` when mining is not wired.
     pub mining_control: Option<Arc<dyn MiningControl>>,
@@ -735,7 +731,7 @@ impl AdmissionFailure {
 
     /// Maps this failure to the string envelope used by
     /// [`Context::admit_transaction`].
-    pub(crate) fn into_string(self) -> String {
+    fn into_string(self) -> String {
         match self {
             Self::Policy(reason) => reason.to_string(),
             Self::Consensus => "consensus-verification-failed".to_owned(),
@@ -831,7 +827,7 @@ impl ChainHandles {
                 (
                     self.difficulty_for_bits(node.header.bits),
                     u64::from(node.header.time),
-                    u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
+                    u64::from(tree.median_time_past_at(tip.tip_id).unwrap_or(0)),
                 )
             })
         });
@@ -1135,7 +1131,7 @@ impl ChainHandles {
     ) -> Option<u32> {
         let tree = self.block_tree.read();
         let node_id = tree.lookup(hash)?;
-        tree.median_time_past_at(node_id, 11)
+        tree.median_time_past_at(node_id)
     }
 
     /// Returns the block height for `hash` via the in-memory `BlockTree`, or
@@ -1291,6 +1287,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<Context>();
+        assert_send_sync::<ContextHandles>();
         assert_send_sync::<ChainHandles>();
         assert_send_sync::<IndexHandles>();
         assert_send_sync::<NetworkHandles>();
@@ -1570,16 +1567,6 @@ mod tests {
             "a log that does not start at zero must still resolve by search"
         );
         assert!(record_at_height(&records, 1).is_none());
-    }
-
-    /// The aggregate `Context` keeps Rust's auto-derived thread-safety traits:
-    /// every capability group is built from handles whose interior mutability
-    /// is already `Send` and `Sync`, so no `unsafe impl` is needed.
-    #[test]
-    fn context_derives_send_and_sync_without_an_unsafe_impl() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Context>();
-        assert_send_sync::<ContextHandles>();
     }
 
     #[test]

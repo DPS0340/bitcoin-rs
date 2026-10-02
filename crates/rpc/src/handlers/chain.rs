@@ -575,8 +575,8 @@ fn window_stats(
         ));
     };
     let window_tx_count = window_tx_count_between(ctx, tree, start_id, selected_id, &branch_cache);
-    let end_mtp = tree.median_time_past_at(selected_id, 11).unwrap_or(0);
-    let start_mtp = tree.median_time_past_at(start_id, 11).unwrap_or(0);
+    let end_mtp = tree.median_time_past_at(selected_id).unwrap_or(0);
+    let start_mtp = tree.median_time_past_at(start_id).unwrap_or(0);
     let window_interval = u64::from(end_mtp.saturating_sub(start_mtp));
     Ok(ChainTxStats {
         selected: true,
@@ -763,7 +763,7 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     })
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 struct FeeFields {
     avgfee: u64,
     avgfeerate: u64,
@@ -1215,7 +1215,7 @@ pub(crate) fn getcapabilities(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     Ok(json!({ "capabilities": snapshot.capabilities }))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ScanScript {
     script_pubkey: Vec<u8>,
     desc: String,

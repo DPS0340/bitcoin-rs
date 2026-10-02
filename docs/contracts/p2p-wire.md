@@ -179,8 +179,8 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
 - The staged retry carries the delivering connection
   (`ReceivedBlock::source`): a retry that admits credits that peer exactly
   as the headers drain would (`note_announced_tip`), and a peer-fault
-  rejection discards the body, releases its download-window record outright
-  (`discard_received`, never re-queued), disconnects the source, and marks
+  rejection drops the staged body (`stager.discard`, never re-queued;
+  its download-window record is only released when the delivery drains), disconnects the source, and marks
   it unresponsive — the same outcome a rejected `headers` batch produces.
 - A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
   `getblocktxn`, `Fallback`'s `getdata`) is marked

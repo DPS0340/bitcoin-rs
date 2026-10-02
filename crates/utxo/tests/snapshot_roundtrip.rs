@@ -5,8 +5,8 @@ use std::io::{Cursor, Seek};
 use bitcoin_rs_primitives::{Amount, Hash256, OutPoint, Script, TxOut};
 use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use bitcoin_rs_utxo::{
-    SnapshotCoin, SnapshotCoinObserver, UtxoError, UtxoSet, hash_serialized_3,
-    read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot_observed,
+    SnapshotCoin, SnapshotCoinObserver, UtxoError, UtxoSet, read_snapshot_strict_v4,
+    read_snapshot_strict_v4_observed, write_snapshot_observed,
 };
 use tempfile::tempfile;
 
@@ -46,7 +46,7 @@ fn snapshot_roundtrip_preserves_vout_and_metadata_boundaries()
     changes.add(UtxoAdd::new(max, max_txout.clone(), false, u32::MAX));
     bitcoin_rs_utxo::contract::commit_block_changes(&set, &changes, &txid(42_004))?;
 
-    let expected_hash = hash_serialized_3(&set)?;
+    let expected_hash = set.lock_stable_view().hash_serialized_3()?;
     let mut file = tempfile()?;
     write_snapshot_observed(&set, &txid(42_005), u32::MAX, &mut file, ())?;
     file.rewind()?;
@@ -57,7 +57,10 @@ fn snapshot_roundtrip_preserves_vout_and_metadata_boundaries()
     assert_eq!(loaded.set.get(&low), Some(low_txout));
     assert_eq!(loaded.set.get(&high), Some(high_txout));
     assert_eq!(loaded.set.get(&max), Some(max_txout));
-    assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
+    assert_eq!(
+        loaded.set.lock_stable_view().hash_serialized_3()?,
+        expected_hash
+    );
     assert!(
         !loaded
             .set

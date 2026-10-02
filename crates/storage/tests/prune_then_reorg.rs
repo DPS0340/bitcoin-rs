@@ -397,7 +397,7 @@ fn retention_lease_stops_the_prune_line_at_its_floor() -> Result<(), Box<dyn std
     released_pass.commit(staged.pruned_below);
     assert!(matches!(
         retention.acquire(2),
-        Err(bitcoin_rs_storage::pruning::RetentionError::PrunedBelow { .. })
+        Err(bitcoin_rs_storage::pruning::RetentionError { .. })
     ));
     Ok(())
 }
@@ -441,7 +441,7 @@ fn history_request_between_planning_and_commit_is_refused() -> Result<(), Box<dy
             assert_eq!(retention.pruned_below(), 0);
             assert!(matches!(
                 retention.acquire(pruned_below - 1),
-                Err(bitcoin_rs_storage::pruning::RetentionError::PrunedBelow {
+                Err(bitcoin_rs_storage::pruning::RetentionError {
                     requested: 10,
                     pruned_below: 11,
                 })
@@ -523,7 +523,7 @@ fn executed_frontier_survives_restart_and_refuses_deleted_heights()
     let restarted = Arc::new(RetentionRegistry::seeded(frontier));
     assert!(matches!(
         restarted.acquire(10),
-        Err(bitcoin_rs_storage::pruning::RetentionError::PrunedBelow {
+        Err(bitcoin_rs_storage::pruning::RetentionError {
             requested: 10,
             pruned_below: 11,
         })

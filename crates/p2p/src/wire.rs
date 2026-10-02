@@ -28,7 +28,7 @@ pub const MAX_MESSAGE_PAYLOAD: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_WRITE_BURST: usize = 8;
 
 /// Maximum number of headers accepted in one `headers` message.
-pub(crate) const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
+const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
 
 /// Maximum block locator hashes accepted in one locator-based request.
 pub const MAX_LOCATOR_HASHES: usize = 101;
@@ -184,7 +184,7 @@ impl Message {
     /// them. Blocks, transactions, and headers stay one frame per syscall so
     /// a 1 MiB body cannot pin a 16-message encode behind it.
     #[must_use]
-    pub const fn is_bulk_payload(&self) -> bool {
+    pub(crate) const fn is_bulk_payload(&self) -> bool {
         matches!(
             self,
             Self::Tx(_)
@@ -831,8 +831,9 @@ mod tests {
     fn block_message_roundtrip_preserves_wire_payload() -> Result<(), super::PeerError> {
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = serialize(&block);
-        let native_block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
-            .map_err(super::PeerError::NativeDecode)?;
+        let native_block =
+            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
+                .map_err(super::PeerError::NativeDecode)?;
         let message = super::Message::Block(native_block);
         let payload = encode_payload(&message)?;
         let expected_hash = block.block_hash();
@@ -909,8 +910,9 @@ mod tests {
     fn block_payload_writes_the_same_frame_as_decoded_block() -> Result<(), PeerError> {
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = serialize(&block);
-        let native_block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
-            .map_err(super::PeerError::NativeDecode)?;
+        let native_block =
+            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
+                .map_err(super::PeerError::NativeDecode)?;
         let decoded = super::Message::Block(native_block);
         let payload = super::Message::BlockPayload(bytes::Bytes::from(block_bytes));
 

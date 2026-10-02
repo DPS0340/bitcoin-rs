@@ -452,11 +452,11 @@ durable.
 - `crates/storage/tests/overhaul_atomic_durability.rs` (existing): tests the
   storage-level prior-or-whole-proposed rule and durable batch completion.
 - `crates/index/src/runtime/recovery_tests.rs` (existing):
+  - `index_ahead_of_restored_tip_is_reported_once_and_rewound` (`RCV-04`);
   - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
     (`RCV-05`);
-  - `tip_change_during_rebuild_converges_on_new_tip` (`RCV-06`);
-  - `missing_disconnected_body_routes_rewind_to_rebuild` (`RCV-07`);
-  - `selective_rebuild_leg_survives_sibling_rollback` (`RCV-05`).
+  - `pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`
+    (`RCV-07`).
 
 - `crates/node/tests/overhaul_fee_history.rs` (existing):
   - `restart_adopts_persisted_estimator_history`,

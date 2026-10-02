@@ -20,7 +20,7 @@ use crate::undo_codec;
 pub use crate::undo_codec::UndoCodecError;
 
 /// One UTXO output to add, owning a `TxOut` or borrowing it from a block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UtxoAdd<T = TxOut> {
     /// Outpoint being created.
     pub outpoint: OutPoint,
@@ -669,7 +669,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::snapshot::hash_serialized_3;
     use crate::stats::CoinStats;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -689,6 +688,13 @@ mod tests {
         TxOut {
             value: Amount::from_sat(value),
             script_pubkey: Script::from_bytes(vec![0x51]),
+        }
+    }
+
+    struct NoSpend;
+    impl SpentOutputLookup for NoSpend {
+        fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
+            None
         }
     }
 
@@ -723,7 +729,7 @@ mod tests {
     fn observe(utxo: &UtxoSet, coin_stats: &CoinStatsListener) -> Result<State, UtxoError> {
         let s = coin_stats.snapshot();
         Ok((
-            hash_serialized_3(utxo)?,
+            utxo.lock_stable_view().hash_serialized_3()?,
             s.muhash.finalize_hash(),
             [
                 s.height.into(),
@@ -1038,7 +1044,10 @@ mod tests {
             commit_block_changes(&first_five, changes, &undo_txid(height))?;
         }
 
-        assert_eq!(hash_serialized_3(&full)?, hash_serialized_3(&first_five)?);
+        assert_eq!(
+            full.lock_stable_view().hash_serialized_3()?,
+            first_five.lock_stable_view().hash_serialized_3()?
+        );
         assert_eq!(full.len(), first_five.len());
 
         Ok(())
@@ -1155,13 +1164,6 @@ mod tests {
     /// reporting success. The build refuses the mismatch before iterating.
     #[test]
     fn short_txid_list_is_refused_before_iterating() {
-        struct NoSpend;
-        impl SpentOutputLookup for NoSpend {
-            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
-                None
-            }
-        }
-
         let (block, txids) = block_with_short_txids();
         let outcome = build_block_changes(&block, HEIGHT, &txids, None, 4, 4, &NoSpend, None, 64);
         assert!(
@@ -1180,13 +1182,6 @@ mod tests {
     /// `txids` slice is refused at height 0 too, as the contract documents.
     #[test]
     fn short_txid_list_is_refused_at_genesis_height() {
-        struct NoSpend;
-        impl SpentOutputLookup for NoSpend {
-            fn entry(&self, _outpoint: &OutPoint) -> Option<&UtxoCoin> {
-                None
-            }
-        }
-
         let (block, txids) = block_with_short_txids();
         let outcome = build_block_changes(&block, 0, &txids, None, 4, 4, &NoSpend, None, 64);
         assert!(

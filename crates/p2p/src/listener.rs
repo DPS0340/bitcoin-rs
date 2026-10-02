@@ -242,7 +242,7 @@ impl ConnectionShared {
     /// INVARIANT: reads the shared chain view once; no per-handshake block
     ///   tree walk exists.
     #[must_use]
-    pub(crate) fn approximate_best_block_depth(&self) -> u64 {
+    fn approximate_best_block_depth(&self) -> u64 {
         let Some(tip_time) = self
             .chain_query
             .as_ref()
@@ -2277,8 +2277,9 @@ mod writer_shutdown_tests {
         let lease = crate::PeerLease::new(tx);
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
-        let block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
-            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        let block =
+            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
+                .map_err(|_| std::io::Error::other("genesis block must decode"))?;
         let serialized = bytes::Bytes::from(block_bytes);
         let source = lease.source(addr);
 
@@ -2305,8 +2306,9 @@ mod writer_shutdown_tests {
         let lease = crate::PeerLease::new(tx);
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
-        let block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
-            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        let block =
+            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
+                .map_err(|_| std::io::Error::other("genesis block must decode"))?;
         let header = block.header;
         let source = lease.source(addr);
 
@@ -2333,11 +2335,13 @@ mod writer_shutdown_tests {
         let lease = crate::PeerLease::new(tx);
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let first_bytes = bitcoin::consensus::encode::serialize(&genesis);
-        let first = bitcoin_rs_primitives::Block::consensus_decode(&first_bytes)
-            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        let first =
+            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&first_bytes)
+                .map_err(|_| std::io::Error::other("genesis block must decode"))?;
         let second_bytes = first_bytes.clone();
-        let second = bitcoin_rs_primitives::Block::consensus_decode(&second_bytes)
-            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        let second =
+            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&second_bytes)
+                .map_err(|_| std::io::Error::other("genesis block must decode"))?;
         shared.send_block(&lease, addr, first, bytes::Bytes::from(first_bytes));
 
         let blocked = std::thread::spawn(move || {
@@ -3120,7 +3124,7 @@ mod block_forward_tests {
     fn genesis_body() -> bitcoin_rs_primitives::Block {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let bytes = bitcoin::consensus::encode::serialize(&genesis);
-        bitcoin_rs_primitives::Block::consensus_decode(&bytes)
+        bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&bytes)
             .expect("regtest genesis block must decode")
     }
 

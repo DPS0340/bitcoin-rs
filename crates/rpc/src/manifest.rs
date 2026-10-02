@@ -151,7 +151,7 @@ impl Status {
 pub const MANIFEST_TOML: &str = include_str!("../core-compat.toml");
 
 /// One declared surface.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Entry {
     /// JSON-RPC method name, REST route prefix (`/rest/...`), or ZMQ topic.
     pub name: &'static str,
