@@ -162,10 +162,11 @@ impl Candidate {
         let mut txs = Vec::with_capacity(self.transactions.len().saturating_add(1));
         txs.push(self.coinbase.clone());
         txs.extend(self.transactions.iter().map(|tx| (*tx.tx).clone()));
-        let merkle_root = merkle_root_from_txids(
-            core::iter::once(self.coinbase.txid())
-                .chain(self.transactions.iter().map(|tx| tx.tx.txid())),
-        )?;
+        let mut leaves = core::iter::once(self.coinbase.txid())
+            .chain(self.transactions.iter().map(|tx| tx.tx.txid()))
+            .map(|txid| *txid.as_bytes())
+            .collect::<Vec<_>>();
+        let merkle_root = merkle_root_from_leaves(&mut leaves)?;
         Ok(Block {
             header: Header {
                 version: self.version,
@@ -309,7 +310,6 @@ fn exact_order(
     }
 
     // Core's generateblock does not claim fees from explicitly ordered transactions.
-    let fees = 0_u64;
     let mut size = transaction_count_size(snapshot.entries.len())?;
     let mut weight = size * 4;
     let mut sigops = 0_u64;
@@ -345,7 +345,7 @@ fn exact_order(
     }
     Ok(SelectedBody {
         ordered: (0..snapshot.entries.len()).collect(),
-        fees,
+        fees: 0,
         weight,
         size,
         sigops,
@@ -482,14 +482,6 @@ fn witness_merkle_root(
     for &index in ordered {
         leaves.push(*snapshot.entries[index].wtxid.as_bytes());
     }
-    merkle_root_from_leaves(&mut leaves)
-}
-
-fn merkle_root_from_txids(txids: impl IntoIterator<Item = Txid>) -> Result<Hash256, MiningError> {
-    let mut leaves = txids
-        .into_iter()
-        .map(|txid| *txid.as_bytes())
-        .collect::<Vec<_>>();
     merkle_root_from_leaves(&mut leaves)
 }
 
