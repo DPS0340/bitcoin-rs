@@ -39,6 +39,13 @@ pub const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 /// Bound concurrent materializations independently of socket connections.
 const MAX_CONCURRENT_REST_BLOCK_RENDERS: usize = 2;
 
+/// UNIX seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 #[derive(Debug)]
 struct RestRenderBudget {
     in_flight: AtomicUsize,
@@ -849,7 +856,7 @@ impl ChainHandles {
                 )
             })
         });
-        let now = crate::handlers::chain::unix_now();
+        let now = unix_now();
         // Core's estimate when the verified-transaction count is known, the
         // height ratio when it is not; `None` is a pre-tracking datadir and
         // means unknown, never zero.

@@ -85,13 +85,6 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     Ok(response)
 }
 
-/// UNIX seconds now.
-pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
-
 /// Bitcoin Core's `GuessVerificationProgress`, as a fraction in `[0, 1]`.
 ///
 /// The quantity is **transactions verified over transactions believed to
