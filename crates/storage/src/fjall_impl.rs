@@ -1,4 +1,4 @@
-use crate::batch::{BatchOp, BufferedWriteBatch};
+use crate::batch::{BatchOp, BufferedWriteBatch, prefix_ops};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -294,12 +294,6 @@ fn cached_keyspace<'store>(
         *slot = Some(store.keyspace(cf)?);
     }
     slot.ok_or(StorageError::UnknownColumnFamily(cf))
-}
-
-/// A strict non-empty prefix of `ops` for the partial-apply fault.
-fn prefix_ops(ops: Vec<BatchOp>) -> impl Iterator<Item = BatchOp> {
-    let split = ops.len().div_ceil(2).max(1).min(ops.len());
-    ops.into_iter().take(split)
 }
 
 struct FjallSnapshot<'a> {
