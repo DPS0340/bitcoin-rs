@@ -45,5 +45,5 @@ pub use overlay::{WindowOverlay, WindowOverlayError};
 pub use set::{UtxoCoin, UtxoError, UtxoMemoryReport, UtxoReader, UtxoScan, UtxoSet, UtxoSetView};
 pub use snapshot::{
     SnapshotCoin, SnapshotCoinObserver, SnapshotLoad, hash_serialized_3, read_snapshot_strict_v4,
-    read_snapshot_strict_v4_observed, write_snapshot, write_snapshot_observed,
+    read_snapshot_strict_v4_observed, write_snapshot_observed,
 };
