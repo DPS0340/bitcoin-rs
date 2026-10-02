@@ -61,10 +61,7 @@ use crate::download_window::RECEIVED_BLOCK_TIMEOUT;
 #[cfg(test)]
 use commit::restore_split;
 
-pub use chain::{
-    BranchSwitchError, HeaderAdmission, SyncChain, SyncChainError, WindowCommitDisposition,
-    WindowCommitError,
-};
+pub use chain::SyncChain;
 
 pub use headers_presync::{
     HeaderAnchor, HeaderSyncError, HeaderSyncResult, HeadersSyncPhase, HeadersSyncState,
