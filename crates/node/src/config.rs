@@ -531,12 +531,6 @@ impl fmt::Debug for Auth {
     }
 }
 
-impl Default for Auth {
-    fn default() -> Self {
-        Self::basic(DEFAULT_RPC_USER, DEFAULT_RPC_PASSWORD)
-    }
-}
-
 const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
 const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
 
