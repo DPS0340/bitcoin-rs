@@ -265,13 +265,6 @@ impl BlockTree {
         self.tip().map(|tip| tip.height)
     }
 
-    /// Returns the hash of the published tip, or `None` if no tip is
-    /// published yet.
-    #[must_use]
-    pub fn tip_hash(&self) -> Option<Hash256> {
-        self.tip().map(|tip| tip.hash)
-    }
-
     /// Returns a cheap-clonable handle to the canonical best-tip pointer.
     ///
     /// Sharing this handle lets lock-free readers observe tip advances
@@ -1289,7 +1282,6 @@ mod tests {
         // The published snapshot is coherent with the active insertion:
         // genesis's height and hash, not hand-stored values.
         assert_eq!(tree.tip_height(), Some(0));
-        assert_eq!(tree.tip_hash(), Some(genesis_hash));
         Ok(())
     }
 
