@@ -9,14 +9,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use bitcoin_rs_node::{Network, UserConfig};
 
-/// Parses `path` into user-config layers for `network`, lowest precedence first.
-pub(crate) fn load_file(path: &Path, network: Network) -> Result<Vec<UserConfig>> {
+/// Parses `path` into the `[global, selected]` layer pair for `network`,
+/// lowest precedence first.
+pub(crate) fn load_file(path: &Path, network: Network) -> Result<[UserConfig; 2]> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read bitcoin.conf {}", path.display()))?;
     Ok(parse_for_network(&text, network))
 }
 
-fn parse_for_network(text: &str, network: Network) -> Vec<UserConfig> {
+fn parse_for_network(text: &str, network: Network) -> [UserConfig; 2] {
     let mut global = UserConfig::default();
     let mut selected = UserConfig::default();
     let mut current_section_selected = None;
@@ -42,7 +43,7 @@ fn parse_for_network(text: &str, network: Network) -> Vec<UserConfig> {
         }
     }
 
-    vec![global, selected]
+    [global, selected]
 }
 
 /// Expands the option table into the `bitcoin.conf` key map: one arm per row
