@@ -267,8 +267,6 @@ impl ZmqPublisher for NoOpZmqPublisher {
     fn publish_rawblock(&self, _bytes: &[u8]) {}
 
     fn publish_rawtx(&self, _bytes: &[u8]) {}
-
-    fn publish_sequence(&self, _event: SequenceEvent) {}
 }
 
 #[cfg(feature = "zmq")]
