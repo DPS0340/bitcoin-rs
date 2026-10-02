@@ -162,12 +162,6 @@ impl ExecutedFrontier {
         self.0
     }
 
-    /// Returns true when `height` lies below the frontier: gone.
-    #[must_use]
-    pub const fn contains(self, height: u32) -> bool {
-        height < self.0
-    }
-
     /// The monotonic join of two frontiers.
     #[must_use]
     pub const fn advance(self, other: Self) -> Self {
