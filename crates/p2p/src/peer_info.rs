@@ -35,7 +35,7 @@ impl PeerRole {
     /// POST: `true` only for `FullRelay`.
     /// INVARIANT: block and header relay is never restricted by role.
     #[must_use]
-    pub const fn relays_transactions(&self) -> bool {
+    pub(crate) const fn relays_transactions(self) -> bool {
         matches!(self, Self::FullRelay)
     }
 }

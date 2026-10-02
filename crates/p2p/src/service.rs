@@ -123,7 +123,7 @@ impl P2pServiceConfig {
     /// INVARIANT: manual peers do not consume these slots; the two slot
     ///   counts are the only automatic outbound population knobs.
     #[must_use]
-    pub(crate) fn total_outbound_active_limit(&self) -> usize {
+    fn total_outbound_active_limit(&self) -> usize {
         self.outbound_full_relay_slots
             .saturating_add(self.outbound_block_relay_slots)
     }
@@ -137,7 +137,7 @@ impl P2pServiceConfig {
     /// INVARIANT: this is the only inbound capacity derivation; the listener
     ///   refuses admission at the result, it never evicts.
     #[must_use]
-    pub fn max_inbound(&self) -> usize {
+    pub(crate) fn max_inbound(&self) -> usize {
         self.max_peer_connections
             .saturating_sub(self.outbound_full_relay_slots)
             .saturating_sub(self.outbound_block_relay_slots)

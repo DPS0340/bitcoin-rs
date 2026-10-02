@@ -98,8 +98,7 @@ impl BlockSync {
     }
 
     #[expect(clippy::too_many_lines)]
-    #[doc(hidden)]
-    pub(crate) fn apply_buffered_blocks(
+    pub(super) fn apply_buffered_blocks(
         &self,
         next_expected_hash: Option<Hash256>,
     ) -> (usize, usize) {
@@ -302,7 +301,7 @@ impl BlockSync {
     /// Returns `None` unless the run reaches `start_height` contiguously (the
     /// reorg / pruning guard); a partial run is never returned so the caller
     /// cannot apply or cache a non-contiguous prefix.
-    pub(super) fn expected_block_hashes(&self, max_count: usize) -> Option<ExpectedRun> {
+    fn expected_block_hashes(&self, max_count: usize) -> Option<ExpectedRun> {
         if max_count == 0 {
             return None;
         }
@@ -356,7 +355,7 @@ impl BlockSync {
     /// past the blocks applied this round, so the next round drains the
     /// remaining suffix on a cache hit. The run is empty only when there is
     /// nothing to apply, in which case caching would be a no-op.
-    pub(super) fn populate_expected_apply_cache(&self, run: ExpectedRun) {
+    fn populate_expected_apply_cache(&self, run: ExpectedRun) {
         if run.hashes.is_empty() {
             return;
         }
@@ -397,7 +396,7 @@ impl BlockSync {
         Some((drained, expected_len))
     }
 
-    pub(super) fn advance_expected_apply_cache(&self, applied_hashes: &[Hash256], failed: bool) {
+    fn advance_expected_apply_cache(&self, applied_hashes: &[Hash256], failed: bool) {
         if failed {
             *self.expected_apply_cache.lock() = None;
             return;

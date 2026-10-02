@@ -77,13 +77,13 @@ impl From<PeerSource> for bitcoin_rs_mempool::PeerToken {
 }
 
 /// Maximum queued messages for one peer connection.
-pub(crate) const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 4096;
+const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 4096;
 
 /// Maximum queued full wire bytes for one peer connection.
 ///
 /// Admission tests usage before adding, so sixteen worst-case block messages
 /// fit: after fifteen, 60,000,360 bytes remain below this 64 MiB high-water.
-pub(crate) const OUTBOUND_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const OUTBOUND_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Consensus maximum serialized block size. `peer` owns the value
 /// ([`crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE`]); `connection` references it
@@ -94,8 +94,7 @@ const BLOCK_SERIALIZED_SIZE: usize = crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZ
 ///
 /// Equals `HEADER_LEN + MAX_BLOCK_SERIALIZED_SIZE_USIZE`: the full encoded wire
 /// byte count that `wire_len` charges and `write_message` releases.
-pub(crate) const BLOCK_PRODUCTION_RESERVE_BYTES: usize =
-    crate::wire::HEADER_LEN + BLOCK_SERIALIZED_SIZE;
+const BLOCK_PRODUCTION_RESERVE_BYTES: usize = crate::wire::HEADER_LEN + BLOCK_SERIALIZED_SIZE;
 
 const _: () = assert!(OUTBOUND_QUEUE_MAX_BYTES > 15 * BLOCK_PRODUCTION_RESERVE_BYTES);
 
@@ -434,7 +433,7 @@ impl PeerLease {
     ///   (`net.h`): the age a connection must reach before policy may
     ///   hold its silence against it.
     #[must_use]
-    pub const fn connected_at(&self) -> Instant {
+    pub(crate) const fn connected_at(&self) -> Instant {
         self.connected
     }
 

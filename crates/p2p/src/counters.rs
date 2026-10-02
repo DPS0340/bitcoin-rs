@@ -141,7 +141,7 @@ impl CountingStream<std::net::TcpStream> {
     /// # Errors
     ///
     /// Returns the error `TcpStream::set_nodelay` returned.
-    pub fn from_connected(
+    pub(crate) fn from_connected(
         stream: std::net::TcpStream,
         counters: Arc<PeerCounters>,
     ) -> IoResult<Self> {

@@ -28,7 +28,7 @@ pub const MAX_MESSAGE_PAYLOAD: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_WRITE_BURST: usize = 8;
 
 /// Maximum number of headers accepted in one `headers` message.
-pub(crate) const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
+const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
 
 /// Maximum block locator hashes accepted in one locator-based request.
 pub const MAX_LOCATOR_HASHES: usize = 101;
@@ -184,7 +184,7 @@ impl Message {
     /// them. Blocks, transactions, and headers stay one frame per syscall so
     /// a 1 MiB body cannot pin a 16-message encode behind it.
     #[must_use]
-    pub const fn is_bulk_payload(&self) -> bool {
+    pub(crate) const fn is_bulk_payload(&self) -> bool {
         matches!(
             self,
             Self::Tx(_)

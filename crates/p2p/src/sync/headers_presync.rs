@@ -727,7 +727,7 @@ impl HeadersSyncState {
 
     /// The salted one-bit commitment for one header hash
     /// (`headerssync.h:211-216`: a salted hasher reduced to its low bit).
-    pub(crate) fn commitment_bit(&self, hash: Hash256) -> bool {
+    pub(super) fn commitment_bit(&self, hash: Hash256) -> bool {
         let mut digest = Sha256::new();
         digest.update(self.salt);
         digest.update(hash.as_byte_array());
