@@ -181,13 +181,7 @@ fn section_matches_network(section: &str, network: Network) -> bool {
 }
 
 fn strip_inline_comment(line: &str) -> &str {
-    let hash = line.find('#');
-    let semicolon = line.find(';');
-    match (hash, semicolon) {
-        (Some(left), Some(right)) => &line[..left.min(right)],
-        (Some(index), None) | (None, Some(index)) => &line[..index],
-        (None, None) => line,
-    }
+    &line[..line.find(['#', ';']).unwrap_or(line.len())]
 }
 
 #[cfg(test)]
