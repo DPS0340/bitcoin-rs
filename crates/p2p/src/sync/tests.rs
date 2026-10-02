@@ -2386,14 +2386,14 @@ fn transaction(seed: u8) -> Tx {
                 u32::from(seed),
             ),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(0xffff_ffff),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(1),
             script_pubkey: Script::new(),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 

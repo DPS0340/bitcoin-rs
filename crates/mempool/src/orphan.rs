@@ -636,7 +636,7 @@ mod tests {
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(parent, 0),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {

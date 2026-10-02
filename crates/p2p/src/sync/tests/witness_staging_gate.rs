@@ -33,7 +33,7 @@ fn segwit_coinbase(height: u32, witness: bool) -> Tx {
         inputs: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(script_sig),
-            sequence: Sequence::from_consensus(0xffff_ffff),
+            sequence: Sequence::MAX,
             witness: if witness {
                 Witness::from_stack(vec![vec![0; 32]])
             } else {
@@ -50,7 +50,7 @@ fn segwit_coinbase(height: u32, witness: bool) -> Tx {
                 script_pubkey: Script::from_bytes(commitment_script),
             },
         ],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 

@@ -118,7 +118,7 @@ fn inbound_tx_channel_is_bounded_against_flood() -> anyhow::Result<()> {
         version: 1,
         inputs: Vec::new(),
         outputs: Vec::new(),
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     for _ in 0..super::INBOUND_TX_CHANNEL_LIMIT {
         sender

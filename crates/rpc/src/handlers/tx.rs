@@ -896,11 +896,11 @@ mod tests {
         use bitcoin_rs_primitives::{Amount, CompactTarget, LockTime, Script, Sequence, Witness};
         let coinbase = Tx {
             version: 1,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
                 previous_output: OutPoint::null(),
                 script_sig: Script::from_bytes(vec![0x51; 4]),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
@@ -1421,11 +1421,11 @@ mod tests {
         // MerkleBlock seam, whose decoder rejects input-less transactions.
         let extra = Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
                 previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[marker; 32])), 0),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
@@ -1985,11 +1985,11 @@ mod tests {
         use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
         Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
                 previous_output: prevout,
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(0xffff_ffff),
+                sequence: Sequence::MAX,
                 witness: Witness::from_stack(vec![vec![0x51]]),
             }],
             outputs: vec![TxOut {
@@ -2131,7 +2131,7 @@ mod gettxout_via_utxo_tests {
         let ctx = Arc::new(Context::new());
         let tx = Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: Vec::new(),
             outputs: vec![TxOut {
                 value: Amount::from_sat(50_000),
@@ -2197,11 +2197,11 @@ mod acceptance_tests {
     fn spending_tx(tag: u8, output_value: u64) -> Tx {
         Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
                 previous_output: spent_outpoint(tag),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(0xffff_ffff),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
@@ -2370,18 +2370,18 @@ mod acceptance_tests {
         let prev = spent_outpoint(1);
         let tx = Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![
                 TxIn {
                     previous_output: prev,
                     script_sig: Script::new(),
-                    sequence: Sequence::from_consensus(0xffff_ffff),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 },
                 TxIn {
                     previous_output: prev,
                     script_sig: Script::new(),
-                    sequence: Sequence::from_consensus(0xffff_ffff),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 },
             ],

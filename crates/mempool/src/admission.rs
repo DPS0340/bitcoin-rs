@@ -845,11 +845,11 @@ mod tests {
         script.extend_from_slice(&[0x88, 0xac]);
         Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
                 previous_output: outpoint,
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
@@ -1420,7 +1420,7 @@ mod tests {
             // gateway must reject those tokens and rebuild from the pool.
             Coins(vec![]).snapshot(&Tx {
                 version: 2,
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
                 inputs: vec![],
                 outputs: vec![],
             })
@@ -1802,11 +1802,11 @@ mod tests {
         for (script_pubkey, script_sig, witness, input_cost) in cases {
             let parent = Tx {
                 version: 2,
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
                 inputs: vec![TxIn {
                     previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[9; 32])), 0),
                     script_sig: Script::new(),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 }],
                 outputs: vec![
@@ -1822,11 +1822,11 @@ mod tests {
             };
             let child = Tx {
                 version: 2,
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
                 inputs: vec![TxIn {
                     previous_output: OutPoint::new(parent.txid(), 1),
                     script_sig: Script::from_bytes(script_sig),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::from_stack(witness),
                 }],
                 outputs: vec![TxOut {
@@ -2342,7 +2342,7 @@ mod tests {
         tx.inputs.push(TxIn {
             previous_output: OutPoint::null(),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         });
         let tx = Arc::new(tx);

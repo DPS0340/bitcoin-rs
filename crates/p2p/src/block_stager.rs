@@ -520,7 +520,7 @@ impl BlockStager {
     }
 
     fn received_order_contains(&self, hash: &Hash256) -> bool {
-        self.received_order.iter().any(|queued| queued == hash)
+        self.received_order.contains(hash)
     }
 
     #[cfg(test)]

@@ -218,7 +218,7 @@ fn reconsidered_prevout_cost_reaches_the_mining_sigop_budget() -> Result<(), Box
         inputs: vec![TxIn {
             previous_output: funding,
             script_sig: Script::from_bytes(bitcoin_rs_script::push_data(&redeem)),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
@@ -231,21 +231,21 @@ fn reconsidered_prevout_cost_reaches_the_mining_sigop_budget() -> Result<(), Box
                 .concat(),
             ),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     let child = Tx {
         version: 2,
         inputs: vec![TxIn {
             previous_output: OutPoint::new(parent.txid(), 0),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::from_stack(vec![witness_script]),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(8_000),
             script_pubkey: Script::from_bytes([vec![0x00, 0x20], vec![0x22; 32]].concat()),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     let chain = ReorgCoins { funding, confirmed };
     let gateway = MempoolGateway::shared(

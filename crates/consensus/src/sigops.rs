@@ -99,11 +99,11 @@ mod tests {
         let script_sig = [vec![opcode::OP_DUP], push_data(&[opcode::OP_CHECKSIG])].concat();
         let tx = Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
                 previous_output: outpoint,
                 script_sig: Script::from_bytes(script_sig),
-                sequence: Sequence::from_consensus(u32::MAX),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
             outputs: vec![TxOut {
@@ -159,14 +159,14 @@ mod tests {
                 inputs: vec![TxIn {
                     previous_output: OutPoint::new(Txid::default(), 0),
                     script_sig: Script::from_bytes(script_sig),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 }],
                 outputs: vec![TxOut {
                     value: Amount::from_sat(1),
                     script_pubkey: Script::new(),
                 }],
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             };
             let prevouts = [(
                 tx.inputs[0].previous_output,
@@ -190,7 +190,7 @@ mod tests {
                 .map(|vout| TxIn {
                     previous_output: OutPoint::new(Txid::default(), vout),
                     script_sig: Script::new(),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::from_stack(vec![vec![
                         opcode::OP_PUSHNUM_1 + 1,
                         opcode::OP_CHECKMULTISIG,
@@ -198,7 +198,7 @@ mod tests {
                 })
                 .collect(),
             outputs: Vec::new(),
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let prevouts = [
             (
@@ -237,12 +237,12 @@ mod tests {
                 .map(|vout| TxIn {
                     previous_output: OutPoint::new(Txid::default(), vout),
                     script_sig: Script::new(),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 })
                 .collect(),
             outputs: Vec::new(),
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
         };
         let mut prevouts: Vec<_> = tx
             .inputs
@@ -296,14 +296,14 @@ mod tests {
                 inputs: vec![TxIn {
                     previous_output: outpoint,
                     script_sig: Script::from_bytes(script_sig),
-                    sequence: Sequence::from_consensus(u32::MAX),
+                    sequence: Sequence::MAX,
                     witness: Witness::from_stack(witness),
                 }],
                 outputs: vec![TxOut {
                     value: Amount::from_sat(9_000),
                     script_pubkey: Script::from_bytes(vec![opcode::OP_CHECKSIG]),
                 }],
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             };
             let prevouts = [(
                 outpoint,

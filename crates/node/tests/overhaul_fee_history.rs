@@ -130,7 +130,7 @@ fn spending_tx(parent: Txid, fee_sats: u64, sequence: u32) -> Tx {
             value: Amount::from_sat(PARENT_VALUE_SATS - fee_sats),
             script_pubkey: Script::from_bytes(vec![0x6A, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 
@@ -166,14 +166,14 @@ fn mine_and_apply(
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig.
             script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
-            sequence: Sequence::from_consensus(0xffff_ffff),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(REGTEST_SUBSIDY_SATS),
             script_pubkey: Script::from_bytes(vec![0x51]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     let mut block = Block {
         header: bitcoin_rs_primitives::Header {

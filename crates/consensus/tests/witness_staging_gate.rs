@@ -35,14 +35,14 @@ fn coinbase(witness: Option<Vec<Vec<u8>>>, commitment: Option<[u8; 32]>) -> Tx {
         inputs: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![1, 1]),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: witness.map_or_else(Witness::new, Witness::from_stack),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(50),
             script_pubkey: Script::new(),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     if let Some(commitment) = commitment {
         tx.outputs.push(commitment_output(commitment));

@@ -79,14 +79,14 @@ fn matured_chain(depth: u32) -> Result<MaturedChain, Box<dyn std::error::Error>>
                 inputs: vec![TxIn {
                     previous_output: OutPoint::new(first_txid, 0),
                     script_sig: Script::from_bytes(push_int(1)),
-                    sequence: Sequence::from_consensus(0xffff_ffff),
+                    sequence: Sequence::MAX,
                     witness: Witness::new(),
                 }],
                 outputs: vec![TxOut {
                     value: Amount::from_sat(subsidy - 100_000),
                     script_pubkey: Script::new(),
                 }],
-                lock_time: LockTime::from_consensus(0),
+                lock_time: LockTime::ZERO,
             });
         }
         let block = mined_block_with_prev_hash(prev_hash, height, txs);

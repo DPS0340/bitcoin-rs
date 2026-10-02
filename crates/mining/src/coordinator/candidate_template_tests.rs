@@ -20,7 +20,7 @@ fn candidate_cache_evicts_the_oldest_entry_at_the_bound() {
     let mut state = CoordinatorState::default();
     let coinbase = Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: Vec::new(),
         outputs: vec![TxOut {
             value: Amount::from_sat(50),
@@ -89,7 +89,7 @@ fn sample_candidate(previous: Hash256, csv_active: bool, segwit_active: bool) ->
         mempool_sequence: 1,
         coinbase: Tx {
             version: 2,
-            lock_time: LockTime::from_consensus(0),
+            lock_time: LockTime::ZERO,
             inputs: Vec::new(),
             outputs: vec![TxOut {
                 value: Amount::from_sat(50),

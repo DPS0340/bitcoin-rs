@@ -96,11 +96,11 @@ pub fn coinbase(height: u32) -> Tx {
     script_sig.extend_from_slice(&script_num_push(0));
     Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(script_sig),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {

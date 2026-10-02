@@ -59,7 +59,7 @@ fn op_true_script() -> Vec<u8> {
 fn tx(prevout: OutPoint, output_value: u64, sequence: u32) -> Tx {
     Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
             previous_output: prevout,
             script_sig: Script::new(),
@@ -1082,18 +1082,18 @@ fn chain_pool(ctx: &Context) -> Result<Vec<Tx>, Box<dyn Error>> {
 fn tx_multi_child(funded: &OutPoint, tip: &Tx) -> Tx {
     Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: vec![
             TxIn {
                 previous_output: *funded,
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(0xffff_ffff),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             },
             TxIn {
                 previous_output: OutPoint::new(tip.txid(), 0),
                 script_sig: Script::new(),
-                sequence: Sequence::from_consensus(0xffff_ffff),
+                sequence: Sequence::MAX,
                 witness: Witness::new(),
             },
         ],
@@ -1344,7 +1344,7 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_replacement_into_a_full_clu
 fn tx_spending(inputs: &[(OutPoint, u32)], output_value: u64) -> Tx {
     Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: inputs
             .iter()
             .map(|(prevout, sequence)| TxIn {
@@ -1366,11 +1366,11 @@ fn tx_spending(inputs: &[(OutPoint, u32)], output_value: u64) -> Tx {
 fn many_output_tx(prevout: OutPoint, value_each: u64, count: usize) -> Tx {
     Tx {
         version: 2,
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
         inputs: vec![TxIn {
             previous_output: prevout,
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(0xffff_ffff),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![
@@ -1535,14 +1535,14 @@ fn reorg_seed_coinbase(height: u32) -> Tx {
             // BIP34 height push plus one pad byte: consensus requires a
             // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
             script_sig: Script::from_bytes([push_int(i64::from(height)), push_int(0)].concat()),
-            sequence: Sequence::from_consensus(0xffff_ffff),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(REORG_SUBSIDY_SATS),
             script_pubkey: Script::from_bytes(vec![0x51]),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 
@@ -1554,7 +1554,7 @@ fn reorg_seed_coinbase_spend_with_fee(fee_sats: u64) -> Tx {
         inputs: vec![TxIn {
             previous_output: OutPoint::new(reorg_seed_coinbase(1).txid(), 0),
             script_sig: Script::new(),
-            sequence: Sequence::from_consensus(0xffff_ffff),
+            sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         outputs: vec![TxOut {
@@ -1565,7 +1565,7 @@ fn reorg_seed_coinbase_spend_with_fee(fee_sats: u64) -> Tx {
                 [vec![0xa9, 0x14], vec![0x22; 20], vec![0x87]].concat(),
             ),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     }
 }
 

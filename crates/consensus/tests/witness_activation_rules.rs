@@ -36,7 +36,7 @@ fn coinbase(with_witness: bool, with_commitment: bool) -> Tx {
         inputs: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: Script::from_bytes(vec![1, 1]),
-            sequence: Sequence::from_consensus(u32::MAX),
+            sequence: Sequence::MAX,
             witness: if with_witness {
                 Witness::from_stack(vec![vec![0; 32]])
             } else {
@@ -47,7 +47,7 @@ fn coinbase(with_witness: bool, with_commitment: bool) -> Tx {
             value: Amount::from_sat(50),
             script_pubkey: Script::new(),
         }],
-        lock_time: LockTime::from_consensus(0),
+        lock_time: LockTime::ZERO,
     };
     if with_commitment {
         tx.outputs.push(commitment_output());
