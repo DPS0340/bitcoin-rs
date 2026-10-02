@@ -11,6 +11,7 @@ use bitcoin_rs_mempool::{
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_primitives::{
     BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes,
+    unix_time_secs,
 };
 
 use bitcoin_rs_consensus::ValidationEngine;
@@ -21,7 +22,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::compat::convert::hex_encode;
 
@@ -792,12 +793,6 @@ pub(crate) fn admit_transaction(
         Err(SubmitError::Consensus) => Err(AdmissionFailure::Consensus),
         Err(SubmitError::RetryExhausted) => Err(AdmissionFailure::RetryExhausted),
     }
-}
-
-fn unix_time_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 impl ChainHandles {

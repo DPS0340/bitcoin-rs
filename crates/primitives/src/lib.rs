@@ -49,3 +49,14 @@ pub use sighash::{
 pub use tx::{Tx, TxIn, TxOut};
 pub use units::{Amount, CompactTarget, LockTime, Sequence};
 pub use version::{PKG_VERSION, USER_AGENT, client_version};
+
+/// Wall-clock seconds since the Unix epoch, `0` when the clock predates it.
+///
+/// Shared wall-clock read for latency and rate-bucket bookkeeping. Consensus
+/// timestamps come from block headers, never from this.
+#[must_use]
+pub fn unix_time_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}

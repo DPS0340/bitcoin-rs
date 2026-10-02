@@ -101,14 +101,14 @@ impl TxIngressConsumer {
             Arc::new(inbound.tx),
             AdmissionOrigin::Peer(source),
             None,
-            unix_time_secs(),
+            bitcoin_rs_primitives::unix_time_secs(),
             &self.chain_view(),
         );
         self.dispatch_outcome(txid, wtxid, source, outcome);
     }
 
     fn process_retries(&self) -> bool {
-        let now = unix_time_secs();
+        let now = bitcoin_rs_primitives::unix_time_secs();
         let live_peers = self
             .peer_table
             .live_sessions()
@@ -158,12 +158,6 @@ impl TxIngressConsumer {
             Err(error) => tracing::debug!(%txid, ?error, "peer transaction not admitted"),
         }
     }
-}
-
-pub(crate) fn unix_time_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
