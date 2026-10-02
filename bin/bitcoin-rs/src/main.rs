@@ -3,8 +3,6 @@
 //! Starts the configured `bitcoin-rs` node with crash recovery, signal handling,
 //! metrics/tracing setup, and graceful shutdown.
 
-#![allow(missing_docs)]
-#![allow(unreachable_pub)]
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
 

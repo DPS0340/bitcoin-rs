@@ -2,8 +2,6 @@
 //! assemble a rendered GBT from real mempool content, then submit the solved
 //! block over HTTP. T36 non-relay subset: no second P2P node, no relay faking.
 
-#![allow(missing_docs)]
-
 use std::error::Error;
 
 use bitcoin::absolute::LockTime;

@@ -33,8 +33,6 @@ pub(crate) struct ReferenceSet {
     pub(crate) kernel: KernelIdentity,
     /// Replay corpora with their pinned stop identities.
     pub(crate) corpora: Vec<CorpusPin>,
-    /// The formal model checker pin.
-    pub(crate) formal_tool: FormalTool,
 }
 
 impl ReferenceSet {
@@ -112,31 +110,16 @@ pub(crate) struct KernelIdentity {
     pub(crate) differential_harness: bool,
 }
 
-/// A replay corpus pinned by its stop identity.
+/// A replay corpus pinned by its manifest digest. The manifest also
+/// carries the replay stop height and hash; the gate requires their
+/// presence at load but no consumer reads them back.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CorpusPin {
     /// Corpus identifier (e.g. `C150`).
     pub(crate) id: String,
-    /// Last mainnet height the corpus covers.
-    pub(crate) stop_height: u64,
-    /// Block hash at `stop_height`.
-    pub(crate) stop_hash: String,
     /// SHA-256 of the corpus manifest, produced at export time. Absent until
     /// the archive exists; a placeholder here would be an invented digest.
     pub(crate) manifest_sha256: Option<[u8; 32]>,
-}
-
-/// The formal model checker pin.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FormalTool {
-    /// Tool name (e.g. `apalache-mc`).
-    pub(crate) name: String,
-    /// Released tool version.
-    pub(crate) version: String,
-    /// SHA-256 of the release archive.
-    pub(crate) archive_sha256: [u8; 32],
-    /// SHA-256 of the checker jar inside the archive.
-    pub(crate) jar_sha256: [u8; 32],
 }
 
 /// Custody state of a corpus archive.
@@ -239,7 +222,7 @@ pub(crate) fn load_reference_set(manifest: &str) -> Result<ReferenceSet, Referen
     };
 
     let corpora = corpora(reference)?;
-    let formal_tool = formal_tool(reference)?;
+    check_formal_tool(reference)?;
 
     check_identity_confusion(&release.core_version, &kernel.core_version)?;
     check_custody_bindings(&release, &kernel)?;
@@ -248,7 +231,6 @@ pub(crate) fn load_reference_set(manifest: &str) -> Result<ReferenceSet, Referen
         release,
         kernel,
         corpora,
-        formal_tool,
     })
 }
 
@@ -323,8 +305,8 @@ fn corpora(reference: &toml::Table) -> Result<Vec<CorpusPin>, ReferenceError> {
             .as_table()
             .ok_or(ReferenceError::VersionLabelOnly { field: "corpora" })?;
         let id = required_str(entry, "id")?;
-        let stop_height = required_u64(entry, "stop_height")?;
-        let stop_hash = required_str(entry, "stop_hash")?;
+        required_u64(entry, "stop_height")?;
+        required_str(entry, "stop_hash")?;
         let manifest_sha256 = match entry.get("manifest_sha256") {
             None => None,
             Some(toml::Value::String(text)) => Some(parse_sha256("manifest_sha256", text)?),
@@ -336,8 +318,6 @@ fn corpora(reference: &toml::Table) -> Result<Vec<CorpusPin>, ReferenceError> {
         };
         corpora.push(CorpusPin {
             id,
-            stop_height,
-            stop_hash,
             manifest_sha256,
         });
     }
@@ -350,14 +330,16 @@ fn corpora(reference: &toml::Table) -> Result<Vec<CorpusPin>, ReferenceError> {
     Ok(corpora)
 }
 
-fn formal_tool(reference: &toml::Table) -> Result<FormalTool, ReferenceError> {
+/// The formal model checker section must be a complete digested pin even
+/// though no consumer reads it back: its absence or malformed digests are
+/// the same rejections as any other reference field's.
+fn check_formal_tool(reference: &toml::Table) -> Result<(), ReferenceError> {
     let section = sub_table(reference, "formal_tool")?;
-    Ok(FormalTool {
-        name: required_str(section, "name")?,
-        version: required_str(section, "version")?,
-        archive_sha256: required_sha256(section, "archive_sha256")?,
-        jar_sha256: required_sha256(section, "jar_sha256")?,
-    })
+    required_str(section, "name")?;
+    required_str(section, "version")?;
+    required_sha256(section, "archive_sha256")?;
+    required_sha256(section, "jar_sha256")?;
+    Ok(())
 }
 
 fn sub_table<'a>(
