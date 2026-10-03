@@ -13,20 +13,17 @@
 
 #![expect(clippy::expect_used, reason = "process test assertions")]
 
-#[path = "support/clean_stderr.rs"]
-mod clean_stderr;
-
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_e2e::helpers::{
-    best_hash, block_count, build_chain, connection_count, genesis_block, wait_for,
+    assert_clean_stderr, best_hash, block_count, build_chain, connection_count, genesis_block,
+    wait_for,
 };
 use bitcoin_rs_e2e::live_peer::LivePeer;
 use bitcoin_rs_e2e::live_peer::pump_until_tip;
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
-use clean_stderr::assert_clean_stderr;
 
 /// Pumps until a `getdata` requests `hash` (serving every request
 /// type-faithfully), up to `dur`. Returns true when the request was seen.

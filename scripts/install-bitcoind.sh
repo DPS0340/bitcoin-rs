@@ -5,8 +5,8 @@
 # against the hardcoded SHA-256, and extracts bitcoind. Prints the bitcoind
 # path on stdout (log lines go to stderr).
 #
-#   eval "$(scripts/install-bitcoind.sh --export)"
 #   scripts/install-bitcoind.sh --print-path
+#   eval "$(scripts/install-bitcoind.sh --export)"   # exports BITCOIND_COMMAND
 #
 # Owner: docs/contracts/core-differential.md (CORE-01).
 

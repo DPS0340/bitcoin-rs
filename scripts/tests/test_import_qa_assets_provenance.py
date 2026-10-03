@@ -45,7 +45,7 @@ class ImportFlowTests(unittest.TestCase):
         (scripts / MAPPER.name).write_bytes(MAPPER.read_bytes())
         inventory = self.root / "crates/p2p/src/compat.rs"
         inventory.parent.mkdir(parents=True)
-        inventory.write_text('pub const COMMANDS: &[Command] = &[Command { name: "ping" }];\n')
+        inventory.write_text('pub const COMMANDS: &[&str] = &["ping"];\n')
         harness = self.root / "fuzz/fuzz_targets/script_eval.rs"
         harness.parent.mkdir(parents=True)
         harness.write_bytes(OWNER_HARNESS.read_bytes())

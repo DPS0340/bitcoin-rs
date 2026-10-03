@@ -83,13 +83,13 @@ struct FeatureDependency {
 /// Parsed workspace dependency graph used by the gates.
 pub(crate) struct WorkspaceGraph {
     /// Normal `bitcoin-rs-*` dependencies per crate.
-    pub normal_deps: BTreeMap<String, Vec<String>>,
+    normal_deps: BTreeMap<String, Vec<String>>,
     /// Storage engine dependencies per crate.
-    pub engine_deps: BTreeMap<String, Vec<String>>,
+    engine_deps: BTreeMap<String, Vec<String>>,
     /// External ZMQ implementation dependencies per crate.
-    pub zmq_deps: BTreeMap<String, Vec<String>>,
+    zmq_deps: BTreeMap<String, Vec<String>>,
     /// Cargo feature implies per crate.
-    pub features: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    features: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// Feature selections on normal/build workspace edges, excluding dev fixtures.
     production_deps: BTreeMap<String, Vec<FeatureDependency>>,
     /// Number of workspace packages seen in the metadata.
