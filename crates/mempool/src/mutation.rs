@@ -165,6 +165,8 @@ pub struct PeerToken {
 pub enum AdmissionOrigin {
     /// Submitted through RPC (`sendrawtransaction`).
     Rpc,
+    /// Submitted through an Esplora raw-transaction broadcast route.
+    Esplora,
     /// Relayed in from a network peer.
     Peer(PeerToken),
     /// Re-admitted by a reorg's disconnect walk.

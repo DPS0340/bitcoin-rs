@@ -885,6 +885,7 @@ mod tests {
     fn parent_commit_without_observers_retries_orphan_with_original_source() {
         for origin in [
             AdmissionOrigin::Rpc,
+            AdmissionOrigin::Esplora,
             AdmissionOrigin::Peer(source()),
             AdmissionOrigin::Reorg,
         ] {
@@ -921,19 +922,20 @@ mod tests {
         }
     }
 
-    // MPL-04: RPC failures do not populate peer lifecycle state.
+    // MPL-04: local failures do not populate peer lifecycle state.
     #[test]
     fn rpc_missing_inputs_does_not_create_peer_lifecycle_state() {
-        let gateway = gateway();
-        let (_, child) = parent_and_child();
-        let result =
-            gateway.submit_transaction(child, AdmissionOrigin::Rpc, None, 1, &Coins(vec![]));
-        assert_eq!(
-            result,
-            Err(SubmitError::Policy(AcceptanceRejectReason::MissingInputs))
-        );
-        assert_eq!(gateway.orphan_count(), 0);
-        assert_eq!(gateway.recent_rejects_count(), 0);
+        for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Esplora] {
+            let gateway = gateway();
+            let (_, child) = parent_and_child();
+            let result = gateway.submit_transaction(child, origin, None, 1, &Coins(vec![]));
+            assert_eq!(
+                result,
+                Err(SubmitError::Policy(AcceptanceRejectReason::MissingInputs))
+            );
+            assert_eq!(gateway.orphan_count(), 0);
+            assert_eq!(gateway.recent_rejects_count(), 0);
+        }
     }
 
     // MPL-04: nonexistent outputs of resident parents cannot become orphans.
