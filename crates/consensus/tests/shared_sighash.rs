@@ -17,7 +17,9 @@ use bitcoin_rs_primitives::{
     Amount, Hash256, LockTime, Network, OutPoint, Script, Sequence, Sighash, SighashCache,
     SighashError, Tx, TxIn, TxOut, Txid, Witness, consensus_bytes,
 };
-use bitcoin_rs_script::{PreparedTransaction, ScriptError, VerifyFlags, opcode, push_data};
+use bitcoin_rs_script::{
+    PreparedTransaction, ScriptErrCode, ScriptError, VerifyFlags, opcode, push_data,
+};
 use secp256k1::{Keypair, Message, PublicKey, SECP256K1, SecretKey};
 
 const MODES: [Sighash; 7] = [
@@ -319,6 +321,31 @@ fn verify_block(
 #[test]
 fn prepared_block_and_transaction_accept_reference_signatures_and_order_failures() {
     let (tx, prevouts) = signed_fixture();
+    let mut changed_tx = tx.clone();
+    // Inputs 1 and 41 are SegWit spends. Exchange their independently valid
+    // DER signatures: witness bytes do not change any sibling's digest, unlike
+    // prevout amounts, which also affect non-ANYONECANPAY Taproot inputs.
+    for (failed_input, signature_input) in [(1, 41), (41, 1)] {
+        let mut isolated = tx.clone();
+        isolated.inputs[failed_input].witness[0].clone_from(&tx.inputs[signature_input].witness[0]);
+        let prepared = PreparedTransaction::new(&isolated, prevouts.clone());
+        for input_index in 0..tx.inputs.len() {
+            let expected = if input_index == failed_input {
+                Err(ScriptError::Invalid {
+                    code: ScriptErrCode::EvalFalse,
+                })
+            } else {
+                Ok(true)
+            };
+            assert_eq!(
+                prepared.verify_input(input_index, VerifyFlags::MANDATORY),
+                expected,
+                "isolated signature substitution at {failed_input}, checking {input_index}"
+            );
+        }
+        changed_tx.inputs[failed_input].witness[0]
+            .clone_from(&tx.inputs[signature_input].witness[0]);
+    }
     for engine in std::iter::once(ValidationEngine::Native).chain(if cfg!(feature = "kernel") {
         Some(ValidationEngine::Kernel)
     } else {
@@ -335,20 +362,8 @@ fn prepared_block_and_transaction_accept_reference_signatures_and_order_failures
             Ok(())
         );
         assert_eq!(verify_block(&tx, &prevouts, engine), Ok(()));
-        let mut changed_prevouts = prevouts.clone();
-        for index in [1, 40] {
-            changed_prevouts[index].value = changed_prevouts[index]
-                .value
-                .saturating_add(Amount::from_sat(1));
-        }
-        let changed_spent: Vec<_> = tx
-            .inputs
-            .iter()
-            .zip(&changed_prevouts)
-            .map(|(input, output)| (input.previous_output, output.clone()))
-            .collect();
-        let sequential = verify_tx_scripts(&tx, &changed_spent, VerifyFlags::MANDATORY, engine);
-        let parallel = verify_block(&tx, &changed_prevouts, engine);
+        let sequential = verify_tx_scripts(&changed_tx, &spent, VerifyFlags::MANDATORY, engine);
+        let parallel = verify_block(&changed_tx, &prevouts, engine);
         assert_eq!(parallel, sequential);
         assert!(matches!(
             parallel,
