@@ -9,56 +9,30 @@
 use std::process::ExitCode;
 
 use anyhow::Context;
-use bitcoin_rs_node::{
-    MeasureStorageRequest, Network, UserConfig, measure_storage_footprint, storage_footprint_json,
-};
+use bitcoin_rs_node::{MeasureStorageRequest, measure_storage_footprint, storage_footprint_json};
 
-mod bitcoin_conf;
-mod cli;
-mod env;
-mod toml;
+mod config;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-fn config_from(
-    mut cli: cli::CliArgs,
-    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> anyhow::Result<bitcoin_rs_node::NodeConfig> {
-    let mut layers = Vec::new();
-    if let Some(path) = &cli.config {
-        layers.push(toml::user_config_from_path(path)?);
-    }
-    let env_layer = env::user_config_from_env(vars)?;
-    let bitcoin_conf_path = cli.bitcoin_conf.take();
-    let cli_layer = cli.into_user_config();
-    if let Some(path) = bitcoin_conf_path {
-        let network = network_from_layers(layers.iter().chain([&env_layer, &cli_layer]));
-        layers.extend(bitcoin_conf::load_file(&path, network)?);
-    }
-    layers.push(env_layer);
-    layers.push(cli_layer);
-    let layer_refs: Vec<_> = layers.iter().collect();
-    bitcoin_rs_node::resolve(&layer_refs)
-}
 
 #[cfg(test)]
 fn load(
     args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> anyhow::Result<bitcoin_rs_node::NodeConfig> {
-    let cli = <cli::CliArgs as clap::Parser>::try_parse_from(args)?;
-    config_from(cli, vars)
+    let cli = <config::CliArgs as clap::Parser>::try_parse_from(args)?;
+    config::resolve(cli, vars)
 }
 
-fn measure_storage(mut cli: cli::CliArgs) -> anyhow::Result<()> {
+fn measure_storage(mut cli: config::CliArgs) -> anyhow::Result<()> {
     let output = cli.measure_storage_output.take();
     let request = MeasureStorageRequest {
         high_water_allocated_bytes: cli.storage_high_water_bytes,
         stop_height: cli.measure_storage_stop_height,
         stop_hash: cli.measure_storage_stop_hash.take(),
     };
-    let config = config_from(cli, std::env::vars_os())?;
+    let config = config::resolve(cli, std::env::vars_os())?;
     let evidence = measure_storage_footprint(&config, &request)?;
     let json = storage_footprint_json(&evidence)?;
     if let Some(path) = output {
@@ -69,29 +43,15 @@ fn measure_storage(mut cli: cli::CliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Network used to select `[regtest]` / `[main]` sections in bitcoin.conf.
-///
-/// Resolved from TOML, environment, and CLI only. bitcoin.conf never chooses
-/// the network that selects its own sections.
-fn network_from_layers<'a>(layers: impl IntoIterator<Item = &'a UserConfig>) -> Network {
-    let mut network = Network::Mainnet;
-    for layer in layers {
-        if let Some(selection) = layer.network {
-            network = selection.consensus_network();
-        }
-    }
-    network
-}
-
 fn main() -> ExitCode {
-    let cli = match <cli::CliArgs as clap::Parser>::try_parse() {
+    let cli = match <config::CliArgs as clap::Parser>::try_parse() {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
     let result = if cli.measure_storage {
         measure_storage(cli)
     } else {
-        config_from(cli, std::env::vars_os()).and_then(|config| {
+        config::resolve(cli, std::env::vars_os()).and_then(|config| {
             bitcoin_rs_node::run(config, bitcoin_rs_node::RuntimeInputs::default())
         })
     };
