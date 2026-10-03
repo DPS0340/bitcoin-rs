@@ -1,17 +1,180 @@
-//! Bitcoin Core `bitcoin.conf` as a process-input source.
+//! Process-input configuration for the `bitcoin-rs` binary.
 //!
-//! Reads the file, selects the network section against the already-resolved
-//! network, and produces the global and selected-section [`UserConfig`]
-//! layers, in precedence order. `node` never opens this file.
+//! Owns the command-line, TOML, environment, and Bitcoin Core `bitcoin.conf`
+//! adapters together with their precedence. `node` only receives the resolved
+//! configuration and never opens these process-input sources.
 
+use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
-use bitcoin_rs_node::{Network, UserConfig};
+use bitcoin_rs_chainstate::ValidationMode;
+use bitcoin_rs_node::options::{
+    parse_connect_endpoint, parse_network, parse_p2p_magic, parse_script_index,
+    parse_storage_backend, parse_validation_engine, parse_validation_mode,
+};
+use bitcoin_rs_node::{
+    ChainstateJournalOverrides, IndexOverrides, MiningOverrides, Network, NetworkSelection,
+    NotificationConfig, ObservabilityOverrides, P2pOverrides, RpcOverrides, ScriptIndexMode,
+    StorageOverrides, UserConfig, ValidationEngine, ValidationOverrides,
+};
+use bitcoin_rs_storage::StorageBackend;
+use clap::Parser;
+
+/// Expands the node option table into the command-line surface: one field per
+/// table row, carrying the row's clap attributes, plus the conversion of the
+/// parsed arguments into one configuration layer.
+///
+/// PRE: a row's `cli` column holds its complete clap attributes; a row the
+/// command line does not expose carries `#[arg(skip)]`.
+/// POST: `CliArgs` exposes exactly the flags the table names, and
+/// `into_user_config` writes each parsed value into its row's slot.
+/// INVARIANT: flag names, aliases, value parsers, and error strings come from
+/// the table, so the command line cannot drift from the other process-input
+/// surfaces. Meta flags that never reach `UserConfig` stay hand-written here.
+macro_rules! emit_cli {
+    (
+        fields {
+            $(
+                $(#[$fdoc:meta])*
+                $fid:ident : $fty:ty {
+                    cli[ $($fcli:tt)* ]
+                    $( env[ $ekey:literal, $egram:expr ] )?
+                    $( toml $tmode:ident ( $tkey:literal $(, $tgram:expr )? ) )?
+                    $( conf[ $ckey:literal ] )?
+                }
+            )*
+        }
+        groups {
+            $(
+                $(#[$gdoc:meta])*
+                group $gid:ident : $gty:ident $(table($gkey:literal))? $(#[$gattr:meta])*
+                {
+                    $(
+                        $(#[$rdoc:meta])*
+                        $rfield:ident as $rid:ident : $rty:ty {
+                            cli[ $($gcli:tt)* ]
+                            $( env[ $gekey:literal, $gegram:expr ] )?
+                            $( toml $gtmode:ident ( $gtkey:literal $(, $gtgram:expr )? ) )?
+                            $( conf[ $gckey:literal ] )?
+                        }
+                    )*
+                }
+            )*
+        }
+    ) => {
+        #[derive(Parser)]
+        #[command(name = "bitcoin-rs", about = "Run a bitcoin-rs node")]
+        pub(crate) struct CliArgs {
+            #[arg(long)]
+            pub(crate) config: Option<PathBuf>,
+            #[arg(long = "bitcoin-conf")]
+            pub(crate) bitcoin_conf: Option<PathBuf>,
+            $(
+                $(#[$fdoc])*
+                $($fcli)*
+                pub(crate) $fid: $fty,
+            )*
+            $(
+                $(
+                    $(#[$rdoc])*
+                    $($gcli)*
+                    pub(crate) $rid: $rty,
+                )*
+            )*
+            /// Measure data-directory storage ledgers and exit. Does not
+            /// start the node.
+            #[arg(long = "measure-storage")]
+            pub(crate) measure_storage: bool,
+            /// Write `--measure-storage` JSON to this path instead of stdout.
+            #[arg(long = "measure-storage-output")]
+            pub(crate) measure_storage_output: Option<PathBuf>,
+            /// Conservative peak allocated bytes from an isolated filesystem
+            /// or project quota.
+            #[arg(long = "storage-high-water-bytes")]
+            pub(crate) storage_high_water_bytes: Option<u64>,
+            /// Recorded stop height. Pairing and hash format: `FP-03`.
+            #[arg(long = "measure-storage-stop-height")]
+            pub(crate) measure_storage_stop_height: Option<u32>,
+            /// Recorded stop hash. Pairing and hash format: `FP-03`.
+            #[arg(long = "measure-storage-stop-hash")]
+            pub(crate) measure_storage_stop_hash: Option<String>,
+        }
+
+        impl CliArgs {
+            /// Maps the parsed command line into one configuration layer.
+            fn into_user_config(self) -> UserConfig {
+                UserConfig {
+                    $( $fid: self.$fid, )*
+                    $(
+                        $gid: $gty { $( $rfield: self.$rid, )* },
+                    )*
+                }
+            }
+        }
+    };
+}
+
+bitcoin_rs_node::option_rows!(emit_cli);
+
+/// Resolves process inputs in ascending precedence: TOML, `bitcoin.conf`,
+/// environment, then command line.
+pub(crate) fn resolve(
+    mut cli: CliArgs,
+    vars: impl Iterator<Item = (OsString, OsString)>,
+) -> Result<bitcoin_rs_node::NodeConfig> {
+    let mut layers = Vec::new();
+    if let Some(path) = &cli.config {
+        layers.push(user_config_from_toml(path)?);
+    }
+    let env_layer = user_config_from_env(vars)?;
+    let bitcoin_conf_path = cli.bitcoin_conf.take();
+    let cli_layer = cli.into_user_config();
+    if let Some(path) = bitcoin_conf_path {
+        let network = network_from_layers(layers.iter().chain([&env_layer, &cli_layer]));
+        layers.extend(user_config_from_bitcoin_conf(&path, network)?);
+    }
+    layers.push(env_layer);
+    layers.push(cli_layer);
+    let layer_refs: Vec<_> = layers.iter().collect();
+    bitcoin_rs_node::resolve(&layer_refs)
+}
+
+/// Network used to select `[regtest]` / `[main]` sections in bitcoin.conf.
+///
+/// Resolved from TOML, environment, and CLI only. bitcoin.conf never chooses
+/// the network that selects its own sections.
+fn network_from_layers<'a>(layers: impl IntoIterator<Item = &'a UserConfig>) -> Network {
+    let mut network = Network::Mainnet;
+    for layer in layers {
+        if let Some(selection) = layer.network {
+            network = selection.consensus_network();
+        }
+    }
+    network
+}
+
+fn user_config_from_env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<UserConfig> {
+    let mut layer = UserConfig::default();
+    for (key, value) in vars {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        layer.apply_env(key, &value)?;
+    }
+    Ok(layer)
+}
+
+fn user_config_from_toml(path: &Path) -> Result<UserConfig> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read TOML config {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("failed to parse TOML config {}", path.display()))
+}
 
 /// Parses `path` into the `[global, selected]` layer pair for `network`,
 /// lowest precedence first.
-pub(crate) fn load_file(path: &Path, network: Network) -> Result<[UserConfig; 2]> {
+fn user_config_from_bitcoin_conf(path: &Path, network: Network) -> Result<[UserConfig; 2]> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read bitcoin.conf {}", path.display()))?;
     Ok(parse_for_network(&text, network))
@@ -249,7 +412,7 @@ listen=0
 
 #[cfg(test)]
 mod compat_tests {
-    use super::load_file;
+    use super::user_config_from_bitcoin_conf;
     use anyhow::Result;
     use bitcoin_rs_node::{Auth, Network, resolve};
     use std::fs;
@@ -272,7 +435,7 @@ mod compat_tests {
 ",
         )?;
 
-        let layer = load_file(&conf_path, Network::Mainnet)?;
+        let layer = user_config_from_bitcoin_conf(&conf_path, Network::Mainnet)?;
         let layer_refs: Vec<_> = layer.iter().collect();
         let config = resolve(&layer_refs)?;
 
@@ -299,7 +462,7 @@ mod compat_tests {
 ",
         )?;
 
-        let layer = load_file(&conf_path, Network::Regtest)?;
+        let layer = user_config_from_bitcoin_conf(&conf_path, Network::Regtest)?;
         let layer_refs: Vec<_> = layer.iter().collect();
         let config = resolve(&layer_refs)?;
 
@@ -326,7 +489,7 @@ mod compat_tests {
 ",
         )?;
 
-        let layer = load_file(&conf_path, Network::Regtest)?;
+        let layer = user_config_from_bitcoin_conf(&conf_path, Network::Regtest)?;
         let layer_refs: Vec<_> = layer.iter().collect();
         let config = resolve(&layer_refs)?;
 
@@ -345,7 +508,7 @@ assumevalid=0000000000000000000000000000000000000000000000000000000000000000
 ",
         )?;
 
-        let layer = load_file(&conf_path, Network::Mainnet)?;
+        let layer = user_config_from_bitcoin_conf(&conf_path, Network::Mainnet)?;
         let layer_refs: Vec<_> = layer.iter().collect();
         let config = resolve(&layer_refs)?;
 
