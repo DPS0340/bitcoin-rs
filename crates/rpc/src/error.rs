@@ -56,6 +56,9 @@ pub enum RpcError {
     /// Bitcoin Core `RPC_CLIENT_IN_INITIAL_DOWNLOAD` (-10).
     #[error("{0}")]
     ClientInInitialDownload(String),
+    /// Bitcoin Core `RPC_MISC_ERROR` (-1), including unavailable optional indexes.
+    #[error("{0}")]
+    Misc(String),
     /// Internal server failure.
     #[error("internal error: {0}")]
     Internal(String),
@@ -94,6 +97,7 @@ impl RpcError {
     pub const fn code(&self) -> i64 {
         match self {
             Self::Parse(_) => Self::PARSE_ERROR,
+            Self::Misc(_) => -1,
             Self::InvalidRequest(_) => Self::INVALID_REQUEST,
             Self::MethodNotFound(_) => Self::METHOD_NOT_FOUND,
             Self::InvalidParams(_) => Self::INVALID_PARAMS,

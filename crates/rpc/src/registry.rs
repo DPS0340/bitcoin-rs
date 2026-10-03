@@ -110,6 +110,7 @@ declare_rows! {
     "finalizepsbt", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(tx::finalizepsbt);
     "getmempoolinfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Policy fields project the enforced MempoolPolicySnapshot: fullrbf is true and cluster bounds are enforced. optimal is always true for exact graph ordering rather than Core background SFL state. usage estimates local structures; maxmempool bounds virtual size rather than allocator usage. The pressure floor is a local heuristic, not Core rolling decay. See docs/policies/mempool-policy.md.", "0.4.0", Some(mempool::getmempoolinfo);
     "getmempoolentry", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(mempool::getmempoolentry);
+    "gettxspendingprevout", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Mempool lookup and options follow Core 31.1 without txospenderindex. Missing or extra argument counts return local JSON-RPC shape errors rather than Core help text. See docs/contracts/external-api.md#api-32-gettxspendingprevout-mempool-snapshot.", "0.11.0", Some(mempool::gettxspendingprevout);
     "getrawmempool", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(mempool::getrawmempool);
     "getmempoolancestors", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(mempool::getmempoolancestors);
     "getmempooldescendants", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(mempool::getmempooldescendants);
@@ -155,7 +156,6 @@ declare_rows! {
     "getdeploymentinfo", SurfaceKind::Rpc, Status::Unimplemented, "", CORE_VERSION, "Not implemented over JSON-RPC (the REST /rest/deploymentinfo route exists).", "n/a", None;
     "getdescriptoractivity", SurfaceKind::Rpc, Status::Unimplemented, "", CORE_VERSION, "No wallet/scan index to serve it.", "n/a", None;
     "getmempoolcluster", SurfaceKind::Rpc, Status::Unimplemented, "", CORE_VERSION, "Cluster mempool tracking not implemented.", "n/a", None;
-    "gettxspendingprevout", SurfaceKind::Rpc, Status::Unimplemented, "", CORE_VERSION, "Not implemented.", "n/a", None;
     "importmempool", SurfaceKind::Rpc, Status::Unimplemented, "", CORE_VERSION, "Mempool import not implemented.", "n/a", None;
     "loadtxoutset", SurfaceKind::Rpc, Status::Unimplemented, "", CORE_VERSION, "UTXO snapshot load (assumeutxo) not implemented.", "n/a", None;
     "preciousblock", SurfaceKind::Rpc, Status::Unimplemented, "", CORE_VERSION, "No manual block-preference surface.", "n/a", None;
