@@ -1,8 +1,8 @@
 //! Process custody for `bitcoin-rs` and pinned Bitcoin Core nodes.
 
 use std::collections::VecDeque;
-use std::fs::{self, File};
-use std::io::{Read, Seek as _, Write as _};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write as _};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -773,7 +773,8 @@ impl Drop for ProcessNode {
 /// readers see output while the child is still running.
 fn capture_output(mut reader: impl Read + Send + 'static, file: PathBuf) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let Ok(mut file) = File::create(&file) else {
+        let path = file;
+        let Ok(mut file) = File::create(&path) else {
             return;
         };
         let mut tail: VecDeque<u8> = VecDeque::new();
@@ -793,10 +794,12 @@ fn capture_output(mut reader: impl Read + Send + 'static, file: PathBuf) -> Join
                         tail.drain(..excess);
                         stale += excess;
                     }
-                    if stale >= limit {
-                        let _ = file.rewind();
-                        let _ = file.set_len(0);
-                        let _ = file.write_all(tail.make_contiguous());
+                    if stale >= limit && publish_tail(&path, tail.make_contiguous()).is_ok() {
+                        // The rename orphaned `file` onto the old inode — reopen
+                        // the published path to keep appending to it.
+                        if let Ok(fresh) = OpenOptions::new().append(true).open(&path) {
+                            file = fresh;
+                        }
                         stale = 0;
                     }
                     let _ = file.flush();
@@ -805,12 +808,23 @@ fn capture_output(mut reader: impl Read + Send + 'static, file: PathBuf) -> Join
         }
         // Rest state: file is exactly the retained tail, honoring MAX_OUTPUT.
         if stale > 0 {
-            let _ = file.rewind();
-            let _ = file.set_len(0);
-            let _ = file.write_all(tail.make_contiguous());
+            let _ = publish_tail(&path, tail.make_contiguous());
         }
         let _ = file.flush();
     })
+}
+
+/// Writes `bytes` to a side file, then atomically renames it over `path`: a
+/// concurrent reader of the log always sees one complete generation — never
+/// a truncation window between `set_len(0)` and a rewrite.
+fn publish_tail(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let side = path.with_extension("tmp");
+    {
+        let mut tmp = File::create(&side)?;
+        tmp.write_all(bytes)?;
+        tmp.flush()?;
+    }
+    fs::rename(&side, path)
 }
 
 #[cfg(test)]
