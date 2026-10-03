@@ -71,9 +71,13 @@ $ docker compose logs -f template-provider pool device-direct-1
 ```
 
 Bootstrap order is `bitcoin-rs` (healthcheck: JSON-RPC `getblockchaininfo`)
-→ `template-provider` → `pool` → devices. The template-provider's Noise
-**public key** is fixed at build time; read it from the bridge's startup log
-or from `template-provider/src/main.rs`:
+→ `template-provider` → `pool` → devices. With the default example key
+nothing needs editing: `config/pool.toml` already pins the build-time
+`template_provider_type.Sv2Tp.public_key` the bridge logs at startup.
+
+Only when `TP_PRIVATE_KEY_HEX` is overridden does the pin change: read the
+new public key from the bridge's startup log, update the pool config, and
+restart the pool:
 
 ```console
 $ docker compose logs template-provider | grep -i key
