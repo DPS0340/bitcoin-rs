@@ -155,11 +155,11 @@ impl TxRelayQueue {
 }
 
 /// Announces locally-injected accepted transactions (`sendrawtransaction`,
-/// reorg re-admission) to every connected peer.
+/// Esplora `POST /tx`, reorg re-admission) to every connected peer.
 ///
 /// Peer-origin accepts are announced by their ingress caller after admission
-/// returns a committed outcome. This observer preserves the existing RPC and
-/// reorg publication trigger, including their lack of a source peer to exclude.
+/// returns a committed outcome. This observer publishes RPC, Esplora and reorg
+/// acceptances, which have no source peer to exclude.
 pub struct LocalTxRelayObserver {
     relay: TxRelayQueue,
     gateway: Weak<MempoolGateway>,
@@ -177,7 +177,7 @@ impl MempoolObserver for LocalTxRelayObserver {
     fn on_mutation(&self, envelope: &MutationEnvelope) {
         if !matches!(
             envelope.origin,
-            AdmissionOrigin::Rpc | AdmissionOrigin::Reorg
+            AdmissionOrigin::Rpc | AdmissionOrigin::Esplora | AdmissionOrigin::Reorg
         ) {
             return;
         }
@@ -1035,15 +1035,18 @@ mod tests {
             .attach_observer_leg("relay", observer.clone())
             .expect("observer slot");
         let mut last_txid = Txid::default();
-        for (marker, origin) in [
-            (1, AdmissionOrigin::Rpc),
-            (2, AdmissionOrigin::Reorg),
+        for (marker, origin, should_announce) in [
+            (1, AdmissionOrigin::Rpc, true),
+            (2, AdmissionOrigin::Reorg, true),
+            (4, AdmissionOrigin::Esplora, true),
+            (5, AdmissionOrigin::Block, false),
             (
                 3,
                 AdmissionOrigin::Peer(PeerToken {
                     addr: SocketAddr::from(([127, 0, 0, 1], 8333)),
                     connection_id: 7,
                 }),
+                false,
             ),
         ] {
             let tx = Arc::new(Tx {
@@ -1066,7 +1069,7 @@ mod tests {
             gateway
                 .insert_entry(origin, MempoolEntry::new(tx, 100, 10_000, 1, 0, 0))
                 .expect("insert fixture");
-            if matches!(origin, AdmissionOrigin::Rpc | AdmissionOrigin::Reorg) {
+            if should_announce {
                 let announced = rx.try_recv().expect("local commit announces once");
                 assert_eq!(
                     (announced.txid, announced.wtxid, announced.source),
@@ -1241,7 +1244,11 @@ mod tests {
     // An old local event must not borrow a new peer admission's identity.
     #[test]
     fn delayed_local_relay_does_not_adopt_a_reinserted_body() {
-        for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Reorg] {
+        for origin in [
+            AdmissionOrigin::Rpc,
+            AdmissionOrigin::Esplora,
+            AdmissionOrigin::Reorg,
+        ] {
             for alternate_witness in [false, true] {
                 let original = relay_identity_tx();
                 let next = if alternate_witness {

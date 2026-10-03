@@ -6,8 +6,8 @@ use bitcoin::consensus::encode::serialize as bitcoin_serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin_rs_mempool::SubmitError;
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
+use bitcoin_rs_mempool::{AdmissionOrigin, SubmitError};
 use bitcoin_rs_primitives::{
     Amount, Block as NativeBlock, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, deserialize as native_deserialize,
@@ -459,7 +459,13 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     )?;
     let txid = tx.txid();
 
-    match context::admit_transaction(&ctx.mempool.gateway, &ctx.chain, &tx, max_feerate) {
+    match context::admit_transaction(
+        &ctx.mempool.gateway,
+        &ctx.chain,
+        &tx,
+        AdmissionOrigin::Rpc,
+        max_feerate,
+    ) {
         Ok(_) => typed_to_sonic(&v31::SendRawTransaction(txid.to_string())),
         Err(AdmissionFailure::Policy(reason)) => Err(reject_reason_to_rpc_error(reason)),
         Err(AdmissionFailure::Consensus) => Err(RpcError::TxRejected(
@@ -762,7 +768,7 @@ fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
 /// transaction rejections (`-26`), matching Bitcoin Core's
 /// `RPC_VERIFY_REJECTED` code. Both typed cluster-limit failures map to
 /// Core's public `too-large-cluster` reason.
-fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
+pub(crate) fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
     match reason {
         AcceptanceRejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
         // Core reports spent/unknown inputs as RPC_VERIFY_ERROR (-25), not

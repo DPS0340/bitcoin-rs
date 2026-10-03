@@ -227,12 +227,16 @@ is the `gettxspendingprevout` mempool snapshot.
 ### `API-10`: Broadcast and preview through the admission gateway
 
 
-- `sendrawtransaction`, `testmempoolaccept`, Esplora `POST /tx`, package
-  submissions, and P2P ingress all reach the single `MempoolGateway`
-  (`mempool-policy.md` `POL-02`). Each call carries an explicit
-  `AdmissionOrigin` and its own request fee limits.
-- Esplora is a distinct origin with its own request fee limits, not an
-  alias for the RPC origin. Peer ingress does not inherit RPC limits.
+- `sendrawtransaction`, `testmempoolaccept`, Esplora `POST /tx`, and P2P
+  ingress reach the single `MempoolGateway` (`mempool-policy.md` `POL-02`).
+  Each committing producer carries an explicit `AdmissionOrigin` and its
+  own request fee limits. Aggregate package submission remains unsupported
+  (`POL-05`); its future producer must use this same admission owner.
+- Esplora `POST /tx` is implemented on both `/api` and `/esplora` with
+  `AdmissionOrigin::Esplora` and an explicit, fixed 10,000,000 sat/kvB
+  request ceiling. Its hex body provides no fee override. RPC keeps its
+  own default and `maxfeerate` override; peer ingress has no request cap.
+  The shared gateway owns fee verification and authoritative mutation.
 - Preview runs the identical pipeline and mutates nothing: no membership,
   estimator, relay state, admission sequence, or victims (`POL-06`).
   `testmempoolaccept` returns preview rows in the frozen Core 31.1 shape
@@ -620,6 +624,22 @@ owned by [wallet-facing.md](wallet-facing.md).
   `crates/mining/tests/template_shape.rs` tests
   `candidate_solves_an_unsolved_regtest_header`,
   `ordered_assembly_keeps_snapshot_order`.
+
+- `API-10`:
+  - `crates/rpc/src/esplora.rs` tests
+    `broadcast_preserves_esplora_origin_and_idempotence`,
+    `broadcast_rejections_are_400_without_mutation`,
+    `broadcast_fee_ceiling_is_independent_of_rpc_overrides`, and
+    `broadcast_fee_ceiling_accepts_equality_and_refuses_one_sat_above`.
+  - `crates/rpc/src/esplora/http.rs` test
+    `admission_consensus_and_retry_failures_preserve_the_http_dialect`.
+  - `crates/p2p/src/tx_relay.rs` local relay and delayed-event tests include
+    Esplora origins; mempool admission tests cover orphan wakeups and absence
+    of peer lifecycle state for local missing-input refusals.
+  - `bin/bitcoin-rs/tests/wallet_facing.rs` test
+    `external_wallet_can_scan_estimate_and_broadcast` exercises both HTTP
+    broadcast directories' maximum-fee and malformed-input refusals, followed
+    by an accepted transaction whose returned id is checked with rust-bitcoin.
 
 - `API-11`:
   - `crates/rpc/src/handlers/mining.rs` tests `getblocktemplate_forwards_longpollid`,

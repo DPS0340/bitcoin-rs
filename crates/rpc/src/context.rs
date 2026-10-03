@@ -29,9 +29,8 @@ const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 
 /// Core `sendrawtransaction` default `maxfeerate`: 0.1 BTC/kvB in sat/kvB.
 ///
-/// The node applies the identical cap to every admission surface, including
-/// the embedded [`bitcoin_rs_node::Node::broadcast`], via
-/// [`Context::admit_transaction`].
+/// RPC selects this default when no request override is supplied. Embedded
+/// `Node::broadcast` also selects it; Esplora owns its request cap separately.
 pub const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 
 /// Full-block REST responses materialize the block and a response buffer.
@@ -706,6 +705,7 @@ impl Context {
             &self.mempool.gateway,
             &self.chain,
             &tx,
+            AdmissionOrigin::Rpc,
             max_feerate_sat_per_kvb,
         )
         .map_err(AdmissionFailure::into_string)
@@ -714,8 +714,8 @@ impl Context {
 
 /// Failure from the one shared admission operation.
 ///
-/// `sendrawtransaction` and [`Context::admit_transaction`] map this into
-/// their respective envelopes.
+/// RPC, Esplora and [`Context::admit_transaction`] map this into their
+/// respective envelopes.
 pub(crate) enum AdmissionFailure {
     /// Mempool or standardness policy refused the transaction.
     Policy(AcceptanceRejectReason),
@@ -731,7 +731,7 @@ impl AdmissionFailure {
 
     /// Maps this failure to the string envelope used by
     /// [`Context::admit_transaction`].
-    fn into_string(self) -> String {
+    pub(crate) fn into_string(self) -> String {
         match self {
             Self::Policy(reason) => reason.to_string(),
             Self::Consensus => "consensus-verification-failed".to_owned(),
@@ -752,11 +752,12 @@ pub(crate) fn admit_transaction(
     mempool: &MempoolGateway,
     chain: &ChainHandles,
     tx: &Tx,
+    origin: AdmissionOrigin,
     max_feerate_sat_per_kvb: Option<u64>,
 ) -> Result<MutationResult, AdmissionFailure> {
     match mempool.submit_transaction(
         Arc::new(tx.clone()),
-        AdmissionOrigin::Rpc,
+        origin,
         max_feerate_sat_per_kvb,
         unix_time_secs(),
         &chain.admission_chain(),
@@ -764,7 +765,7 @@ pub(crate) fn admit_transaction(
         Ok(SubmitOutcome::Committed(result)) => Ok(result),
         Ok(SubmitOutcome::AlreadyKnown) => Ok(MutationResult::empty()),
         Ok(SubmitOutcome::AlreadyConfirmed | SubmitOutcome::Held { .. }) => {
-            // RPC never holds orphans or treats the transaction lookup cache
+            // RPC/Esplora never hold orphans or treat the transaction lookup cache
             // as a successful submission. Preserve its missing-input refusal.
             Err(AdmissionFailure::Policy(
                 AcceptanceRejectReason::MissingInputs,

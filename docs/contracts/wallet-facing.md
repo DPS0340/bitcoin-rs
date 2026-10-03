@@ -50,9 +50,10 @@ mixed-tip page.
   insufficient-data shape, never a fabricated rate.
 - Build and sign outside the node: `combinepsbt`, `finalizepsbt`, and the
   descriptor helpers are key-free. The consumer signs.
-- Broadcast: `POST /tx` (hex body) reaches the shared `MempoolGateway`
-  dispatched as the `Rpc` origin today; a distinct Esplora origin with its
-  own request fee limits remains target work under `API-10`.
+- Broadcast: `POST /tx` (hex body) reaches the shared `MempoolGateway` with
+  `AdmissionOrigin::Esplora` and its own fixed 10,000,000 sat/kvB request
+  ceiling (`API-10`). Rejections return HTTP 400 with the rejection reason;
+  success returns the transaction id as plain text.
 - Confirmation tracking, replacement observation, disconnect and reorg
   observation, and rescan all run over the same public reads.
 - Public `/api` responses, including errors, allow cross-origin reads with

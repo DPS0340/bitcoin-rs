@@ -115,6 +115,9 @@ fn external_wallet_can_scan_estimate_and_broadcast() -> TestResult {
     assert_script_activity(&client, &address, &p2wpkh)?;
 
     let spend_hex = spend_anyone_can_spend(&client, 1, &p2wpkh)?;
+    let spend_bytes: Vec<u8> = bitcoin::hex::FromHex::from_hex(&spend_hex)?;
+    let spend: Transaction = bitcoin::consensus::deserialize(&spend_bytes)?;
+    assert_broadcast_rejections(&client, &spend)?;
     let broadcast = client.esplora_post("/api/tx", spend_hex.as_bytes())?;
     assert_eq!(
         broadcast.status,
@@ -123,6 +126,7 @@ fn external_wallet_can_scan_estimate_and_broadcast() -> TestResult {
         broadcast.body_text()
     );
     let txid = broadcast.body_text();
+    assert_eq!(txid.trim(), spend.compute_txid().to_string());
     assert_eq!(
         txid.trim().len(),
         64,
@@ -165,6 +169,25 @@ fn external_wallet_can_scan_estimate_and_broadcast() -> TestResult {
         fees.get("6").and_then(Value::as_f64).is_some(),
         "two confirmed spends must qualify the 6-block target wallets use: {fees}"
     );
+    Ok(())
+}
+
+fn assert_broadcast_rejections(client: &Client, spend: &Transaction) -> TestResult {
+    let mut excessive_fee = spend.clone();
+    excessive_fee.output[0].value = Amount::from_sat(1_000_000);
+    let excessive_hex = serialize_hex(&excessive_fee);
+    for path in ["/api/tx", "/esplora/tx"] {
+        let rejected = client.esplora_post(path, excessive_hex.as_bytes())?;
+        assert_eq!(rejected.status, 400);
+        assert_eq!(rejected.body_text(), "invalid params: max-fee-exceeded");
+        let malformed = client.esplora_post(path, b"zz")?;
+        assert_eq!(malformed.status, 400);
+        assert_eq!(
+            malformed.body_text(),
+            "TX decode failed. Make sure the tx has at least one input."
+        );
+    }
+    assert_eq!(client.rpc("getrawmempool", &json!([]))?, json!([]));
     Ok(())
 }
 
