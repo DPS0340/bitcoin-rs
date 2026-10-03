@@ -302,19 +302,41 @@ jobs:
       contents: read
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - uses: ./.github/actions/test-deps
       - name: Install pinned bitcoind 31.1
-        run: scripts/install-bitcoind.sh --print-path
+        run: |
+          mkdir -p target/core-differential
+          scripts/install-bitcoind.sh --print-path \
+            2>&1 | tee target/core-differential/install.log
       - name: Build bitcoin-rs (quickstart, portable)
         run: |
-          cargo build -p bitcoin-rs --profile quickstart \
-            --no-default-features --features fjall,zmq
+          cargo build --locked -p bitcoin-rs --profile quickstart \
+            --no-default-features --features fjall,zmq \
+            2>&1 | tee target/core-differential/build.log
       - name: Core vs bitcoin-rs P2P and chain-identity differential
         run: |
           scripts/run-p2p-core-interop.sh \
             --bitcoind-command "$(scripts/install-bitcoind.sh --print-path)" \
-            --bitcoin-rs-command target/quickstart/bitcoin-rs
+            --bitcoin-rs-command target/quickstart/bitcoin-rs \
+            --workdir "$PWD/target/core-differential/run" \
+            --evidence "$PWD/target/core-differential/evidence.json" \
+            2>&1 | tee target/core-differential/driver.log
+      - name: Preserve Core differential evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-differential-${{ github.run_attempt }}
+          path: |
+            target/core-differential/*.log
+            target/core-differential/evidence.json
+            target/core-differential/run/*.log
+            target/core-differential/run/core/regtest/debug.log
+          if-no-files-found: warn
+          retention-days: 7
