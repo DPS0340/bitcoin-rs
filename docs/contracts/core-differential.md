@@ -46,5 +46,10 @@ after a real P2P sync, not a replay of captured JSON.
 ## Proven by
 
 - Main workflow `core-differential`.
+- The workflow retains any generated evidence JSON, installer/build/driver
+  output, and node logs in the `core-differential-<run_attempt>` artifact for
+  seven days, including failed runs. Node databases and RPC cookies are
+  excluded. Failures before evidence generation can leave only partial logs;
+  failures before log creation can leave no files to upload.
 - `cargo test -p bitcoin-rs-p2p --test core_interop_live -- --ignored`
   with `P2P_CORE_INTEROP_EVIDENCE` set by the driver.
