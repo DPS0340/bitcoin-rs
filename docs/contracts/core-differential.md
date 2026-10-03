@@ -71,8 +71,9 @@ a running pinned binary, not a replay of captured JSON.
   rejected blocks leave the common public state unchanged; accepted blocks
   advance both nodes to the candidate hash.
 - Each `acceptance-*.json` under the candidate's process evidence directory
-  records input bytes and identity, expected verdict, both replies, checked
-  states, classification, and links to both process evidence directories.
+  records input bytes and identity, expected verdict, replies and checked
+  states when observed, classification, and links to both process evidence
+  directories.
   The initial input record is written before submission and retained even
   when a later check fails. Existing process evidence contains pinned binary
   identities, launch arguments, RPC transcripts, and output logs.
