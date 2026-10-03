@@ -20,6 +20,9 @@ mod reference_set;
 #[path = "support/policy_cases.rs"]
 mod policy_cases;
 
+#[path = "support/spending_prevout_cases.rs"]
+mod spending_prevout_cases;
+
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;

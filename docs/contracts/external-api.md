@@ -22,7 +22,8 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
 `getprioritisedtransactions` `modified_fee` in satoshis. `API-29` is Core
 `generatetoaddress` / `generateblock` invalid-output text. `API-30` is
 `generateblock` `TestBlockValidity` before solve. `API-31` is
-`generateblock` multipath, ranged, and Expand private-key errors.
+`generateblock` multipath, ranged, and Expand private-key errors. `API-32`
+is the `gettxspendingprevout` mempool snapshot.
 
 ## Clauses
 
@@ -63,8 +64,8 @@ reject reasons. `API-22` is GBT `coinbaseaux.flags`. `API-23` is
   authentication, and error ordering follow the pinned Core 31.1
   contract.
 - Failures map through `RpcError` (`crates/rpc/src/error.rs`): standard
-  JSON-RPC codes (`-32700`, `-32600`..=`-32603`) and Core codes `-3`
-  (invalid type), `-5` (not found), `-8` (invalid parameter), `-9`
+  JSON-RPC codes (`-32700`, `-32600`..=`-32603`) and Core codes `-1`
+  (miscellaneous runtime failure), `-3` (invalid type), `-5` (not found), `-8` (invalid parameter), `-9`
   (not connected), `-10` (initial download), `-22` (deserialization),
   and `-25` plus `-26` (submission).
 - Amounts are integer satoshis internally. Adapters render the exact
@@ -538,6 +539,31 @@ owned by [wallet-facing.md](wallet-facing.md).
 - Multipath is checked first, matching Core `descs.size() > 1` before
   `IsRange()`. A descriptor that is both is the multipath error.
 
+### `API-32`: `gettxspendingprevout` mempool snapshot
+
+- **Owner**: `Mempool::outpoint_spender` owns the spending-index lookup and
+  its typed consistency failure. The RPC adapter validates every input before
+  taking one gateway read guard, captures spending transaction references for
+  all outpoints under that guard, and serializes after releasing it.
+- Results preserve query order, duplicates, and the caller's txid spelling.
+  A row without a mempool spender contains only `txid` and `vout`; no
+  confirmed-spend history is queried. Replacement and removal are visible
+  through the existing mempool index, with no additional state.
+- Positional and named `outputs` / `options`, flattened named options, and
+  the `args` positional prefix accept Core 31.1's `mempool_only` and
+  `return_spending_tx` options. The default is mempool-only; requested
+  `spendingtx` uses full consensus serialization, including witness.
+  With `mempool_only=false`, a missing mempool spender fails with Core's
+  `-1` unavailable-txospenderindex error. An inconsistent spending index
+  becomes an internal error, never an unspent result.
+- Empty output lists, strict object keys, txid syntax, and signed 32-bit
+  nonnegative vout validation follow the pinned reference. Missing or extra
+  argument counts retain local JSON-RPC `-32602` shape errors instead of
+  Core's `-1` help text; the registry declares this deviation.
+- The HTTP request-body limit bounds externally supplied queries; this
+  handler retains O(number of requested outputs) rows and transaction
+  references. It never scans or clones the full mempool.
+
 ## Live gaps
 
 - **Full Core differential suite**: Versioned Core response structs, golden fixtures, and differential test lanes across all RPC methods are tracked under #78 (open).
@@ -745,5 +771,14 @@ owned by [wallet-facing.md](wallet-facing.md).
   - `crates/rpc/src/handlers/mining.rs` tests
     `generateblock_rejects_multipath_before_ranged_like_core`,
     `generateblock_rejects_hardened_xpub_like_core`
+
+- `API-32`:
+  - `crates/rpc/src/handlers/mempool.rs` tests
+    `gettxspendingprevout_projects_queries_and_removal_from_the_existing_index`
+    and `gettxspendingprevout_rejects_argument_count_with_local_shape_errors`.
+  - `bin/bitcoin-rs/tests/overhaul_process_harness.rs` module
+    `spending_prevout_cases`: pinned Core 31.1 comparison of admitted,
+    replaced, and confirmed spenders, ordered and duplicate requests,
+    optional transaction bytes, named forms, and parameter errors.
 
 ## Vocabulary
