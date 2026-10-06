@@ -163,7 +163,8 @@ pub struct PeerToken {
 /// by the apply-path sweep (`crates/node/src/apply.rs`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionOrigin {
-    /// Submitted through RPC (`sendrawtransaction`).
+    /// Submitted through RPC `sendrawtransaction` or the embedded
+    /// `Node::broadcast`.
     Rpc,
     /// Submitted through an Esplora raw-transaction broadcast route.
     Esplora,
