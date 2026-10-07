@@ -44,10 +44,11 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
     not depend on mempool, P2P, index, mining, RPC, node, or the binary.
     `utxo` sits in Layer 2 because it depends on `storage` for undo records
     and persisted coin statistics. `chain` depends on `consensus` for BIP9
-    parameters and the BIP113 locktime cutoff, and reads persisted block
-    bodies only through its `BlockBodySource` capability. `mining` sits in
-    Layer 2 because it depends on `mempool` for candidate selection and
-    `chain` for candidate header/work/time context.
+    parameters and the BIP113 locktime cutoff. It does not read block bodies;
+    it defines the `BlockBodySource` capability through which P2P, index,
+    and RPC read persisted bodies. `mining` sits in Layer 2 because it
+    depends on `mempool` for candidate selection and `chain` for candidate
+    header/work/time context.
     `p2p` depends on `mempool` for the transaction inventory view and
     committed-mutation relay consumer. This same-layer edge keeps peer
     protocol mechanics with their consumer; `mempool` must not depend on
