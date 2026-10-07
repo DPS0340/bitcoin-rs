@@ -371,6 +371,7 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
             ConsensusError::Encoding(_)
             | ConsensusError::PrevoutMatrixSize { .. }
             | ConsensusError::PrevoutCount { .. }
+            | ConsensusError::PrevoutMismatch { .. }
             | ConsensusError::UnsupportedEngine { .. }
             | ConsensusError::Kernel(_)
             | ConsensusError::Script {
