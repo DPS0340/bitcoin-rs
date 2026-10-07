@@ -295,9 +295,14 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   because node orchestration drains it into `MempoolGateway`. Confirmed
   transaction bodies are queried through the derived index and durable block
   storage, never through a second node/RPC transaction map. RPC network
-  answers likewise read the P2P-owned peer table, traffic counters, ban list,
-  added-node list, and network-active latch directly; there is no parallel
-  RPC-local network-state projection.
+  answers and control operations likewise read and mutate network state through
+  `P2pService` directly (querying the P2P-owned peer table, traffic counters,
+  ban list, added-node list, and network-active latch, and invoking service
+  control methods for bans, added nodes, network-active toggling, and
+  disconnections). RPC no longer receives raw handles for bans, added nodes,
+  the network-active latch, or the outbound dial channel; the peer table stays
+  as a read view, and there is no parallel RPC-local network-state projection
+  or duplicate mutation authority.
 - `MempoolGateway` owns the process mempool handle; `NodeState::mempool` is a
   read/composition capability borrowed from that gateway, not a parallel
   retained `Arc`. Gateway interning remains the public one-gateway-per-pool
