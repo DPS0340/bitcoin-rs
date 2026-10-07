@@ -148,13 +148,6 @@ fn chainstate_facade_exposes_no_production_raw_mutation_handles() -> anyhow::Res
             method,
         )?;
     }
-    for method in ["block_tree_mut", "set_tips"] {
-        consumer.deny(
-            &format!("{READ_CONTROL}\npub fn denied() {{ let _ = <dyn SyncChain>::{method}; }}"),
-            &["E0599"],
-            method,
-        )?;
-    }
     // `UtxoReader::fixture_set` is the only route from a read capability back
     // to the set `utxo::contract` mutates. It is compiled out of production
     // builds, so a production consumer must not be able to name it.

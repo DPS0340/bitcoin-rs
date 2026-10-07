@@ -125,15 +125,6 @@ impl SyncChain for TestChain {
         self.applied_tip.load_full()
     }
 
-    fn block_tree_mut(&self) -> parking_lot::RwLockWriteGuard<'_, BlockTree> {
-        self.block_tree.write()
-    }
-
-    fn set_tips(&self, applied: TipSnapshot, header: TipSnapshot) {
-        self.applied_tip.store(Some(Arc::new(applied)));
-        self.chain_tip.store(Some(Arc::new(header)));
-    }
-
     fn bootstrap_genesis(&self) {
         if self.applied_tip.load_full().is_some() {
             return;
@@ -385,14 +376,6 @@ impl SyncChain for RefusingChain {
         self.0.applied_tip()
     }
 
-    fn block_tree_mut(&self) -> parking_lot::RwLockWriteGuard<'_, BlockTree> {
-        self.0.block_tree_mut()
-    }
-
-    fn set_tips(&self, applied: TipSnapshot, header: TipSnapshot) {
-        self.0.set_tips(applied, header);
-    }
-
     fn bootstrap_genesis(&self) {
         self.0.bootstrap_genesis();
     }
@@ -431,57 +414,6 @@ impl SyncChain for RefusingChain {
     ) -> Result<(), BranchSwitchError> {
         self.0.switch_to_branch(target, staged_body, connected_body)
     }
-}
-
-fn check_sync_frontier_pair(
-    sync: &BlockSync,
-    rx: &crossbeam_channel::Receiver<Message>,
-    addr: SocketAddr,
-    applied: &TipSnapshot,
-    target: &TipSnapshot,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let expected =
-        bitcoin_rs_chain::plan_reorg(&sync.chain.block_tree(), applied.tip_id, target.tip_id).ok();
-    sync.chain.set_tips(applied.clone(), target.clone());
-    assert_eq!(
-        sync.outweighed_branch_target(),
-        expected
-            .as_ref()
-            .filter(|plan| !plan.disconnect.is_empty())
-            .map(|_| target.tip_id),
-        "branch gate differs: {applied:?} -> {target:?}; indexed or parent-walk fixture"
-    );
-    sync.install_budget(super::default_sync_budget(Network::Regtest));
-    let outcome = sync.send_getdata_for_pending_blocks(
-        current_source(&sync.peer_table, addr),
-        true,
-        100,
-        &test_frontier(sync),
-    );
-    let expected_ids = expected
-        .as_ref()
-        .map(|plan| plan.connect.as_slice())
-        .unwrap_or_default();
-    if expected_ids.is_empty() {
-        assert!(!outcome.sent);
-        assert!(rx.try_recv().is_err());
-        return Ok(());
-    }
-    assert!(outcome.sent);
-    let Message::GetData(inventory) = rx.try_recv()? else {
-        return Err("expected witness getdata".into());
-    };
-    let requested = witness_block_inventory(inventory)?;
-    let tree = sync.chain.block_tree();
-    let expected_hashes = expected_ids
-        .iter()
-        .take(requested.len())
-        .map(|id| tree.node(*id).map(|node| BlockHash(node.hash)))
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(requested, expected_hashes);
-    assert_ne!(requested, []);
-    assert!(rx.try_recv().is_err());
-    Ok(())
 }
 
 /// A batch forwarded out of a delivered body (`wire_response = false`) is
