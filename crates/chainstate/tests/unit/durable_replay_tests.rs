@@ -573,3 +573,68 @@ fn committed_gap_replay_failure_fails_closed() -> Result<(), Box<dyn std::error:
     );
     Ok(())
 }
+
+/// RCV-02 / JW-ORDER-1: retention relief must not turn append-gap poison into
+/// a progress checkpoint or a retry. The original writer error stays intact.
+#[cfg(feature = "fjall")]
+#[test]
+fn committed_gap_append_gap_does_not_enter_retention_relief()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bitcoin_rs_storage::chainstate_journal::{
+        FULL_REVALIDATION_MARKER, JournalEmit, JournalWriter, JournalWriterError,
+        shared_journal_writer,
+    };
+
+    let (mut handles, child) = restored_chainstate()?;
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.persist_block_body(1, child.block_hash().0, &consensus_bytes(&child))?;
+    let head = install_head(&mut handles, &child, bodies)?;
+    let temp = tempfile::tempdir()?;
+    let store = Arc::new(bitcoin_rs_storage::FjallStore::open(
+        temp.path().join("kv"),
+    )?);
+    let path = temp.path().join("journal");
+    std::fs::create_dir(&path)?;
+    let dir = bitcoin_rs_storage::checkpoint::fs::open_data_dir(&path)?;
+    let mut writer = JournalWriter::initialize(
+        dir,
+        store,
+        0,
+        (0, 0),
+        0,
+        Network::Regtest.genesis_block_hash().to_le_bytes(),
+        [0; 32],
+        1,
+    )?;
+    std::fs::write(
+        path.join(FULL_REVALIDATION_MARKER),
+        b"force full validation\n",
+    )?;
+    let marker_before = std::fs::read(path.join(FULL_REVALIDATION_MARKER))?;
+    let journal_head_before = std::fs::read(path.join("head.json"))?;
+    JournalEmit::mark_append_gap(&mut writer, 1);
+    handles.journal = Some(shared_journal_writer(writer));
+
+    let Err(ApplyError::JournalBackpressure(error)) = super::reconcile_at_boot(&handles) else {
+        panic!("append gap must return the original journal refusal, not recovery publication");
+    };
+    assert!(matches!(
+        *error,
+        JournalWriterError::AppendGap { height: 1 }
+    ));
+    assert!(matches!(
+        handles.begin_transition(),
+        Err(ApplyError::Shutdown)
+    ));
+    assert_eq!(
+        handles.applied_tip.load_full().map(|tip| tip.height),
+        Some(0)
+    );
+    assert_eq!(handles.durable_head.load()?, Some(head));
+    assert_eq!(
+        std::fs::read(path.join(FULL_REVALIDATION_MARKER))?,
+        marker_before
+    );
+    assert_eq!(std::fs::read(path.join("head.json"))?, journal_head_before);
+    Ok(())
+}

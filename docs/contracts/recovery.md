@@ -402,6 +402,9 @@ durable.
   - `committed_gap_replay_failure_fails_closed` proves an apply failure inside
     the replay transition closes admission and leaves `begin_transition`
     refusing with `ApplyError::Shutdown`.
+  - `committed_gap_append_gap_does_not_enter_retention_relief` proves a poisoned
+    writer returns its original append-gap refusal without progress publication,
+    preserving its recovery marker and journal head while closing admission.
 - `crates/chainstate/src/connect.rs` and
   `crates/chainstate/src/disconnect.rs`: run the `RCV-02` tail —
   sync, one atomic batch, derived journal emission, then publication — and
