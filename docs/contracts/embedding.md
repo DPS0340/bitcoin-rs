@@ -43,11 +43,11 @@ the first embedder — there is one lifecycle implementation, not two.
   the node's concrete-service `CapabilitySnapshot`. Owners:
   `crates/node/src/embed.rs` and `crates/rpc/src/context.rs`; wire types:
   `crates/index/src/capabilities.rs`.
-- **EMB-05 — Broadcast is the shared admission.** `Node::broadcast` calls
-  `MempoolGateway::submit_local_transaction` with `sendrawtransaction`'s
-  default fee-rate cap — the local submission `sendrawtransaction`
-  (`crates/rpc/src/handlers/tx.rs`) and Esplora broadcasts also call:
-  the full policy stack is evaluated under the node's one
+- **EMB-05 — Broadcast is the shared admission.** `Node::broadcast`,
+  `sendrawtransaction` (`crates/rpc/src/handlers/tx.rs`) and Esplora
+  broadcasts all call `MempoolGateway::submit_local_transaction`;
+  `Node::broadcast` passes `sendrawtransaction`'s default fee-rate cap. The
+  full policy stack is evaluated under the node's one
   `MempoolGateway` write-lock interval and the authorized mutation
   commits inside it, so no concurrent admission can pass stale policy.
   Block-connect eviction commits through the same gateway's

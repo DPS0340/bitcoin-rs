@@ -7,7 +7,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
-use bitcoin_rs_mempool::{AdmissionOrigin, SubmitError};
+use bitcoin_rs_mempool::{LocalOrigin, SubmitError};
 use bitcoin_rs_primitives::{
     Amount, Block as NativeBlock, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, deserialize as native_deserialize, unix_time_secs,
@@ -463,7 +463,7 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
         .gateway
         .submit_local_transaction(
             Arc::new(tx),
-            AdmissionOrigin::Rpc,
+            LocalOrigin::Rpc,
             max_feerate,
             unix_time_secs(),
             &ctx.chain.admission_chain(),

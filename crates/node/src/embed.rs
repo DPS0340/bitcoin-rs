@@ -8,7 +8,7 @@
 //! Embedders control placement of that work on their own runtime.
 
 use bitcoin_rs_index::CapabilitySnapshot;
-use bitcoin_rs_mempool::{AdmissionOrigin, FeeRate, MempoolStats, MutationResult};
+use bitcoin_rs_mempool::{FeeRate, LocalOrigin, MempoolStats, MutationResult};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Tx, Txid, deserialize, unix_time_secs};
 pub(crate) use bitcoin_rs_rpc::context::SyncProgress;
 use bitcoin_rs_rpc::context::{ChainAdmissionView, DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB};
@@ -165,7 +165,7 @@ impl Node {
             .mempool_gateway()
             .submit_local_transaction(
                 Arc::new(tx),
-                AdmissionOrigin::Rpc,
+                LocalOrigin::Rpc,
                 Some(DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB),
                 unix_time_secs(),
                 &chain,

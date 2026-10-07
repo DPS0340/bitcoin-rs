@@ -114,7 +114,8 @@ state (`crates/mempool/src/orphan.rs`).
 - `submit_transaction` owns common preparation and four bounded attempts for
   RPC and peer submissions. `submit_local_transaction` runs it for RPC,
   Esplora and embedded broadcasts, answering current membership as success
-  with no changes. `preview_transactions` uses the same policy and
+  with no changes; it takes a `LocalOrigin`, so peer, reorg and block
+  origins cannot reach it. `preview_transactions` uses the same policy and
   script evaluator, with the same retry bound. Each attempt captures an even
   chain generation and pool sequence before reading chain facts. Preparation
   copies the input outputs under a pool read, then executes scripts without

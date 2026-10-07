@@ -10,8 +10,8 @@ use hashbrown::{HashMap, HashSet};
 
 use crate::standardness::{AcceptanceRejectReason, StandardnessPolicy, is_standard_tx};
 use crate::{
-    AdmissionOrigin, AdmissionRequest, AdmitError, AdmitOutcome, MempoolGateway, MutationResult,
-    PeerToken,
+    AdmissionOrigin, AdmissionRequest, AdmitError, AdmitOutcome, LocalOrigin, MempoolGateway,
+    MutationResult, PeerToken,
 };
 
 pub(crate) const MAX_ADMISSION_RETRIES: usize = 4;
@@ -461,16 +461,12 @@ impl MempoolGateway {
     pub fn submit_local_transaction(
         &self,
         tx: Arc<Tx>,
-        origin: AdmissionOrigin,
+        origin: LocalOrigin,
         max_feerate_sat_per_kvb: Option<u64>,
         time: u64,
         chain: &dyn AdmissionChain,
     ) -> Result<MutationResult, SubmitError> {
-        debug_assert!(
-            !matches!(origin, AdmissionOrigin::Peer(_)),
-            "peer ingress uses submit_transaction"
-        );
-        match self.submit_transaction(tx, origin, max_feerate_sat_per_kvb, time, chain)? {
+        match self.submit_transaction(tx, origin.into(), max_feerate_sat_per_kvb, time, chain)? {
             SubmitOutcome::Committed(result) => Ok(result),
             SubmitOutcome::AlreadyKnown => Ok(MutationResult::empty()),
             SubmitOutcome::AlreadyConfirmed | SubmitOutcome::Held { .. } => {
@@ -973,7 +969,7 @@ mod tests {
     // POL-01: a local resubmission of a member succeeds without changes.
     #[test]
     fn local_submission_answers_membership_as_success_without_changes() {
-        for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Esplora] {
+        for origin in [LocalOrigin::Rpc, LocalOrigin::Esplora] {
             let gateway = gateway();
             let (parent, child) = parent_and_child();
             insert_parent(&gateway, parent, AdmissionOrigin::Rpc);

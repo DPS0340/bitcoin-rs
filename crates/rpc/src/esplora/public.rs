@@ -11,7 +11,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_mempool::AdmissionOrigin;
+use bitcoin_rs_mempool::LocalOrigin;
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{
     Block, Hash256, OutPoint, Tx, Txid, consensus_bytes, deserialize, unix_time_secs,
@@ -156,7 +156,7 @@ pub(super) fn post(handler: &Handler, path: &str, body: &[u8]) -> Response {
             let txid = transaction.txid();
             match ctx.mempool.gateway.submit_local_transaction(
                 Arc::new(transaction),
-                AdmissionOrigin::Esplora,
+                LocalOrigin::Esplora,
                 Some(MAX_BROADCAST_FEE_RATE_SAT_PER_KVB),
                 unix_time_secs(),
                 &ctx.chain.admission_chain(),
