@@ -690,13 +690,6 @@ impl P2pService {
         apply_network_active(&self.network_active, &self.peer_table, active);
     }
 
-    /// Returns the shared admission switch for compatibility with node
-    /// orchestration code that passes the switch into worker constructors.
-    #[must_use]
-    pub fn network_active_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.network_active)
-    }
-
     /// Adds or replaces one manual ban entry.
     pub fn set_ban(&self, entry: crate::BannedSubnet) {
         let mut banned = self.banned.write();
@@ -718,18 +711,6 @@ impl P2pService {
     #[must_use]
     pub fn banned(&self) -> Vec<crate::BannedSubnet> {
         self.banned.read().clone()
-    }
-
-    /// Returns the service-owned manual ban list handle.
-    #[must_use]
-    pub fn banned_handle(&self) -> Arc<RwLock<Vec<crate::BannedSubnet>>> {
-        Arc::clone(&self.banned)
-    }
-
-    /// Returns a sender for outbound dial requests, manual or not.
-    #[must_use]
-    pub fn outbound_sender(&self) -> Sender<OutboundDial> {
-        self.outbound_tx.clone()
     }
 
     /// Returns configured addnode add addresses.
@@ -770,10 +751,14 @@ impl P2pService {
         self.peer_table.disconnect(addr)
     }
 
-    /// Returns the service-owned persistent addnode view.
-    #[must_use]
-    pub fn added_nodes_handle(&self) -> Arc<RwLock<Vec<SocketAddr>>> {
-        Arc::clone(&self.added_nodes)
+    /// Queues an automatic dial for the stale-tip slot-cap unit test.
+    /// Local addnode requests are manual and cannot exercise that allowance.
+    #[cfg(test)]
+    pub(crate) fn test_queue_automatic_dial(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(), crossbeam_channel::SendError<OutboundDial>> {
+        self.outbound_tx.send(OutboundDial::auto(addr))
     }
 
     /// Returns a cloned inbound headers receiver for the node sync coordinator.
@@ -795,11 +780,11 @@ impl P2pService {
     }
 }
 
-/// Applies the network-activity transition used by [`P2pService`] and RPC.
+/// Applies the service-owned network-activity transition.
 ///
 /// Disabling cancels current leases; connection owners remove their own
 /// sessions during teardown.
-pub fn apply_network_active(flag: &AtomicBool, table: &crate::PeerTable, active: bool) {
+fn apply_network_active(flag: &AtomicBool, table: &crate::PeerTable, active: bool) {
     flag.store(active, Ordering::Release);
     if !active {
         table.cancel_all();

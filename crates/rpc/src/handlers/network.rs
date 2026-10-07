@@ -664,12 +664,7 @@ mod addnode_validation_tests {
             },
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
-        let queued = bitcoin_rs_p2p::OutboundDial::pinned(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            8333,
-        )));
-        p2p.outbound_sender()
-            .try_send(queued)
+        p2p.add_node(SocketAddr::from(([127, 0, 0, 1], 8333)), false)
             .unwrap_or_else(|err| panic!("failed to fill outbound queue: {err}"));
         let mut ctx = Context::new();
         ctx.network.p2p = Arc::clone(&p2p);
@@ -692,12 +687,7 @@ mod addnode_validation_tests {
             },
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));
-        let queued = bitcoin_rs_p2p::OutboundDial::pinned(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            8333,
-        )));
-        p2p.outbound_sender()
-            .try_send(queued)
+        p2p.add_node(SocketAddr::from(([127, 0, 0, 1], 8333)), false)
             .unwrap_or_else(|err| panic!("failed to fill outbound queue: {err}"));
         let mut ctx = Context::new();
         ctx.network.p2p = Arc::clone(&p2p);
