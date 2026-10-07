@@ -175,6 +175,20 @@ pub enum P2pJoinError {
     BootstrapPanic,
 }
 
+/// Errors returned by RPC-facing P2P control operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum P2pControlError {
+    /// The destination is covered by an active manual ban.
+    #[error("destination is banned")]
+    Banned,
+    /// The bounded dial queue has no capacity.
+    #[error("p2p outbound queue is full")]
+    QueueFull,
+    /// The P2P service has already shut down.
+    #[error("p2p outbound queue is closed")]
+    Closed,
+}
+
 #[derive(Default)]
 struct Workers {
     listeners: Vec<JoinHandle<Result<(), ListenerError>>>,
@@ -670,11 +684,40 @@ impl P2pService {
         self.network_active.load(Ordering::Acquire)
     }
 
+    /// Enables or disables network activity. Disabling cancels current peers;
+    /// their owners remove the leases during teardown.
+    pub fn set_network_active(&self, active: bool) {
+        apply_network_active(&self.network_active, &self.peer_table, active);
+    }
+
     /// Returns the shared admission switch for compatibility with node
     /// orchestration code that passes the switch into worker constructors.
     #[must_use]
     pub fn network_active_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.network_active)
+    }
+
+    /// Adds or replaces one manual ban entry.
+    pub fn set_ban(&self, entry: crate::BannedSubnet) {
+        let mut banned = self.banned.write();
+        banned.retain(|current| current.subnet != entry.subnet);
+        banned.push(entry);
+    }
+
+    /// Removes one manual ban entry.
+    pub fn remove_ban(&self, subnet: crate::IpSubnet) {
+        self.banned.write().retain(|entry| entry.subnet != subnet);
+    }
+
+    /// Clears all manual bans.
+    pub fn clear_banned(&self) {
+        self.banned.write().clear();
+    }
+
+    /// Returns a snapshot of current manual bans.
+    #[must_use]
+    pub fn banned(&self) -> Vec<crate::BannedSubnet> {
+        self.banned.read().clone()
     }
 
     /// Returns the service-owned manual ban list handle.
@@ -687,6 +730,50 @@ impl P2pService {
     #[must_use]
     pub fn outbound_sender(&self) -> Sender<OutboundDial> {
         self.outbound_tx.clone()
+    }
+
+    /// Returns the service-owned outbound request receiver.
+    #[must_use]
+    pub fn outbound_receiver(&self) -> Arc<Mutex<Receiver<OutboundDial>>> {
+        Arc::clone(&self.outbound_rx)
+    }
+
+    /// Returns configured addnode add addresses.
+    #[must_use]
+    pub fn added_nodes(&self) -> Vec<SocketAddr> {
+        self.added_nodes.read().clone()
+    }
+
+    /// Applies Core-like addnode state and requests a connection.
+    pub fn add_node(&self, addr: SocketAddr, persist: bool) -> Result<(), P2pControlError> {
+        if crate::subnet::is_banned(&self.banned.read(), addr.ip(), SystemTime::now()) {
+            return Err(P2pControlError::Banned);
+        }
+        if persist {
+            let mut added = self.added_nodes.write();
+            if !added.contains(&addr) {
+                added.push(addr);
+            }
+        }
+        if !self.network_active() {
+            return Ok(());
+        }
+        match self.outbound_tx.try_send(OutboundDial::pinned(addr)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) if persist => Ok(()),
+            Err(TrySendError::Full(_)) => Err(P2pControlError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(P2pControlError::Closed),
+        }
+    }
+
+    /// Removes one configured addnode add address.
+    pub fn remove_node(&self, addr: SocketAddr) {
+        self.added_nodes.write().retain(|current| *current != addr);
+    }
+
+    /// Disconnects any active connection with the given address.
+    pub fn disconnect(&self, addr: SocketAddr) -> bool {
+        self.peer_table.disconnect(addr)
     }
 
     /// Returns the service-owned persistent addnode view.
