@@ -42,9 +42,11 @@ the first embedder — there is one lifecycle implementation, not two.
   projection `getblockchaininfo` runs. The chain facts in it — heights, best
   hash, tip time and median time past, verification progress, the
   initial-block-download decision, and chain work — come from the
-  Chainstate-minted `ChainProgressReader` (`crates/chain/src/progress.rs`);
-  RPC adds only difficulty rendering and the storage facts. `capabilities()` returns
-  the node's concrete-service `CapabilitySnapshot`. Owners:
+  Chainstate-minted `ChainProgressReader` (`crates/chain/src/progress.rs`).
+  The projection adds the network, the rendered difficulty and chain work,
+  and the storage facts; `getblockchaininfo` adds its wire-only fields
+  (`bits`, `target`, warnings, recovery status) on top. `capabilities()`
+  returns the node's concrete-service `CapabilitySnapshot`. Owners:
   `crates/node/src/embed.rs` and `crates/rpc/src/context.rs`; wire types:
   `crates/index/src/capabilities.rs`.
 - **EMB-05 — Broadcast is the shared admission.** `Node::broadcast` runs
