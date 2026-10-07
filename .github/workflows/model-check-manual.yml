@@ -5,9 +5,9 @@ name: model-check-manual
 # hold it). Runs the solver UNCHANGED at K=128. MANUAL ONLY, no schedule: a
 # cron on hosted runners (360-min cap) would fail every run and train everyone
 # to ignore the lane. Add a schedule back when a self-hosted/unbounded runner
-# exists. Informational: failures never block merges. Every run uploads its
-# evidence as an artifact; it never edits the proof inventory, which
-# docs/contracts/formal-verification.md owns.
+# exists. Informational: failures never block merges. A run uploads whatever
+# evidence it produced as an artifact; it never edits the proof inventory,
+# which docs/contracts/formal-verification.md owns.
 on:
   workflow_dispatch:
 concurrency:
