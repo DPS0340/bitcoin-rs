@@ -694,11 +694,6 @@ impl Chainstate {
         )
     }
 
-    /// Acquires a shared block-tree guard.
-    pub fn read_block_tree(&self) -> RwLockReadGuard<'_, BlockTree> {
-        self.block_tree.read()
-    }
-
     /// Fixture-only writable header-tip cell. Not present in production builds.
     #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
