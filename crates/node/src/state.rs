@@ -11,6 +11,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::bail;
 use bitcoin_rs_chain::BlockBodySource;
+#[cfg(any(test, feature = "test-seam"))]
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_chainstate::events::ChainEventPublisher;
 #[cfg(test)]
@@ -21,6 +22,7 @@ use bitcoin_rs_index::runtime::OpenDerivedIndex;
 use bitcoin_rs_index::runtime::REDB_BATCH_LIMITS;
 use bitcoin_rs_index::runtime::open_derived_index_store_on_worker;
 use bitcoin_rs_mempool::Mempool;
+#[cfg(any(test, feature = "test-seam"))]
 use bitcoin_rs_primitives::Block;
 use bitcoin_rs_rpc::context::PruneService;
 use bitcoin_rs_storage::KvStore;
@@ -153,6 +155,7 @@ impl NodeState {
     }
 
     /// Returns the configured storage backend that was opened.
+    #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub const fn storage_kind(&self) -> &'static str {
         self.storage.kind()
@@ -164,6 +167,7 @@ impl NodeState {
     /// Crash-recovery test seam: exposes the undo/marker store so harnesses
     /// can arm and inspect disconnect markers. Not a supported mutation
     /// surface for node owners.
+    #[cfg(any(test, feature = "test-seam"))]
     #[doc(hidden)]
     #[must_use]
     pub fn undo_store(&self) -> Arc<dyn bitcoin_rs_chainstate::UndoStore> {
@@ -175,6 +179,7 @@ impl NodeState {
     /// Crash-recovery test seam: exposes the durable head store so
     /// harnesses can read the commit point. Not a supported mutation
     /// surface for node owners.
+    #[cfg(any(test, feature = "test-seam"))]
     #[doc(hidden)]
     #[must_use]
     pub fn durable_head(&self) -> Arc<dyn bitcoin_rs_storage::DurableHeadStore> {
@@ -246,6 +251,7 @@ impl NodeState {
 
     /// Returns a cloned `Sender` that the P2P listener pushes inbound
     /// blocks into for verification and relay.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn inbound_blocks_sender(&self) -> Sender<bitcoin_rs_p2p::InboundBlock> {
         self.p2p.inbound_blocks_sender()
     }
@@ -313,6 +319,7 @@ impl NodeState {
     /// Holds the chain transition through follower dispatch (`ARCH-07`).
     /// A post-commit settlement failure remains distinguishable in
     /// [`crate::ConnectMutationError`] and retains the authoritative outcome.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_block(
         &self,
         block: &Block,
