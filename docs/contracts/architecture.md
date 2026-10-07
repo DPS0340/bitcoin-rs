@@ -299,8 +299,10 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   `P2pService` directly (querying the P2P-owned peer table, traffic counters,
   ban list, added-node list, and network-active latch, and invoking service
   control methods for bans, added nodes, network-active toggling, and
-  disconnections). RPC receives no raw writable P2P handles, and there is no
-  parallel RPC-local network-state projection or duplicate mutation authority.
+  disconnections). RPC no longer receives raw handles for bans, added nodes,
+  the network-active latch, or the outbound dial channel; the peer table stays
+  as a read view, and there is no parallel RPC-local network-state projection
+  or duplicate mutation authority.
 - `MempoolGateway` owns the process mempool handle; `NodeState::mempool` is a
   read/composition capability borrowed from that gateway, not a parallel
   retained `Arc`. Gateway interning remains the public one-gateway-per-pool

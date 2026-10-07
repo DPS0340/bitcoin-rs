@@ -636,48 +636,23 @@ mod addnode_validation_tests {
         let result = addnode(&ctx, &json!(["127.0.0.1:8333", "add"]));
         assert!(result.is_ok());
         assert_eq!(ctx.network.p2p.added_nodes().as_slice(), &[persisted]);
-        assert!(
-            ctx.network
-                .p2p
-                .outbound_receiver()
-                .lock()
-                .try_recv()
-                .is_err()
-        );
 
         ctx.network.p2p.set_network_active(true);
-        assert!(
-            ctx.network
-                .p2p
-                .outbound_receiver()
-                .lock()
-                .try_recv()
-                .is_err()
-        );
         let result = addnode(&ctx, &json!(["127.0.0.2:8333", "onetry"]));
         assert!(result.is_ok());
-        let queued = bitcoin_rs_p2p::OutboundDial::pinned(SocketAddr::from(([127, 0, 0, 2], 8333)));
-        assert_eq!(
-            ctx.network.p2p.outbound_receiver().lock().try_recv().ok(),
-            Some(queued)
-        );
     }
 
     #[test]
-    fn addnode_add_sends_outbound_request() {
+    fn addnode_add_persists_node() {
         let ctx = Arc::new(Context::new());
         let result = addnode(&ctx, &json!(["127.0.0.1:8333", "add"]))
             .unwrap_or_else(|err| panic!("addnode failed: {err}"));
 
         assert!(result.is_null());
-        let Ok(sent) = ctx.network.p2p.outbound_receiver().lock().try_recv() else {
-            panic!("addnode did not send outbound request");
-        };
-        let queued = bitcoin_rs_p2p::OutboundDial::pinned(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            8333,
-        )));
-        assert_eq!(sent, queued);
+        assert_eq!(
+            ctx.network.p2p.added_nodes().as_slice(),
+            &[SocketAddr::from(([127, 0, 0, 1], 8333))]
+        );
     }
 
     #[test]
@@ -706,7 +681,6 @@ mod addnode_validation_tests {
             result,
             Err(RpcError::Internal(message)) if message == "p2p outbound queue full"
         ));
-        assert_eq!(p2p.outbound_receiver().lock().try_iter().count(), 1);
     }
 
     #[test]
@@ -753,15 +727,7 @@ mod addnode_validation_tests {
             result,
             Err(RpcError::InvalidParams("node is banned"))
         ));
-        assert!(ctx.network.p2p.added_nodes().is_empty());
-        assert!(
-            ctx.network
-                .p2p
-                .outbound_receiver()
-                .lock()
-                .try_recv()
-                .is_err()
-        );
+        assert_eq!(ctx.network.p2p.added_nodes().as_slice(), &[]);
     }
 
     #[test]
@@ -908,7 +874,7 @@ mod admin_rpc_tests {
             Some("10.0.0.1/32")
         );
         assert!(setban(&ctx, &json!(["10.0.0.1:8333", "remove"])).is_ok());
-        assert!(ctx.network.p2p.banned().is_empty());
+        assert_eq!(ctx.network.p2p.banned().as_slice(), &[]);
     }
 
     #[test]
@@ -1070,7 +1036,7 @@ mod ban_state_tests {
         let ctx = Arc::new(Context::new());
         setban_ok(&ctx, "192.168.1.1", "add");
         clearbanned_ok(&ctx);
-        assert!(ctx.network.p2p.banned().is_empty());
+        assert_eq!(ctx.network.p2p.banned().as_slice(), &[]);
     }
 
     #[test]

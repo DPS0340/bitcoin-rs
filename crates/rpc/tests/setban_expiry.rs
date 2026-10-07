@@ -53,7 +53,7 @@ fn overflow_does_not_create_a_permanent_ban() {
     for absolute in [false, true] {
         let handler = handler();
         assert_invalid_expiry(&handler, "192.0.2.1", absolute);
-        assert!(handler.context().network.p2p.banned().is_empty());
+        assert_eq!(handler.context().network.p2p.banned().as_slice(), &[]);
     }
 }
 
@@ -157,7 +157,7 @@ fn assert_past_absolute_expiry(handler: &Handler, target: &str) {
 fn past_absolute_expiry_does_not_create_a_ban() {
     let handler = handler();
     assert_past_absolute_expiry(&handler, "192.0.2.1");
-    assert!(handler.context().network.p2p.banned().is_empty());
+    assert_eq!(handler.context().network.p2p.banned().as_slice(), &[]);
 }
 
 #[test]

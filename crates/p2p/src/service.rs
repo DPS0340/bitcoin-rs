@@ -732,12 +732,6 @@ impl P2pService {
         self.outbound_tx.clone()
     }
 
-    /// Returns the service-owned outbound request receiver.
-    #[must_use]
-    pub fn outbound_receiver(&self) -> Arc<Mutex<Receiver<OutboundDial>>> {
-        Arc::clone(&self.outbound_rx)
-    }
-
     /// Returns configured addnode add addresses.
     #[must_use]
     pub fn added_nodes(&self) -> Vec<SocketAddr> {
@@ -1977,5 +1971,68 @@ mod tests {
             addr(4),
             "a real automatic excess still retires its newest aged peer"
         );
+    }
+
+    #[test]
+    fn add_node_enqueues_and_respects_queue_capacity() {
+        let service = P2pService::new(
+            P2pServiceConfig {
+                outbound_queue_limit: 1,
+                ..P2pServiceConfig::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        let addr1: SocketAddr = "127.0.0.1:8333".parse().expect("addr");
+        let addr2: SocketAddr = "127.0.0.2:8333".parse().expect("addr");
+
+        assert!(service.add_node(addr1, true).is_ok());
+        assert_eq!(service.added_nodes().as_slice(), &[addr1]);
+        let dial = service.outbound_rx.lock().try_recv().expect("recv");
+        assert_eq!(dial, OutboundDial::pinned(addr1));
+
+        service
+            .outbound_tx
+            .try_send(OutboundDial::pinned(addr1))
+            .expect("send");
+
+        assert_eq!(
+            service.add_node(addr2, false),
+            Err(P2pControlError::QueueFull)
+        );
+
+        assert!(service.add_node(addr2, true).is_ok());
+        assert_eq!(service.added_nodes().as_slice(), &[addr1, addr2]);
+    }
+
+    #[test]
+    fn add_node_inactive_skips_queueing() {
+        let service = P2pService::new(
+            P2pServiceConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        service.set_network_active(false);
+        let addr: SocketAddr = "127.0.0.1:8333".parse().expect("addr");
+        assert!(service.add_node(addr, true).is_ok());
+        assert_eq!(service.added_nodes().as_slice(), &[addr]);
+        assert!(service.outbound_rx.lock().try_recv().is_err());
+    }
+
+    #[test]
+    fn add_node_rejects_banned_address() {
+        let service = P2pService::new(
+            P2pServiceConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let subnet: crate::IpSubnet = "127.0.0.0/24".parse().expect("subnet");
+        service.set_ban(crate::BannedSubnet {
+            subnet,
+            ban_created: SystemTime::now(),
+            banned_until: None,
+            reason: String::new(),
+        });
+        let addr: SocketAddr = "127.0.0.1:8333".parse().expect("addr");
+        assert_eq!(service.add_node(addr, true), Err(P2pControlError::Banned));
+        assert_eq!(service.added_nodes().as_slice(), &[]);
+        assert!(service.outbound_rx.lock().try_recv().is_err());
     }
 }
