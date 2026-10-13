@@ -82,7 +82,8 @@ stage.
 | Shipped | End-to-end interoperability with an unmodified external consumer; measured resource cost; docs and status tables updated in the same change-set. | Promoted rows in `ecosystem-compat.toml` and the owning status inventories. |
 
 For P2P surfaces, "shipped" additionally requires the live Core evidence lane
-or an equivalent unmodified external consumer, per `ECO-09`. An in-tree test
+or an equivalent unmodified external consumer, per `ECO-08`, with observable
+protocol outcomes scoped by `ECO-09`. An in-tree test
 never upgrades external verification.
 
 Deferred is not a protocol failure: incompatibility, pruning limits, or weak
@@ -93,10 +94,11 @@ external adoption can justify postponement without a defect claim.
 The user-facing BIP support matrix lives in
 [../bip-support.md](../bip-support.md). Its rows follow `ECO-08`'s
 evidence-axis rules — implementation status and external verification stay
-separate axes; this matrix's `Shipped`/`Partial`/`Experimental`/`Planned`/
-`Unsupported` legend is its own implementation-status vocabulary, and an
-external-consumer run is always recorded in
-[api/ecosystem-compat.toml](../api/ecosystem-compat.toml), never here. Keep
+separate axes; the matrix uses compact support symbols for `Implemented`,
+`Partial`, `Experimental`, `Planned`, and `Unsupported`. `Implemented` means
+the stated capability exists in the merged tree, not that it has reached this
+policy's `Shipped` lifecycle stage. An external-consumer run is always
+recorded in [api/ecosystem-compat.toml](../api/ecosystem-compat.toml), never here. Keep
 the matrix updated when a BIP-related capability is added, promoted,
 materially changed, or removed — in the same change-set as the code.
 
@@ -104,11 +106,11 @@ Maintenance rules:
 
 - Verify every status against the merged default branch before publishing. A
   status is never read from a PR head or an open issue.
-- `Shipped` requires actual shipped behavior for the exact scope. `Compiled`,
-  `Enabled`, and `Externally Verified` are distinct claims; never conflate
-  them.
-- Open PRs and open issues do not count as shipped. Label them as pending or
-  experimental in the evidence column only.
+- Implementation support, lifecycle promotion, and external verification are
+  distinct claims. A support checkmark alone never establishes `Shipped` or
+  `Externally Verified`.
+- Open PRs and issues are `Planned` in the matrix. Reserve `Experimental` for
+  implementations already in the merged tree that are default-off or draft-pinned.
 - Never publish an "X% of all BIPs supported" metric. There is no meaningful
   single denominator: many BIPs are wallet-only, informational, or inapplicable
   to a full node. Distinguish implemented, applicable-but-unsupported, and
@@ -123,10 +125,11 @@ in each issue:
 
 - **#1502 BIP157/158 compact filters.** Optional light-client service. Not a
   consensus or wallet-architecture requirement; Esplora/ScriptIndex remains the
-  default self-hosting path. Class: application-layer. Stage: Experimental
-  (in-flight PR). Promotion requires an unmodified external light client on
-  regtest, Core filter vectors for spend-heavy blocks, and measured default-off
-  overhead. This is a re-evaluation of the #143 removal decision; it stands
+  default self-hosting path. Class: application-layer. Stage: Research
+  (in-flight PR; Planned in the merged-tree matrix). Promotion requires an
+  unmodified external light client on regtest, Core filter vectors for
+  spend-heavy blocks, and measured default-off overhead. This is a
+  re-evaluation of the #143 removal decision; it stands
   only with a real consumer, because #257 removed a speculative re-entry.
 - **#1491 BIP352 Silent Payments.** Optional, keyless tweak service over
   existing chain data. Wallet scan keys and per-user history never enter the

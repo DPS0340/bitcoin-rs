@@ -15,7 +15,7 @@ The decoded command inventory is owned by `crates/p2p/src/compat.rs` (`COMMANDS`
 | Reference implementation | Bitcoin Core |
 | Pinned version | **31.1** (`crates/p2p/src/compat.rs::PINNED_CORE_VERSION`) |
 | Protocol version advertised | `70016` (`crates/p2p/src/wire.rs::PROTOCOL_VERSION`) |
-| Transport | Legacy v1 envelope only; BIP324 v2 is not implemented (§7) |
+| Transport | Legacy v1 by default; experimental BIP324 v2 is opt-in via `--v2transport` (§7) |
 
 ### 2.1 Version-Bump Rules
 
@@ -27,7 +27,8 @@ Re-pinning to a newer Core version requires all of:
 
 ## 3. Transport and Envelope
 
-- Bitcoin P2P **v1 envelope only** (`crates/p2p/src/wire.rs`): 4-byte network magic, 12-byte NUL-padded command, `u32` little-endian payload length, 4-byte checksum (first 4 bytes of double-SHA256 of the payload), then the payload.
+- Default Bitcoin P2P **v1 envelope** (`crates/p2p/src/wire.rs`): 4-byte network magic, 12-byte NUL-padded command, `u32` little-endian payload length, 4-byte checksum (first 4 bytes of double-SHA256 of the payload), then the payload.
+- Experimental BIP324 v2 is present behind `--v2transport` (off by default), with key exchange, packet framing and v1 fallback (`crates/p2p/src/transport.rs`, `bip324.rs`). Reference vectors and in-tree negotiation tests are implementation evidence, not recorded bidirectional Core interoperability (§7).
 - Payload bound: `MAX_MESSAGE_PAYLOAD = 32 MiB`. Core caps messages at 4 MiB; bitcoin-rs is deliberately looser so any protocol-maximal block fits. A peer that Core would disconnect for an oversized message may be accepted here; this is a bound difference, not a relay difference.
 - Network magic and default ports come from `bitcoin_rs_primitives::Network` and are asserted equal to Core's constants per network (mainnet 8333, testnet3 18333, testnet4 48333, signet 38333, regtest 18444).
 - Fork networks sharing a chain may override the message-start bytes with `--p2p-magic` (a bitcoin-rs extension; requires `--network mainnet` semantics and explicit `--connect` peers). Not a Core option; recorded as extension, not parity.
@@ -201,7 +202,7 @@ issued through `GetRequestsToSend` in `SendMessages` (`net_processing.cpp:6206`)
 TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
 `net_processing.cpp:319` under the `INVENTORY_BROADCAST_*` delays at `:163-166`):
 
-1. **BIP324 v2 transport**: not implemented. We speak v1 only; Core 31 accepts v1 peers.
+1. **BIP324 v2 transport**: experimental, default-off implementation. V1 remains the default; Core 31 accepts v1 peers. Promotion requires a recorded live bidirectional Core 31.1 run proving v2 in both directions; the external-evidence inventory does not yet claim that qualification (issue #1503).
 2. **BIP330 `sendtxrcncl`**: not implemented; it is the one Core 31 command missing from our 36-command table. Decoded as `Unknown`: ignored from a ready peer (Core ignores unknown commands too), disconnected before readiness. Core whitelists it during handshake, so the only affected topology is a Core peer *dialing* bitcoin-rs with `-txreconciliation=1`. The supported topology — bitcoin-rs dials Core, Core sees an inbound peer — never receives it, because Core sends `sendtxrcncl` to outbound peers only.
 3. **Proactive block announcements**: implemented for newly committed active tips. Ready peers receive unsolicited BIP152 high-bandwidth compact blocks (up to 3 peers when parent is known and tx relay is active), BIP130 headers (up to 8 blocks when anchored to the active chain), or fallback to single-block `inv` (`MSG_BLOCK`). Stale tips across reorgs are discarded and intermediate tips are coalesced under queue backpressure.
 4. **Address management**: one P2P-owned `AddressBook` retains canonical
