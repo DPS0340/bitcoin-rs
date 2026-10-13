@@ -1332,6 +1332,26 @@ mod tests {
     use alloc::sync::Arc;
     use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
+    // CONTRACT: docs/contracts/external-api.md#API-26
+    #[test]
+    fn fee_projection_preserves_the_exact_relay_floor() {
+        // A 1 sat/vB rate must project to exactly the f64 1.0 the endpoint
+        // publishes, not a rounding artefact such as 1.0000000000000002.
+        // Both `/fee-estimates` and `estimatesmartfee` share this helper, so
+        // the assertion guards the one arithmetic path they cannot diverge
+        // on.
+        assert_eq!(
+            sat_per_kvb_to_sat_per_vbyte(1_000).to_bits(),
+            1.0_f64.to_bits(),
+            "1 sat/VB (1,000 sat/kvB) must project to the exact f64 1.0"
+        );
+        assert_eq!(
+            sat_per_kvb_to_sat_per_vbyte(1_000),
+            sat_to_btc(1_000) * 100_000.0,
+            "the projection must be the same arithmetic estimatesmartfee uses"
+        );
+    }
+
     #[test]
     fn estimatesmartfee_reports_unavailable_when_estimator_has_no_history() {
         let ctx = Arc::new(Context::new());

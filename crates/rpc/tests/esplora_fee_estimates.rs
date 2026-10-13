@@ -14,7 +14,6 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_rpc::Handler;
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_rpc::esplora::{Surface, route};
-use sonic_rs::JsonValueTrait as _;
 
 /// vsize stamped on every seeded entry so the fee rate is deterministic.
 const VSIZE: u32 = 100;
@@ -180,10 +179,16 @@ fn fee_estimates_come_from_one_coherent_mempool_view() {
         "fixture must answer at least one target"
     );
 
-    let pool = ctx.mempool.gateway.read();
+    // The whole map must agree with ONE view of the pool. The endpoint takes
+    // a single guard for all targets, so no concurrent writer can slip
+    // between two targets and make them disagree; comparing every target
+    // against one fresh read therefore holds for the single-view
+    // implementation and would fail for the old per-target dispatch, which
+    // could observe the pool at 28 different revisions.
+    let observed_at = ctx.mempool.gateway.read();
     for (target, observed) in &parsed {
         let target: u32 = target.parse().expect("target keys are decimal");
-        let expected = pool
+        let expected = observed_at
             .estimate_fee_rate(target)
             .map(|rate| {
                 f64::from(u32::try_from(rate.as_sat_per_kvb()).unwrap_or(u32::MAX)) / 100_000_000.0
@@ -199,9 +204,21 @@ fn fee_estimates_come_from_one_coherent_mempool_view() {
 
 #[test]
 #[expect(clippy::expect_used, reason = "fixture invariants, not policy")]
-fn fee_estimates_match_the_rpc_surface_rate_for_every_target() {
-    // The Esplora map is a projection of the same estimator answer
-    // `estimatesmartfee` returns; both must agree target for target.
+fn fee_estimates_never_mix_two_pool_revisions() {
+    // The concrete defect of #1568: the endpoint dispatched `estimatesmartfee`
+    // once per target, each taking its own mempool read guard, so a writer
+    // running during the request could make two targets in one response come
+    // from different revisions. A response built from ONE guard cannot do
+    // that.
+    //
+    // Make the writer OSCILLATE — admit confirmed fee history, then clear it
+    // — so the estimator's answers move in both directions. A response that
+    // straddled two revisions then shows some targets above and some below a
+    // single read taken afterwards. A response from one coherent view is
+    // monotone against a single later read, because the pool only ever sits
+    // at one revision for the whole response.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let ctx = Arc::new(Context::new());
     admit_batch(&ctx, LOW_FEE_SATS, ENTRY_HEIGHT);
     connect_block(&ctx, &[], &[], MISS_HEIGHT);
@@ -210,23 +227,79 @@ fn fee_estimates_match_the_rpc_surface_rate_for_every_target() {
     let high_refs: Vec<&Tx> = highs.iter().collect();
     connect_block(&ctx, &high_refs, &high_txids, CONFIRM_HEIGHT);
 
-    let parsed = fee_estimates(&ctx);
-    let handler = Handler::new(Arc::clone(&ctx));
-    for (target, esplora) in &parsed {
-        let rpc = handler
-            .dispatch(
-                "estimatesmartfee",
-                &sonic_rs::json!([target.parse::<u64>().expect("decimal target")]),
-            )
-            .expect("estimatesmartfee must answer");
-        let rpc_sat_per_vbyte = rpc
-            .get("feerate")
-            .and_then(sonic_rs::JsonValueTrait::as_f64)
-            .map(|btc_per_kvb| btc_per_kvb * 100_000.0)
-            .expect("a target the estimator answers must carry feerate");
-        assert_eq!(
-            *esplora, rpc_sat_per_vbyte,
-            "Esplora and RPC must publish the same rate for target {target}"
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let ctx = Arc::clone(&ctx);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut round = 0_u64;
+            let mut live: Vec<Tx> = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let pool = ctx.mempool.gateway.pool();
+                let mut guard = pool.write();
+                if live.is_empty() {
+                    for index in 0_u64..2 {
+                        let tx = spend(1_000_000 + round * 16 + index);
+                        if guard
+                            .insert_entry(MempoolEntry::new(
+                                Arc::new(tx.clone()),
+                                VSIZE,
+                                HIGH_FEE_SATS + round,
+                                1,
+                                CONFIRM_HEIGHT,
+                                0,
+                            ))
+                            .is_ok()
+                        {
+                            live.push(tx);
+                        }
+                    }
+                } else {
+                    // Clear the added history so the estimator drops again.
+                    let txids: Vec<_> = live.iter().map(Tx::txid).collect();
+                    let refs: Vec<&Tx> = live.iter().collect();
+                    let clear_height =
+                        CONFIRM_HEIGHT + 10 + u32::try_from(round).unwrap_or(u32::MAX);
+                    let _ = guard.remove_for_block(&refs, &txids, clear_height);
+                    live.clear();
+                }
+                drop(guard);
+                round = round.wrapping_add(1);
+            }
+        })
+    };
+
+    let mut checked = 0_usize;
+    for _ in 0..512 {
+        let parsed = fee_estimates(&ctx);
+        if parsed.len() < 2 {
+            continue;
+        }
+        let single = ctx.mempool.gateway.read();
+        let mut above = 0_usize;
+        let mut below = 0_usize;
+        for (target, observed) in &parsed {
+            let target: u32 = target.parse().expect("target keys are decimal");
+            let Some(rate) = single.estimate_fee_rate(target) else {
+                continue;
+            };
+            let expected = f64::from(u32::try_from(rate.as_sat_per_kvb()).unwrap_or(u32::MAX))
+                / 100_000_000.0
+                * 100_000.0;
+            match observed.total_cmp(&expected) {
+                core::cmp::Ordering::Less => below += 1,
+                core::cmp::Ordering::Greater => above += 1,
+                core::cmp::Ordering::Equal => {}
+            }
+        }
+        assert!(
+            !(above > 0 && below > 0),
+            "a response mixed two pool revisions: {above} target(s) above and \
+             {below} below the same single read"
         );
+        checked += 1;
     }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread must join");
+    assert!(checked > 0, "the fixture must answer at least once");
 }
