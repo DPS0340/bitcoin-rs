@@ -2267,6 +2267,59 @@ mod tests {
     }
 
     #[test]
+    fn repeated_parent_inputs_resolve_from_one_lookup() {
+        // Issue #1569: `transaction_value` resolved each input's parent with a
+        // separate `prevout` lookup, so several inputs paying the same parent
+        // (or several transactions in one response sharing a parent) repeated
+        // the index lookup and decode. One projection must resolve each
+        // distinct parent once.
+        let parent = Tx {
+            version: 2,
+            inputs: Vec::new(),
+            outputs: (0_u32..3)
+                .map(|vout| TxOut {
+                    value: Amount::from_sat(500 + u64::from(vout)),
+                    script_pubkey: vec![0x51].into(),
+                })
+                .collect(),
+            lock_time: LockTime::ZERO,
+        };
+        // One child spending the SAME parent at three distinct outputs, so
+        // every input resolves through the one memoized parent lookup.
+        let mut child = transaction(
+            Some(OutPoint::new(parent.txid(), 0)),
+            TxOut {
+                value: Amount::from_sat(100),
+                script_pubkey: vec![0x52].into(),
+            },
+        );
+        for vout in 1_u32..3 {
+            child.inputs.push(TxIn {
+                previous_output: OutPoint::new(parent.txid(), vout),
+                script_sig: Vec::new().into(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            });
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut ctx = Context::new();
+        ctx.indexes.esplora_tx_index = Some(Arc::new(CountingTxIndex {
+            transactions: vec![parent],
+            calls: Arc::clone(&calls),
+        }));
+
+        let rendered = Projection::new(&ctx)
+            .transaction_value(&child, None)
+            .expect("shared-parent prevouts must render");
+        assert_eq!(rendered.vin.len(), 3, "all three inputs must render");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "one projection must resolve the shared parent exactly once"
+        );
+    }
+
+    #[test]
     fn stale_block_transactions_do_not_inherit_active_chain_status()
     -> Result<(), Box<dyn std::error::Error>> {
         // Null-prevout coinbase shape: a zero-input tx cannot be consensus

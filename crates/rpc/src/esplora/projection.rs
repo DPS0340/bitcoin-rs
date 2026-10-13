@@ -119,11 +119,59 @@ impl ScriptActivity {
 
 pub(super) struct Projection<'a> {
     pub(super) ctx: &'a Context,
+    /// Request-scoped parent-transaction memo, keyed by txid. An Esplora
+    /// response commonly renders several inputs that share one parent (and
+    /// several transactions that share a parent or block), so resolving each
+    /// parent once per request removes repeated index lookups, stored-
+    /// transaction decodes, and block reads. It never outlives the request:
+    /// the memo is dropped with the projection, carries no cross-request
+    /// state, and is not consulted for the chain snapshot, which every
+    /// route still fences through the shared view (WF-02).
+    parents: std::cell::RefCell<hashbrown::HashMap<Txid, Option<Arc<Tx>>>>,
 }
 
 impl<'a> Projection<'a> {
-    pub(super) const fn new(ctx: &'a Context) -> Self {
-        Self { ctx }
+    pub(super) fn new(ctx: &'a Context) -> Self {
+        Self {
+            ctx,
+            parents: std::cell::RefCell::new(hashbrown::HashMap::new()),
+        }
+    }
+
+    /// Resolves the parent transaction once per request, memoized by txid.
+    ///
+    /// PRE: `txid` names a transaction this node may hold (mempool or the
+    ///   transaction index).
+    /// POST: the parent transaction, or `None` when neither source has it and
+    ///   no error occurred; the first resolution's answer is reused for every
+    ///   later lookup of the same txid within this projection's lifetime.
+    /// INVARIANT: the memo is request-scoped and holds no chain authority —
+    ///   a caller that needs tip/generation correctness still fences through
+    ///   the shared view.
+    fn parent_transaction(&self, txid: &Txid) -> Result<Option<Arc<Tx>>, Response> {
+        if let Some(cached) = self.parents.borrow().get(txid) {
+            return Ok(cached.clone());
+        }
+        let resolved = self.resolve_parent_transaction(txid)?;
+        self.parents.borrow_mut().insert(*txid, resolved.clone());
+        Ok(resolved)
+    }
+
+    /// The uncached resolution: mempool first, then the transaction index.
+    fn resolve_parent_transaction(&self, txid: &Txid) -> Result<Option<Arc<Tx>>, Response> {
+        if let Some(transaction) = self.ctx.mempool.gateway.read().transaction_by_txid(txid) {
+            return Ok(Some(transaction));
+        }
+        let index = self
+            .ctx
+            .indexes
+            .esplora_tx_index
+            .as_ref()
+            .ok_or_else(|| service_unavailable("transaction lookup index is disabled"))?;
+        match index.transaction(txid).map_err(query_error)? {
+            Some(transaction) => Ok(Some(Arc::new(transaction))),
+            None => Ok(None),
+        }
     }
 
     pub(super) fn required_transaction(
@@ -282,31 +330,18 @@ impl<'a> Projection<'a> {
     }
 
     pub(super) fn prevout(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, Response> {
-        if let Some(transaction) = self
-            .ctx
-            .mempool
-            .gateway
-            .read()
-            .transaction_by_txid(&outpoint.txid)
-        {
-            return Ok(transaction
-                .outputs
-                .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
-                .cloned());
-        }
-        let index = self
-            .ctx
-            .indexes
-            .esplora_tx_index
-            .as_ref()
-            .ok_or_else(|| service_unavailable("transaction lookup index is disabled"))?;
-        let Some(transaction) = index.transaction(&outpoint.txid).map_err(query_error)? else {
-            return Ok(None);
-        };
-        Ok(transaction
-            .outputs
-            .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
-            .cloned())
+        // Every input of the same parent transaction resolves from the one
+        // request-scoped lookup: a response that renders several inputs
+        // paying the same parent (or several transactions from one block)
+        // no longer repeats the index lookup, decode, and any block read.
+        Ok(self
+            .parent_transaction(&outpoint.txid)?
+            .and_then(|transaction| {
+                transaction
+                    .outputs
+                    .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
+                    .cloned()
+            }))
     }
 
     pub(super) fn block_value(
