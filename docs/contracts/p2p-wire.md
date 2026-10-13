@@ -460,6 +460,26 @@ prefilter exemption.
   connection, `headerssync.cpp:155-163`); every other failure — bad proof of
   work, an impermitted difficulty transition, a commitment divergence, or
   the commitment and buffer bounds — disconnects the connection.
+- One outstanding locator per collecting connection: while a connection
+  owns a live collection, the only `getheaders` that may address it is that
+  state's own cursor continuation. The scheduler's tree-locator requests
+  (`request_headers_from_best_peer`, `request_headers_from_eligible`) and
+  the capability and eviction probes skip such a connection, and
+  `send_getheaders_tracked` refuses any other locator outright. Without
+  this, a request sent after the `getheaders` deadline expired rewinds to
+  the tree locator — genesis while the fork is unextended — and the
+  replayed first page fails the live state's continuity check, spends the
+  verified collection, and leaves every later page rejected as
+  `MissingParent` because the collected prefix never reached the tree.
+- A continuation that goes unanswered past the deadline retires the
+  connection together with its half-verified collection, and the next sync
+  starts fresh on another connection. The deadline is armed by the send and
+  cleared by the answering batch, so a slow-but-answering connection is
+  never blamed; nothing is retained for a punished chain.
+- A batch delivered by a connection that has since been replaced is
+  ignored: it neither opens or advances a collection nor reaches
+  admission, because a predecessor's headers must not attach after the
+  operator moved past it.
 - The serving side is the mirror rule: below the network's assumed work the
   node answers `getheaders` with the empty response
   (`ActiveChainQuery::headers_after`, `net_processing.cpp:3010-3018`), so a
@@ -469,8 +489,11 @@ Proof: `crates/p2p/src/sync/tests/headers_presync.rs` pins the presync
 lifecycle end to end — first-pass commitment collection, the work-floor
 crossing that restarts the sync at the fork point, commitment divergence
 on a substituted redownload header, salted-commitment spends, the benign
-lost-continuity break, and the disconnects every other failure costs the
-connection. `crates/p2p/benches/headers_presync.rs` measures the hashing
+lost-continuity break, the disconnects every other failure costs the
+connection, the tree-locator refusal that protects a live cursor, the
+deadline arming and the retirement it drives, a late answer that still
+feeds the live state, and the ignored page from a replaced connection.
+`crates/p2p/benches/headers_presync.rs` measures the hashing
 bound the first pass pays per page.
 
 ### `P2P-11`: BIP324 v2 transport negotiation
