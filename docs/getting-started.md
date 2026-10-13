@@ -20,7 +20,7 @@ Use a lane deliberately:
 | Minimal native | `cargo build --locked --release -p bitcoin-rs --no-default-features --features fjall` | One storage backend, optional extensions off |
 | Kernel | `CARGO_TARGET_DIR=target/oracle cargo build --locked --release -p bitcoin-rs --features kernel` | Optional `bitcoinkernel` validation/oracle lane |
 
-Keep the kernel lane in a separate `CARGO_TARGET_DIR` when proving a kernel-free build. BIP324 is target work only; there is currently no `bip324` Cargo feature.
+Keep the kernel lane in a separate `CARGO_TARGET_DIR` when proving a kernel-free build. BIP324 v2 ships behind `--v2transport` (off by default); see [bip-support.md](bip-support.md).
 
 ## Configuration
 
