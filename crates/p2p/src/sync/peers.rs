@@ -677,22 +677,31 @@ impl BlockSync {
     /// INVARIANT: only a state that actually owes a continuation can
     ///   expire; the deadline is armed by the send and cleared by the
     ///   answering batch, so a slow-but-answering peer is never blamed.
+    ///
+    /// The caller runs this after the tick's header drain, so a batch the
+    /// connection already delivered settles its request (clearing the
+    /// deadline) before any retirement decision reads it.
     pub(super) fn sweep_presync_timeouts(&self, now: Instant) {
         let expired: Vec<PeerSource> = {
-            let scheduler = self.scheduler.lock();
-            scheduler
+            let mut scheduler = self.scheduler.lock();
+            let timeout = super::HEADER_REQUEST_TIMEOUT;
+            let expired: Vec<PeerSource> = scheduler
                 .headers_sync
                 .iter()
-                .filter(|(_, state)| state.continuation_expired(now, super::HEADER_REQUEST_TIMEOUT))
+                .filter(|(_, state)| state.continuation_expired(now, timeout))
                 .map(|(source, _)| *source)
-                .collect()
+                .collect();
+            // The decision and the removal share one lock, so no state can
+            // be removed after the batch answering it settled the request:
+            // the map's only writers run on this thread, and none of them
+            // can interleave between these two statements.
+            for source in &expired {
+                scheduler.headers_sync.remove(source);
+            }
+            expired
         };
         for source in expired {
-            let settled = {
-                let mut scheduler = self.scheduler.lock();
-                scheduler.headers_sync.remove(&source).is_some()
-            };
-            if settled && self.peer_table.disconnect_source(source) {
+            if self.peer_table.disconnect_source(source) {
                 metrics::counter!("node.sync.presync_timeout_disconnects").increment(1);
                 tracing::warn!(
                     peer_addr = %source.addr,

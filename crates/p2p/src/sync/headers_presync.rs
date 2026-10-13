@@ -738,6 +738,26 @@ impl HeadersSyncState {
         self.continuation_requested_at = None;
     }
 
+    /// Whether this sync owes the wire exactly the continuation it last
+    /// sent: the state owns an unanswered request.
+    ///
+    /// PRE: none.
+    /// POST: `true` between a sent continuation and the batch answering it,
+    ///   `false` otherwise (including a spent state).
+    /// INVARIANT: one owed request at a time — the connection's own gate.
+    #[must_use]
+    pub(crate) const fn owing_continuation(&self) -> bool {
+        self.continuation_requested_at.is_some()
+    }
+
+    /// The instant this sync's continuation left for the wire, `None` while
+    /// no request is owed. Lets a caller measure the deadline from the send
+    /// rather than from an observation taken around it.
+    #[must_use]
+    pub const fn continuation_requested_at(&self) -> Option<Instant> {
+        self.continuation_requested_at
+    }
+
     /// Whether the connection let its continuation go unanswered past
     /// `timeout`: the state owns a request that aged out.
     ///

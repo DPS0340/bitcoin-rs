@@ -839,6 +839,32 @@ impl BlockSync {
         self.send_getheaders_tracked(source, our_height, target_height, locator, true)
     }
 
+    /// The untracked send, reachable by tests so the probe gate can be
+    /// pinned without a live frontier to drive the eviction sweep.
+    #[cfg(test)]
+    pub(super) fn send_getheaders_untracked_for_test(
+        &self,
+        source: crate::PeerSource,
+        our_height: u32,
+        locator_tip_hash: Hash256,
+    ) -> GetheadersOutcome {
+        let target_height = self
+            .peer_table
+            .sessions()
+            .iter()
+            .find(|session| session.addr == source.addr)
+            .map_or(i32::MAX, |session| {
+                headers_target_height(session.headers_horizon, session.info.as_ref())
+            });
+        self.send_getheaders_tracked(
+            source,
+            our_height,
+            target_height,
+            vec![locator_tip_hash],
+            false,
+        )
+    }
+
     /// `track` registers the request in the singleton `header_request` slot;
     /// a probe that must not displace the frontier's pending request sends
     /// untracked — its answer arrives as ordinary inbound headers.
@@ -857,25 +883,40 @@ impl BlockSync {
         let now = Instant::now();
         // One outstanding locator per connection: while a download-twice
         // sync owns this connection's chain, only that state's own cursor
-        // continuation may address it. Any other locator's answer — a
-        // tree-locator replay from genesis — would fail the state's
-        // continuity check and restart the whole sync, and the next pages
-        // would then be rejected as `MissingParent` because the collected
-        // prefix never reached the tree (#1567).
-        if self
-            .scheduler
-            .lock()
-            .headers_sync
-            .get(&source)
-            .is_some_and(|state| state.cursor_hash() != Some(locator_tip_hash))
+        // continuation may address it — and only through the tracked
+        // continuation path. Any other request's answer would fail the
+        // state's continuity check and restart the whole sync: a
+        // tree-locator replay from genesis (the locator while the fork is
+        // unextended), a repeated continuation the state never asked for,
+        // and an untracked probe (`track == false`, which the singleton
+        // suppression below cannot cover) whose first hash happens to equal
+        // the cursor. Every later page is then rejected as `MissingParent`
+        // because the collected prefix never reached the tree (#1567).
+        if !track {
+            if self.scheduler.lock().headers_sync.contains_key(&source) {
+                tracing::trace!(
+                    peer_addr = %source.addr,
+                    our_height,
+                    target_height,
+                    "block sync: untracked probe suppressed; the connection's presync owns its cursor",
+                );
+                return GetheadersOutcome::Failed;
+            }
+        } else if let Some(state) = self.scheduler.lock().headers_sync.get(&source)
+            && state.owing_continuation()
         {
-            tracing::trace!(
-                peer_addr = %source.addr,
-                our_height,
-                target_height,
-                "block sync: getheaders suppressed; the connection's presync owns its locator",
-            );
-            return GetheadersOutcome::Failed;
+            // The state owes exactly the continuation it last sent: a
+            // tracked request carrying anything else is the scheduler's
+            // tree-locator path racing the deadline.
+            if state.cursor_hash() != Some(locator_tip_hash) {
+                tracing::trace!(
+                    peer_addr = %source.addr,
+                    our_height,
+                    target_height,
+                    "block sync: getheaders suppressed; the connection's presync owns its locator",
+                );
+                return GetheadersOutcome::Failed;
+            }
         }
         if self.has_pending_getheaders(source, locator_tip_hash, target_height, now) {
             tracing::trace!(

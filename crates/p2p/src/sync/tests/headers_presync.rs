@@ -8,6 +8,7 @@ use super::behavior_5::deliver_headers;
 use super::behavior_5::next_locator;
 use bitcoin_rs_primitives::Hash256;
 
+use super::super::GetheadersOutcome;
 use super::super::SyncBudget;
 use super::super::default_sync_budget;
 use super::super::headers_presync::HeadersSyncPhase;
@@ -772,32 +773,34 @@ fn continuation_deadline_tracks_the_sent_request_only() {
 
     // A fresh state owes no request: nothing can expire.
     deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source).or_fail("page");
+    let before_tick = Instant::now();
     sync.tick();
-    let now = Instant::now();
     let timeout = Duration::from_secs(5);
+    // The deadline is measured from the send inside the tick, so any
+    // boundary instant derived from `before_tick` sits strictly inside the
+    // window regardless of how long the tick took.
+    let send_at = with_sync_state(&sync, source, HeadersSyncState::continuation_requested_at)
+        .or_fail("state")
+        .or_fail("the page must have armed a continuation");
     assert!(
-        !with_sync_state(&sync, source, |state| state
-            .continuation_expired(now, timeout))
-        .or_fail("state"),
-        "a collection whose page just arrived must not read as expired"
+        send_at >= before_tick,
+        "the deadline must be armed by the send, not before it"
     );
-    // The continuation that the batch asked for arms exactly one deadline.
-    assert!(
-        with_sync_state(&sync, source, |state| {
-            state.continuation_expired(now + timeout + Duration::from_millis(1), timeout)
-        })
-        .or_fail("state"),
-        "the sent continuation must expire past the deadline"
-    );
-    let just_inside = (now + timeout)
+    let just_inside = (send_at + timeout)
         .checked_sub(Duration::from_millis(1))
         .or_fail("clock underrun");
     assert!(
-        !with_sync_state(&sync, source, |state| {
-            state.continuation_expired(just_inside, timeout)
-        })
+        !with_sync_state(&sync, source, |state| state
+            .continuation_expired(just_inside, timeout))
         .or_fail("state"),
         "the sent continuation must not expire before the deadline"
+    );
+    assert!(
+        with_sync_state(&sync, source, |state| {
+            state.continuation_expired(send_at + timeout + Duration::from_millis(1), timeout)
+        })
+        .or_fail("state"),
+        "the sent continuation must expire past the deadline"
     );
 }
 
@@ -959,6 +962,107 @@ fn delayed_presync_page_still_feeds_the_live_state() -> TestResult {
         sync_phase(&sync, source),
         Some(HeadersSyncPhase::Presync),
         "a late page must not restart or spend the collection"
+    );
+    Ok(())
+}
+
+/// An untracked probe may not address a collecting connection either: the
+/// singleton suppression cannot cover it, and its answer would break the
+/// live cursor exactly as a tracked tree-locator request does (#1567).
+#[test]
+fn untracked_probe_never_addresses_a_collecting_connection() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, rx) = connect(&peers, 9715, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+    let _ = rx.try_recv()?;
+
+    let chain = chain_on(&genesis, 0, 2 * PAGE + 500);
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "fixture: the page must collect under presync"
+    );
+    let _continuation = next_locator(&rx)
+        .ok_or_else(|| std::io::Error::other("the presync continuation was not sent"))?;
+
+    // The eviction probe carries the collecting state's own cursor hash but
+    // is untracked; the live collection must still refuse it.
+    let cursor = with_sync_state(&sync, source, HeadersSyncState::cursor_hash)
+        .or_fail("state")
+        .or_fail("the collection must have a cursor");
+    let probe = sync.send_getheaders_untracked_for_test(source, 0, cursor);
+    assert_eq!(
+        probe,
+        GetheadersOutcome::Failed,
+        "an untracked probe must not reach a collecting connection"
+    );
+    assert!(
+        next_locator(&rx).is_none(),
+        "the probe must not have left the node"
+    );
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "the collection must survive the suppressed probe"
+    );
+    Ok(())
+}
+
+/// A batch already queued when the deadline elapses settles the request
+/// before the sweep reads it: the tick drains headers first, so a delivered
+/// answer is never punished as silence.
+#[test]
+fn queued_answer_settles_before_the_timeout_sweep() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, rx) = connect(&peers, 9716, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+    let _ = rx.try_recv()?;
+
+    let chain = chain_on(&genesis, 0, 2 * PAGE + 500);
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    let _continuation = next_locator(&rx)
+        .ok_or_else(|| std::io::Error::other("the presync continuation was not sent"))?;
+
+    // Age the sent continuation, then queue its answer: the next tick's
+    // drain must settle the request before the sweep could retire it.
+    let stale = Instant::now()
+        .checked_sub(Duration::from_secs(6))
+        .or_fail("clock underrun");
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get_mut(&source)
+            .is_some_and(|state| {
+                state.note_continuation_sent(stale);
+                true
+            }),
+        "fixture: the state must own the sent continuation"
+    );
+    deliver_headers(&inbound_headers_tx, chain[PAGE..2 * PAGE].to_vec(), source)?;
+    sync.tick();
+
+    assert!(
+        peers.is_connected(addr),
+        "a connection whose answer was already delivered must not be retired"
+    );
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "the delivered answer must keep the collection"
+    );
+    let cursor = with_sync_state(&sync, source, |state| state.next_locator()[0].to_le_bytes());
+    assert_eq!(
+        cursor,
+        Some(Hash256::from(chain[2 * PAGE - 1].compute_hash()).to_le_bytes()),
+        "the queued answer must extend the cursor"
     );
     Ok(())
 }

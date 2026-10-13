@@ -490,8 +490,9 @@ lifecycle end to end — first-pass commitment collection, the work-floor
 crossing that restarts the sync at the fork point, commitment divergence
 on a substituted redownload header, salted-commitment spends, the benign
 lost-continuity break, the disconnects every other failure costs the
-connection, the tree-locator refusal that protects a live cursor, the
-deadline arming and the retirement it drives, a late answer that still
+connection, the tree-locator refusal that protects a live cursor (tracked
+and untracked), the deadline arming and the retirement it drives, a queued
+answer that settles before the sweep reads it, a late answer that still
 feeds the live state, and the ignored page from a replaced connection.
 `crates/p2p/benches/headers_presync.rs` measures the hashing
 bound the first pass pays per page.
