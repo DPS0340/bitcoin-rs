@@ -64,9 +64,10 @@ Linked capability names lead to code or tests; notes link scope and evidence own
 
 | BIP | Capability | Support | External evidence | Notes |
 | :-- | :-- | :--: | :--: | :-- |
-| 32 | [BIP32 derivation](../crates/rpc/src/handlers/util.rs) | ✅ | — | Multipath/ranged descriptor addresses; no key custody |
+| 32 | [BIP32 derivation](../crates/rpc/src/handlers/util.rs) | ✅ | — | Ranged descriptor addresses; no key custody |
 | 173/350 | [Segwit addresses](../crates/rpc/src/convert.rs) | ✅ | — | Wallet-free script address rendering |
-| 379/380 | [Output descriptors](../crates/rpc/src/handlers/util.rs) | ✅ | — | getdescriptorinfo/deriveaddresses; scantxoutset rejects ranged/multipath forms |
+| 380 | [Output descriptors](../crates/rpc/src/handlers/util.rs) | ✅ | — | getdescriptorinfo/deriveaddresses; scantxoutset rejects ranged/multipath forms |
+| 389 | [Multipath descriptors](../crates/rpc/src/handlers/util.rs) | ✅ | — | Multipath key expressions in getdescriptorinfo/deriveaddresses; rejected by scantxoutset |
 | 352 | [Silent Payments](../crates/index/src/silent_payments.rs) | 🧪 | — | Opt-in library scan codec; [tweak service / thin index](https://github.com/gosuda/bitcoin-rs/issues/1491) remains planned; [docs](silent-payments.md) |
 
 ## Out of scope by policy
