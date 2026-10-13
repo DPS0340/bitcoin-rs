@@ -14,6 +14,7 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_rpc::Handler;
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_rpc::esplora::{Surface, route};
+use sonic_rs::JsonValueTrait as _;
 
 /// vsize stamped on every seeded entry so the fee rate is deterministic.
 const VSIZE: u32 = 100;
@@ -151,6 +152,81 @@ fn fee_estimates_projects_confirmed_history_to_sat_per_vbyte() {
         assert!(
             parsed.contains_key(target),
             "target {target} must be present, not omitted"
+        );
+    }
+}
+
+#[test]
+#[expect(clippy::expect_used, reason = "fixture invariants, not policy")]
+fn fee_estimates_come_from_one_coherent_mempool_view() {
+    // Issue #1568: the endpoint used to dispatch `estimatesmartfee` 28 times,
+    // each taking its own mempool read guard, so a concurrent pool change
+    // could mix estimates observed at different revisions inside one HTTP
+    // response. With history that answers several targets, every target in
+    // one response must be reproducible by one read of the pool taken AFTER
+    // the response — which is only true when the response itself came from a
+    // single coherent view.
+    let ctx = Arc::new(Context::new());
+    admit_batch(&ctx, LOW_FEE_SATS, ENTRY_HEIGHT);
+    connect_block(&ctx, &[], &[], MISS_HEIGHT);
+    let highs = admit_batch(&ctx, HIGH_FEE_SATS, MISS_HEIGHT);
+    let high_txids: Vec<_> = highs.iter().map(Tx::txid).collect();
+    let high_refs: Vec<&Tx> = highs.iter().collect();
+    connect_block(&ctx, &high_refs, &high_txids, CONFIRM_HEIGHT);
+
+    let parsed = fee_estimates(&ctx);
+    assert!(
+        !parsed.is_empty(),
+        "fixture must answer at least one target"
+    );
+
+    let pool = ctx.mempool.gateway.read();
+    for (target, observed) in &parsed {
+        let target: u32 = target.parse().expect("target keys are decimal");
+        let expected = pool
+            .estimate_fee_rate(target)
+            .map(|rate| {
+                f64::from(u32::try_from(rate.as_sat_per_kvb()).unwrap_or(u32::MAX)) / 100_000_000.0
+                    * 100_000.0
+            })
+            .expect("a target present in the response must estimate from the same view");
+        assert_eq!(
+            *observed, expected,
+            "target {target} must come from the response's one coherent view"
+        );
+    }
+}
+
+#[test]
+#[expect(clippy::expect_used, reason = "fixture invariants, not policy")]
+fn fee_estimates_match_the_rpc_surface_rate_for_every_target() {
+    // The Esplora map is a projection of the same estimator answer
+    // `estimatesmartfee` returns; both must agree target for target.
+    let ctx = Arc::new(Context::new());
+    admit_batch(&ctx, LOW_FEE_SATS, ENTRY_HEIGHT);
+    connect_block(&ctx, &[], &[], MISS_HEIGHT);
+    let highs = admit_batch(&ctx, HIGH_FEE_SATS, MISS_HEIGHT);
+    let high_txids: Vec<_> = highs.iter().map(Tx::txid).collect();
+    let high_refs: Vec<&Tx> = highs.iter().collect();
+    connect_block(&ctx, &high_refs, &high_txids, CONFIRM_HEIGHT);
+
+    let parsed = fee_estimates(&ctx);
+    let handler = Handler::new(Arc::clone(&ctx));
+    for (target, esplora) in &parsed {
+        let rpc = handler
+            .dispatch(
+                "estimatesmartfee",
+                &sonic_rs::json!([target.parse::<u64>().expect("decimal target")]),
+            )
+            .expect("estimatesmartfee must answer");
+        let rpc_sat_per_vbyte = rpc
+            .get("feerate")
+            .and_then(sonic_rs::JsonValueTrait::as_f64)
+            .map(|btc_per_kvb| btc_per_kvb * 100_000.0)
+            .expect("a target the estimator answers must carry feerate");
+        assert_eq!(
+            *esplora, rpc_sat_per_vbyte,
+            "Esplora and RPC must publish the same rate for target {target}"
         );
     }
 }

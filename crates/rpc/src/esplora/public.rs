@@ -17,7 +17,6 @@ use bitcoin_rs_primitives::{
     Block, Hash256, OutPoint, Tx, Txid, consensus_bytes, deserialize, unix_time_secs,
 };
 use serde_json::json;
-use sonic_rs::{JsonValueTrait as _, json as sonic_json};
 
 use super::http::{admission_error, query_error};
 use super::model::{
@@ -591,28 +590,27 @@ fn fee_estimates(handler: &Handler) -> Response {
     // CONTRACT: docs/contracts/external-api.md#API-26 — one horizon, honest
     // refusal. A target without enough admitted-and-confirmed history has no
     // answer: the entry is omitted from the map rather than fabricated as a
-    // 1 sat/vB floor, so a wallet can tell "no data" from "cheap". The
-    // dispatched `estimatesmartfee` feerate is the RPC surface's own
-    // `sat_to_btc` projection of the estimator's sat/kvB rate (see the
-    // util.rs handler); this endpoint is a consumer of that value, so the
-    // unit projection cannot drift between the two surfaces.
+    // 1 sat/vB floor, so a wallet can tell "no data" from "cheap".
+    //
+    // Every target is read from ONE coherent mempool view through the same
+    // typed estimator path the `estimatesmartfee` handler uses, so the
+    // endpoint cannot mix estimates observed at different pool revisions
+    // and cannot drift from the RPC surface's projection. The guard is
+    // released before the response is formatted.
+    let rates = {
+        let pool = handler.context().mempool.gateway.read();
+        crate::handlers::util::estimate_fee_rates_sat_per_vbyte(
+            &pool,
+            (1_u32..=25).chain([144, 504, 1008]),
+        )
+    };
     let mut values = serde_json::Map::new();
-    for target in (1_u32..=25).chain([144, 504, 1008]) {
-        if let Some(fee) = handler
-            .dispatch("estimatesmartfee", &sonic_json!([target]))
-            .ok()
-            .and_then(|v| v.get("feerate").and_then(sonic_rs::JsonValueTrait::as_f64))
-            .map(fee_rate_sat_per_vbyte)
-        {
-            values.insert(target.to_string(), json!(fee));
-        }
+    for (target, fee) in rates {
+        values.insert(target.to_string(), json!(fee));
     }
     json_ok(&values)
 }
 
-pub(super) fn fee_rate_sat_per_vbyte(btc_per_kvb: f64) -> f64 {
-    btc_per_kvb * 100_000.0
-}
 pub(super) fn summary(ctx: &Context, text: &str, address: Option<&str>) -> Response {
     parse_script(text).map_or_else(|r| r, |h| summary_for(ctx, h, address))
 }

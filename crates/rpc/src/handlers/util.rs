@@ -164,6 +164,43 @@ pub(crate) fn estimatesmartfee(ctx: &Arc<Context>, params: &Value) -> Result<Val
     }
 }
 
+/// Projects the estimator's sat/kvB answer to sat/vB by way of the same
+/// BTC/kvB value `estimatesmartfee` publishes, so the two surfaces are
+/// bit-identical and cannot drift.
+#[must_use]
+fn sat_per_kvb_to_sat_per_vbyte(sat_per_kvb: u64) -> f64 {
+    sat_to_btc(sat_per_kvb) * 100_000.0
+}
+
+/// One coherent estimator reading for every requested confirmation target.
+///
+/// PRE: `pool` is a read guard held by the caller for the whole set; the
+///   targets are the caller's own.
+/// POST: returns `(target, sat/vB rate)` for exactly the targets the
+///   estimator can answer, in the caller's order, with every rate read from
+///   that one view; a target without enough history is omitted rather than
+///   fabricated.
+/// INVARIANT: one estimator and one pool view back the whole set — the
+///   caller releases the guard before formatting its response. This is the
+///   same projection the `estimatesmartfee` handler applies, so the two
+///   surfaces cannot drift.
+#[must_use]
+pub(crate) fn estimate_fee_rates_sat_per_vbyte(
+    pool: &bitcoin_rs_mempool::Mempool,
+    targets: impl IntoIterator<Item = u32>,
+) -> alloc::vec::Vec<(u32, f64)> {
+    targets
+        .into_iter()
+        .filter_map(|target| {
+            pool.estimate_fee_rate(target).map(|rate| {
+                // The estimator answers in sat/kvB; sat/vB is 1/1000 of it, the
+                // same projection `estimatesmartfee` publishes as BTC/kvB.
+                (target, sat_per_kvb_to_sat_per_vbyte(rate.as_sat_per_kvb()))
+            })
+        })
+        .collect()
+}
+
 fn parse_estimate_mode(params: &Value) -> Result<(), RpcError> {
     let Some(array) = params.as_array() else {
         return Ok(());
