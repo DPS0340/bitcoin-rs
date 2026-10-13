@@ -129,19 +129,20 @@ in each issue:
 
 - **#1502 BIP157/158 compact filters.** Optional light-client service. Not a
   consensus or wallet-architecture requirement; Esplora/ScriptIndex remains the
-  default self-hosting path. Class: application-layer. Stage: Research
-  (in-flight PR; Planned in the merged-tree matrix). Promotion requires an
-  unmodified external light client on regtest, Core filter vectors for
-  spend-heavy blocks, and measured default-off overhead. This is a
-  re-evaluation of the #143 removal decision; it stands
-  only with a real consumer, because #257 removed a speculative re-entry.
+  default self-hosting path. Class: application-layer. Stage: Shipped —
+  optional `blockfilterindex` is merged in the tree, with recorded unmodified
+  Kyoto regtest verification per [api/ecosystem-compat.toml](../api/ecosystem-compat.toml).
+  Stale-block filters and scanblocks are not implemented; production mainnet
+  IBD performance is not claimed.
 - **#1491 BIP352 Silent Payments.** Optional, keyless tweak service over
   existing chain data. Wallet scan keys and per-user history never enter the
-  node. Class: wallet discovery. Stage: Research (codec work
-  first). The upstream index-server specification is WIP; pin the commit under
-  test and do not present provisional endpoints as a stable standard. The
-  hosted remote-scanner models stay out of scope by default: they hold wallet
-  secrets, a materially worse privacy boundary.
+  node. Class: wallet discovery. Stage: Experimental — keyless, stateless
+  BIP352 scan codec merged in the tree behind the `silent-payments` Cargo feature;
+  follow-up #1491 tracks an optional thin public-tweak index. The upstream
+  index-server specification is WIP; pin the commit under test and do not
+  present provisional endpoints as a stable standard. The hosted remote-scanner
+  models stay out of scope by default: they hold wallet secrets, a materially
+  worse privacy boundary.
 - **#1503 BIP324 v2 transport.** Opportunistic encryption without peer
   authentication; do not claim it stops an active MITM or eclipsing peer.
   Class: P2P transport. Stage: Experimental — the implementation is in the
