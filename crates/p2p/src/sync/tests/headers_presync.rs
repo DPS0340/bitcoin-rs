@@ -1090,7 +1090,7 @@ fn connection_replacement_starts_a_fresh_presync() -> TestResult {
 
     // Replace the connection at the same address: `register` cancels and
     // replaces the predecessor in one table write.
-    let (tx, replacement_rx) = crossbeam_channel::unbounded::<Message>();
+    let (tx, _replacement_rx) = crossbeam_channel::unbounded::<Message>();
     let replacement_lease = PeerLease::new(tx);
     assert!(
         peers.register(addr, replacement_lease.clone()),
@@ -1116,8 +1116,8 @@ fn connection_replacement_starts_a_fresh_presync() -> TestResult {
         "a replacement must start empty, never inherit the predecessor's commitments"
     );
     assert!(
-        !replacement_rx.is_empty() || peers.is_connected(addr),
-        "fixture: the replacement must be live for the fold"
+        peers.is_current(replacement),
+        "fixture: the replacement's own lease must be live, not merely present"
     );
     Ok(())
 }

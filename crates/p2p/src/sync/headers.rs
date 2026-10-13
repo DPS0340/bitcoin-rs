@@ -1027,7 +1027,9 @@ impl BlockSync {
     ///   committed phase released headers; and `None` when the sync state
     ///   retained the batch, in which case this call already retired the
     ///   answered request, sent the state-cursor continuation, or ran the
-    ///   fault path.
+    ///   fault path — or when the batch came from a connection that has
+    ///   since been replaced (or cancelled), which is dropped without any
+    ///   state, request, or admission action.
     /// INVARIANT: a body-carried header is deferred below the work floor
     ///   only after standalone `PoW` and contextual validation pass; wire
     ///   batches reach admission below the floor only as
@@ -1074,6 +1076,13 @@ impl BlockSync {
             if self.presync_anchor(headers).is_none()
                 || self.body_carried_header_needs_admission(headers)
             {
+                // The anchor and body validation run outside any lock, so
+                // the connection may have been replaced in between: the
+                // pre-check above cannot cover a direct admission reached
+                // this far down.
+                if !self.peer_table.is_current(source) {
+                    return None;
+                }
                 return Some(self.chain.admit_headers(headers));
             }
             return None;
@@ -1092,6 +1101,12 @@ impl BlockSync {
                 // A fresh sync anchors on the tree's fork point, read
                 // before any scheduler or transition lock is taken.
                 let Some(anchor) = self.presync_anchor(headers) else {
+                    // The anchor read is unlocked: a replacement may have
+                    // landed since the entry check, so the direct admission
+                    // re-validates the identity.
+                    if !self.peer_table.is_current(source) {
+                        return None;
+                    }
                     return Some(self.chain.admit_headers(headers));
                 };
                 let minimum_work = self.chain.minimum_chain_work();
