@@ -963,6 +963,100 @@ fn delayed_presync_page_still_feeds_the_live_state() -> TestResult {
     Ok(())
 }
 
+/// A same-address replacement never inherits the predecessor's collection:
+/// register cancels the predecessor's lease in the same table write, so
+/// its identities own no state and a fresh connection starts empty.
+#[test]
+fn connection_replacement_starts_a_fresh_presync() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, predecessor_lease, rx) = connect(&peers, 9713, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+    let _ = rx.try_recv()?;
+
+    let chain = chain_on(&genesis, 0, 2 * PAGE + 500);
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "fixture: the predecessor must own a live collection"
+    );
+
+    // Replace the connection at the same address: `register` cancels and
+    // replaces the predecessor in one table write.
+    let (tx, replacement_rx) = crossbeam_channel::unbounded::<Message>();
+    let replacement_lease = PeerLease::new(tx);
+    assert!(
+        peers.register(addr, replacement_lease.clone()),
+        "fixture: register must replace the predecessor"
+    );
+    assert!(
+        peers.publish_info(addr, &replacement_lease, synthetic_peer(addr, 100_000)),
+        "fixture: the replacement's info must publish"
+    );
+    let replacement = replacement_lease.source(addr);
+    assert!(
+        predecessor_lease.is_cancelled() && !peers.is_current(source),
+        "fixture: the predecessor's lease must be cancelled by the replacement"
+    );
+
+    sync.tick();
+    assert!(
+        with_sync_state(&sync, source, HeadersSyncState::phase).is_none(),
+        "the predecessor's collection must be released with its lease"
+    );
+    assert!(
+        with_sync_state(&sync, replacement, HeadersSyncState::phase).is_none(),
+        "a replacement must start empty, never inherit the predecessor's commitments"
+    );
+    assert!(
+        !replacement_rx.is_empty() || peers.is_connected(addr),
+        "fixture: the replacement must be live for the fold"
+    );
+    Ok(())
+}
+
+/// A page from a replaced connection is ignored: it neither advances a
+/// collection nor admits headers the predecessor was carrying (#1567).
+#[test]
+fn replaced_connection_page_is_ignored() -> TestResult {
+    // Above the floor: a live source's page would be admitted directly, so
+    // "the tree stayed put" is evidence the stale source was dropped rather
+    // than an artefact of the presync gate.
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(ChainWork::ZERO)?;
+    let (addr, _predecessor_lease, _rx) = connect(&peers, 9714, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+
+    let (tx, _rx) = crossbeam_channel::unbounded::<Message>();
+    let replacement_lease = PeerLease::new(tx);
+    peers.register(addr, replacement_lease.clone());
+    peers.publish_info(addr, &replacement_lease, synthetic_peer(addr, 100_000));
+    let replacement = replacement_lease.source(addr);
+    assert!(
+        !peers.is_current(source),
+        "fixture: the predecessor is gone"
+    );
+
+    // The predecessor's late page: dropped, nothing admitted for anyone.
+    let chain = chain_on(&genesis, 0, PAGE);
+    deliver_headers(&inbound_headers_tx, chain, source)?;
+    sync.tick();
+
+    assert_eq!(
+        tree_node_count(&sync),
+        1,
+        "a replaced connection must not admit headers after its lease is gone"
+    );
+    assert!(
+        with_sync_state(&sync, replacement, HeadersSyncState::phase).is_none(),
+        "a replaced connection's page must not open a state on the replacement"
+    );
+    Ok(())
+}
+
 fn assert_invalid_body_header_is_discarded(block: Block, port: u16) -> TestResult {
     let floor = ChainWork::from(u64::MAX);
     let (_genesis, sync, _inbound_headers_tx, peers) = presync_fixture(floor)?;

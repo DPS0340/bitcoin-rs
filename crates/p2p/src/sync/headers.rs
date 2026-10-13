@@ -1013,6 +1013,12 @@ impl BlockSync {
         let Some(source) = source else {
             return Some(self.chain.admit_headers(headers));
         };
+        // A batch from a replaced (or cancelled) connection is stale
+        // evidence: the identity owns no live state, and admitting it would
+        // install headers from a predecessor the operator has moved past.
+        if !self.peer_table.is_current(source) {
+            return None;
+        }
         // Only a genuine wire `headers` message opens or feeds the
         // download-twice state: Core feeds the sync state only from
         // processed `headers` messages (`net_processing.cpp:2915-2924`).
@@ -1064,6 +1070,15 @@ impl BlockSync {
         };
         if outcome.finished {
             self.scheduler.lock().headers_sync.remove(&source);
+        }
+        // A page a replaced (or cancelled) connection delivered is stale
+        // evidence: its identity owns no state, and acting on it would
+        // fault or blame a connection that is no longer live — or, worse,
+        // admit headers from a predecessor the operator has moved past.
+        // The batch is dropped after its parked state has already been
+        // released above.
+        if !self.peer_table.is_current(source) {
+            return None;
         }
         if let Some(error) = outcome.failure {
             self.settle_presync_fault(source, error);
