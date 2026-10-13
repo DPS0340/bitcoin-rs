@@ -110,8 +110,10 @@ Maintenance rules:
 - Implementation support, lifecycle promotion, and external verification are
   distinct claims. A support checkmark alone never establishes `Shipped` or
   `Externally Verified`.
-- Open PRs and active issues are `Planned` in the matrix; explicitly deferred or
-  rejected issues remain `Unsupported`. Reserve `Experimental` for
+- Open PRs and active issues are `Planned` in the matrix; an issue that only
+  records a deferral (`Reopen on upstream maturity`) keeps the row
+  `Unsupported`, because the tracker entry is the deferral note, not planned
+  work. Rejected issues remain `Unsupported`. Reserve `Experimental` for
   implementations already in the merged tree that are default-off or draft-pinned.
 - Never publish an "X% of all BIPs supported" metric. There is no meaningful
   single denominator: many BIPs are wallet-only, informational, or inapplicable

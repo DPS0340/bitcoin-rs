@@ -43,12 +43,12 @@ Linked capability names lead to code or tests; notes link scope and evidence own
 | 130 | [Headers announcements](../crates/p2p/src/block_announce.rs) | ✅ | — | Up to 8 headers; [CORE-05 qualification pending](contracts/core-differential.md#core-05-proactive-block-announcements-across-a-live-reorg) |
 | 133 | [Fee filter](../crates/p2p/src/tx_policy/relay.rs) | ✅ | — | Per-peer inventory floor; rounded local refresh |
 | 144 | [Segwit relay](../crates/p2p/src/dispatch.rs) | ✅ | — | Witness block/transaction inventory preserves bytes |
-| 152 | [Compact blocks](../crates/p2p/src/compact_blocks.rs) | ✅ | ✓ | [Core 31.1 request/response scope](api/ecosystem-compat.toml); CORE-05 proactive-announcement qualification pending; reconstruction counts diagnostic |
+| 152 | [Compact blocks](../crates/p2p/src/compact_blocks.rs) | ✅ | ✓ | Announcements are implemented (see policy §7); only the CORE-05 live-reorg qualification is pending; [Core 31.1 request/response scope](api/ecosystem-compat.toml); reconstruction counts diagnostic |
 | 155 | [Address v2](../crates/p2p/src/wire.rs) | ◐ | — | Negotiation and IP receive path; getaddr sends legacy addr |
 | 157/158 | [Compact filters](https://github.com/gosuda/bitcoin-rs/pull/1554) | ☐ | — | Pending PR; optional blockfilterindex |
 | 159 | [Limited-network service](../crates/node/src/state_open.rs) | ✅ | — | Pruned nodes advertise NETWORK_LIMITED + WITNESS |
 | 324 | [v2 transport](../crates/p2p/src/transport.rs) | 🧪 | — | Opt-in; [vectors](../crates/p2p/tests/data/bip324/) and [negotiation tests](../crates/p2p/src/listener/v2_transport_tests.rs); bidirectional Core interop pending |
-| 330 | [Erlay](https://github.com/gosuda/bitcoin-rs/issues/1501) | ❌ | — | Backlog watch per policy #1501; sendtxrcncl ignored |
+| 330 | [Erlay](https://github.com/gosuda/bitcoin-rs/issues/1501) | ❌ | — | Explicitly deferred backlog (#1501 tracks the deferral, so the policy keeps it `Unsupported` rather than `Planned`); sendtxrcncl ignored |
 | 339 | [Wtxid relay](../crates/p2p/src/peer.rs) | ✅ | — | Negotiation, announcements and getdata |
 | 35 | [Mempool request](../crates/p2p/src/dispatch.rs) | ❌ | — | Command decoded then ignored |
 
