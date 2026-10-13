@@ -91,9 +91,14 @@ external adoption can justify postponement without a defect claim.
 ## 5. Coverage map maintenance
 
 The user-facing BIP support matrix lives in
-[../api/ecosystem-compat-bips](../api/ecosystem-compat-bips); its rows follow
-`ECO-08` vocabulary. Keep it updated when a BIP-related capability is added,
-promoted, materially changed, or removed — in the same change-set as the code.
+[../bip-support.md](../bip-support.md). Its rows follow `ECO-08`'s
+evidence-axis rules — implementation status and external verification stay
+separate axes; this matrix's `Shipped`/`Partial`/`Experimental`/`Planned`/
+`Unsupported` legend is its own implementation-status vocabulary, and an
+external-consumer run is always recorded in
+[api/ecosystem-compat.toml](../api/ecosystem-compat.toml), never here. Keep
+the matrix updated when a BIP-related capability is added, promoted,
+materially changed, or removed — in the same change-set as the code.
 
 Maintenance rules:
 
@@ -132,8 +137,11 @@ in each issue:
   secrets, a materially worse privacy boundary.
 - **#1503 BIP324 v2 transport.** Opportunistic encryption without peer
   authentication; do not claim it stops an active MITM or eclipsing peer.
-  Class: P2P transport. Stage: Shipped in code (behind `v2transport`, off by
-  default), pending live bidirectional Core evidence for full promotion.
+  Class: P2P transport. Stage: Experimental — the implementation is in the
+  tree behind `v2transport`, off by default, with in-tree vector and
+  negotiation tests; a live bidirectional Core 31.1 run recording v2 in both
+  directions is the promotion evidence, and the P2P policy still records
+  v1-only as the shipped transport default.
 - **#1501 BIP330 Erlay.** Backlog/watch. Class: P2P relay. Bitcoin Core's
   implementation is incomplete (`DO NOT MERGE`), and a moving upstream design
   makes a parallel reconciliation policy pure maintenance. Reopen on upstream
