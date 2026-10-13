@@ -20,6 +20,7 @@
 //! `:306-326` (the locator switch).
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use bitcoin_rs_chain::{
     ChainWork, block_work, current_unix_seconds, permitted_difficulty_transition, validate_pow,
@@ -338,6 +339,10 @@ pub struct HeadersSyncState {
     /// The header height the peer demonstrated before `finalize` reset the
     /// cursors — the horizon it verifiably serves.
     final_height: u32,
+    /// When this sync's outstanding continuation left for the wire, `None`
+    /// while the connection owes no request. The owner-side sweep reads it
+    /// to tell a slow collection from a silent one.
+    continuation_requested_at: Option<Instant>,
 }
 
 impl HeadersSyncState {
@@ -392,6 +397,7 @@ impl HeadersSyncState {
             process_all_remaining_headers: false,
             commit_offset: u32::try_from(commit_offset).unwrap_or(0),
             final_height: chain_start.height,
+            continuation_requested_at: None,
             chain_start,
             params,
             minimum_work,
@@ -654,6 +660,23 @@ impl HeadersSyncState {
         ready
     }
 
+    /// The cursor this sync has collected to — the first hash
+    /// [`Self::next_locator`] carries.
+    ///
+    /// PRE: none.
+    /// POST: the deepest header hash the live phase accepted, or `None`
+    ///   once the state is spent (`Final`), when no continuation exists.
+    /// INVARIANT: one cursor per live sync; the handle a competing
+    ///   `getheaders` to this connection is judged against.
+    #[must_use]
+    pub(crate) const fn cursor_hash(&self) -> Option<Hash256> {
+        match self.phase {
+            HeadersSyncPhase::Presync => Some(self.last_header_hash),
+            HeadersSyncPhase::Redownload => Some(self.redownload_last_hash),
+            HeadersSyncPhase::Final => None,
+        }
+    }
+
     /// The locator to continue this sync with (`headerssync.cpp:306-326`).
     ///
     /// PRE: the state is not `Final`.
@@ -699,6 +722,34 @@ impl HeadersSyncState {
         self.phase
     }
 
+    /// Records that this sync's continuation left for the wire at `at`.
+    ///
+    /// PRE: the state is live (not `Final`).
+    /// POST: the owner-side sweep sees the connection owing a request.
+    /// INVARIANT: set exactly when a continuation is actually sent, so a
+    ///   suppressed or failed send never arms the deadline.
+    pub(crate) fn note_continuation_sent(&mut self, at: Instant) {
+        self.continuation_requested_at = Some(at);
+    }
+
+    /// Clears the outstanding-continuation mark: the batch answering it
+    /// arrived (or the state is gone and nothing owes a request).
+    pub(crate) fn clear_continuation(&mut self) {
+        self.continuation_requested_at = None;
+    }
+
+    /// Whether the connection let its continuation go unanswered past
+    /// `timeout`: the state owns a request that aged out.
+    ///
+    /// PRE: `timeout` is the scheduler's header-request deadline.
+    /// POST: `true` only while a sent continuation is older than `timeout`;
+    ///   a state that owes nothing is never expired.
+    #[must_use]
+    pub(crate) fn continuation_expired(&self, now: Instant, timeout: Duration) -> bool {
+        self.continuation_requested_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= timeout)
+    }
+
     /// Releases all temporary state and spends the sync (`headerssync.cpp:52-66`).
     ///
     /// PRE: none (idempotent).
@@ -717,6 +768,7 @@ impl HeadersSyncState {
         self.process_all_remaining_headers = false;
         self.final_height = self.sync_height();
         self.current_height = 0;
+        self.continuation_requested_at = None;
         self.phase = HeadersSyncPhase::Final;
     }
 

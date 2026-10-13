@@ -558,12 +558,18 @@ impl BlockSync {
     pub(super) fn request_headers_from_eligible(&self) {
         let required = bitcoin::p2p::ServiceFlags::NETWORK.to_u64()
             | bitcoin::p2p::ServiceFlags::WITNESS.to_u64();
+        let presync = self.presync_connections();
         let source = self
             .peer_table
             .sessions()
             .into_iter()
             .filter(|session| {
+                // A connection with a live download-twice sync answers only
+                // its own state cursor: a tree-locator ancestry request
+                // would break that state's continuity (#1567), so the
+                // rotation skips it and asks the next eligible connection.
                 !session.lease.is_cancelled()
+                    && !presync.contains(&session.lease.source(session.addr))
                     && session
                         .info
                         .as_ref()
@@ -572,6 +578,16 @@ impl BlockSync {
             .min_by_key(|session| session.addr)
             .map(|session| session.lease.source(session.addr));
         self.request_headers_from(source);
+    }
+
+    /// The connections currently owning a live download-twice header sync.
+    ///
+    /// PRE: none.
+    /// POST: a snapshot of every connection identity with a live presync
+    ///   state, so a caller can test membership without taking the
+    ///   scheduler lock once per candidate.
+    fn presync_connections(&self) -> Vec<PeerSource> {
+        self.scheduler.lock().headers_sync.keys().copied().collect()
     }
 
     pub(super) fn refresh_active_peer_credit(&self) {
@@ -664,6 +680,11 @@ impl BlockSync {
         exclude: Option<PeerSource>,
     ) {
         let (applied_height, header_height) = frontier.heights();
+        // A connection with a live download-twice sync owns its cursor: the
+        // tree-locator request this path sends would rewind it to genesis
+        // and break the state's continuity (#1567), so that connection is
+        // skipped and a peer without a collection takes the request.
+        let presync = self.presync_connections();
         let mut header_peer: Option<(PeerSource, SyncPeer)> = None;
         for peer in &frontier.usable_peers {
             let Some(candidate) = sync_peer_candidate(
@@ -674,7 +695,9 @@ impl BlockSync {
             ) else {
                 continue;
             };
-            if exclude.is_some_and(|excluded| excluded == peer.source) {
+            if exclude.is_some_and(|excluded| excluded == peer.source)
+                || presync.contains(&peer.source)
+            {
                 continue;
             }
             if header_peer
@@ -832,6 +855,28 @@ impl BlockSync {
         };
         let target_height = u32::try_from(target_height).unwrap_or(0);
         let now = Instant::now();
+        // One outstanding locator per connection: while a download-twice
+        // sync owns this connection's chain, only that state's own cursor
+        // continuation may address it. Any other locator's answer — a
+        // tree-locator replay from genesis — would fail the state's
+        // continuity check and restart the whole sync, and the next pages
+        // would then be rejected as `MissingParent` because the collected
+        // prefix never reached the tree (#1567).
+        if self
+            .scheduler
+            .lock()
+            .headers_sync
+            .get(&source)
+            .is_some_and(|state| state.cursor_hash() != Some(locator_tip_hash))
+        {
+            tracing::trace!(
+                peer_addr = %source.addr,
+                our_height,
+                target_height,
+                "block sync: getheaders suppressed; the connection's presync owns its locator",
+            );
+            return GetheadersOutcome::Failed;
+        }
         if self.has_pending_getheaders(source, locator_tip_hash, target_height, now) {
             tracing::trace!(
                 peer_addr = %source.addr,
@@ -1006,6 +1051,11 @@ impl BlockSync {
                 let params = anchor.network.headers_sync_params();
                 HeadersSyncState::new(anchor, minimum_work, params, presync_salt())
             };
+            // The arriving page answers this connection's outstanding
+            // continuation: the owed request is settled before the batch is
+            // processed, so a state that asks for more arms a fresh
+            // deadline from that send (or stays unarmed when it does not).
+            state.clear_continuation();
             let outcome = Self::advance_presync_state(&mut state, headers, batch_len);
             if self.peer_table.is_current(source) {
                 self.scheduler.lock().headers_sync.insert(source, state);
@@ -1213,7 +1263,8 @@ impl BlockSync {
     ///   `height` is the cursor the state has reached.
     /// POST: the next `getheaders` is sent to that exact connection and
     ///   registered under its ownership, or nothing is sent when an
-    ///   identical request is already pending.
+    ///   identical request is already pending; a send arms the state's
+    ///   continuation deadline the owner-side sweep reads.
     /// INVARIANT: the continuation never re-elects a different connection:
     ///   commitments, salt, and cursor belong to the one sync.
     fn send_presync_getheaders(
@@ -1230,7 +1281,15 @@ impl BlockSync {
             .map_or(i32::MAX, |session| {
                 headers_target_height(session.headers_horizon, session.info.as_ref())
             });
-        self.send_getheaders(source, height, target_height, locator)
+        let outcome = self.send_getheaders(source, height, target_height, locator);
+        if outcome == GetheadersOutcome::Sent
+            && let Some(state) = self.scheduler.lock().headers_sync.get_mut(&source)
+        {
+            // The SEND arms the deadline, so the owner-side sweep retires
+            // exactly a connection that let a real continuation expire.
+            state.note_continuation_sent(Instant::now());
+        }
+        outcome
     }
 
     /// Settles a failed download-twice sync.

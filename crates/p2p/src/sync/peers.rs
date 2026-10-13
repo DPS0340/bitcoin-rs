@@ -662,6 +662,46 @@ impl BlockSync {
         }
     }
 
+    /// Retires connections whose download-twice sync left a continuation
+    /// unanswered past the `getheaders` deadline (#1567).
+    ///
+    /// A live presync is fed only by its own state cursor: the scheduler
+    /// never re-requests that cursor (the tracked continuation answers it
+    /// once), so a connection that goes silent mid-collection would hold
+    /// its half-verified chain forever. Rather than re-requesting from the
+    /// block-tree locator — whose genesis-rooted replay breaks the state's
+    /// continuity and restarts the sync — the expired request retires the
+    /// connection with its state, and the next sync starts fresh on
+    /// another connection.
+    ///
+    /// INVARIANT: only a state that actually owes a continuation can
+    ///   expire; the deadline is armed by the send and cleared by the
+    ///   answering batch, so a slow-but-answering peer is never blamed.
+    pub(super) fn sweep_presync_timeouts(&self, now: Instant) {
+        let expired: Vec<PeerSource> = {
+            let scheduler = self.scheduler.lock();
+            scheduler
+                .headers_sync
+                .iter()
+                .filter(|(_, state)| state.continuation_expired(now, super::HEADER_REQUEST_TIMEOUT))
+                .map(|(source, _)| *source)
+                .collect()
+        };
+        for source in expired {
+            let settled = {
+                let mut scheduler = self.scheduler.lock();
+                scheduler.headers_sync.remove(&source).is_some()
+            };
+            if settled && self.peer_table.disconnect_source(source) {
+                metrics::counter!("node.sync.presync_timeout_disconnects").increment(1);
+                tracing::warn!(
+                    peer_addr = %source.addr,
+                    "block sync: presync continuation went unanswered past the deadline; retiring connection"
+                );
+            }
+        }
+    }
+
     /// Asks one connection for headers once and reports whether the request
     /// is now outstanding.
     /// INVARIANT: a suppression counts only when the pending request it

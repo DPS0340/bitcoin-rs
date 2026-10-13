@@ -497,6 +497,10 @@ impl BlockSync {
         self.reconcile_peer_sessions();
         let frontier = self.observe_frontier(chain.clone(), now);
         self.sweep_chain_sync(&frontier, now);
+        // A presync whose continuation aged out retires here, before the
+        // re-observation, so selection and body planning never address a
+        // lease this sweep just removed.
+        self.sweep_presync_timeouts(now);
         self.follow_tip_progress(&frontier, now);
         // The sweep can disconnect a peer; re-observe so selection and body
         // planning never address a lease the sweep just removed.

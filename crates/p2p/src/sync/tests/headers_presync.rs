@@ -760,6 +760,209 @@ fn unsolicited_presync_continuation_keeps_another_peers_pending_request() -> Tes
     Ok(())
 }
 
+/// The continuation deadline is armed by the send and cleared by the
+/// answering batch, so a state that owes nothing is never expired.
+#[test]
+fn continuation_deadline_tracks_the_sent_request_only() {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor).or_fail("fixture");
+    let (addr, _lease, _rx) = connect(&peers, 9709, 100_000);
+    let source = current_source(&peers, addr);
+    let chain = chain_on(&genesis, 0, 2 * PAGE + 500);
+
+    // A fresh state owes no request: nothing can expire.
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source).or_fail("page");
+    sync.tick();
+    let now = Instant::now();
+    let timeout = Duration::from_secs(5);
+    assert!(
+        !with_sync_state(&sync, source, |state| state
+            .continuation_expired(now, timeout))
+        .or_fail("state"),
+        "a collection whose page just arrived must not read as expired"
+    );
+    // The continuation that the batch asked for arms exactly one deadline.
+    assert!(
+        with_sync_state(&sync, source, |state| {
+            state.continuation_expired(now + timeout + Duration::from_millis(1), timeout)
+        })
+        .or_fail("state"),
+        "the sent continuation must expire past the deadline"
+    );
+    let just_inside = (now + timeout)
+        .checked_sub(Duration::from_millis(1))
+        .or_fail("clock underrun");
+    assert!(
+        !with_sync_state(&sync, source, |state| {
+            state.continuation_expired(just_inside, timeout)
+        })
+        .or_fail("state"),
+        "the sent continuation must not expire before the deadline"
+    );
+}
+
+/// The #1567 regression: while a connection owns a live download-twice sync,
+/// no tree-locator `getheaders` may address it. The tree locator during a
+/// fresh collection is the genesis locator, and its answer replays the first
+/// page over the collected cursor — the replayed page fails the state's
+/// continuity check, spends the collection, and every later page is then
+/// rejected as `MissingParent` because the prefix never reached the tree.
+#[test]
+fn tree_locator_request_never_addresses_a_collecting_connection() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, rx) = connect(&peers, 9710, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+    let _ = rx.try_recv()?;
+
+    let chain = chain_on(&genesis, 0, 2 * PAGE + 500);
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "fixture: the first page must collect under presync"
+    );
+    let _continuation = next_locator(&rx)
+        .ok_or_else(|| std::io::Error::other("the presync continuation was not sent"))?;
+
+    // The scheduler's tree-locator path: exactly what the tick runs when the
+    // request deadline elapses (and what a capability probe would run).
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), Instant::now());
+    assert_eq!(
+        frontier.header_request.map(|request| request.source),
+        Some(source),
+        "fixture: the continuation must own the header request slot"
+    );
+    sync.request_headers_from_best_peer(&frontier, None);
+    sync.request_headers_from_eligible();
+
+    let genesis_locator = Hash256::from(genesis.compute_hash()).to_le_bytes();
+    assert!(
+        next_locator(&rx).is_none_or(|locator| locator.first() != Some(&genesis_locator)),
+        "a tree-locator request must never overwrite a collecting connection's cursor"
+    );
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "the collection must survive the scheduler's tree-locator path"
+    );
+    assert_eq!(
+        tree_node_count(&sync),
+        1,
+        "nothing may reach the tree while the collection is below the floor"
+    );
+    Ok(())
+}
+
+/// A silent presync connection retires with its half-verified chain once its
+/// continuation ages out, instead of holding the collection and tempting a
+/// genesis-rooted re-request (#1567).
+#[test]
+fn expired_presync_continuation_retires_the_connection() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, rx) = connect(&peers, 9711, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+    let _ = rx.try_recv()?;
+
+    let chain = chain_on(&genesis, 0, 2 * PAGE + 500);
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "fixture: the first page must collect under presync"
+    );
+
+    // Age the sent continuation past the deadline, as the silent fold does.
+    let stale = Instant::now()
+        .checked_sub(Duration::from_secs(6))
+        .ok_or_else(|| std::io::Error::other("clock underrun"))?;
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get_mut(&source)
+            .is_some_and(|state| {
+                state.note_continuation_sent(stale);
+                true
+            }),
+        "fixture: the state must own the sent continuation"
+    );
+
+    sync.tick();
+
+    assert_eq!(
+        sync_phase(&sync, source),
+        None,
+        "an expired continuation must retire the collection with its connection"
+    );
+    assert!(
+        !peers.is_connected(addr),
+        "the silent collecting connection must be retired, not held"
+    );
+    let genesis_locator = Hash256::from(genesis.compute_hash()).to_le_bytes();
+    assert!(
+        next_locator(&rx).is_none_or(|locator| locator.first() != Some(&genesis_locator)),
+        "retirement must not be preceded by a genesis-rooted re-request"
+    );
+    Ok(())
+}
+
+/// A page that answers the continuation after the deadline still feeds the
+/// live state: the deadline paces requests, it does not spend a collection
+/// whose answer is merely late.
+#[test]
+fn delayed_presync_page_still_feeds_the_live_state() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    let (addr, _lease, rx) = connect(&peers, 9712, 100_000);
+    let source = current_source(&peers, addr);
+    sync.tick();
+    let _ = rx.try_recv()?;
+
+    let chain = chain_on(&genesis, 0, 2 * PAGE + 500);
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source)?;
+    sync.tick();
+    let _continuation = next_locator(&rx)
+        .ok_or_else(|| std::io::Error::other("the presync continuation was not sent"))?;
+
+    // The answer arrives while the request is old but the collection live:
+    // the arriving batch settles the owed request before processing.
+    let stale = Instant::now()
+        .checked_sub(Duration::from_secs(6))
+        .ok_or_else(|| std::io::Error::other("clock underrun"))?;
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get_mut(&source)
+            .is_some_and(|state| {
+                state.note_continuation_sent(stale);
+                true
+            }),
+        "fixture: the state must own the sent continuation"
+    );
+    deliver_headers(&inbound_headers_tx, chain[PAGE..2 * PAGE].to_vec(), source)?;
+    sync.tick();
+
+    let cursor = with_sync_state(&sync, source, |state| state.next_locator()[0].to_le_bytes());
+    assert_eq!(
+        cursor,
+        Some(Hash256::from(chain[2 * PAGE - 1].compute_hash()).to_le_bytes()),
+        "the late page must extend the same state's cursor"
+    );
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "a late page must not restart or spend the collection"
+    );
+    Ok(())
+}
+
 fn assert_invalid_body_header_is_discarded(block: Block, port: u16) -> TestResult {
     let floor = ChainWork::from(u64::MAX);
     let (_genesis, sync, _inbound_headers_tx, peers) = presync_fixture(floor)?;
