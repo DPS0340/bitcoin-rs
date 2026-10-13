@@ -28,8 +28,8 @@ Re-pinning to a newer Core version requires all of:
 ## 3. Transport and Envelope
 
 - Default Bitcoin P2P **v1 envelope** (`crates/p2p/src/wire.rs`): 4-byte network magic, 12-byte NUL-padded command, `u32` little-endian payload length, 4-byte checksum (first 4 bytes of double-SHA256 of the payload), then the payload.
-- Experimental BIP324 v2 is present behind `--v2transport` (off by default), with key exchange, packet framing and v1 fallback (`crates/p2p/src/transport.rs`, `bip324.rs`). Reference vectors and in-tree negotiation tests are implementation evidence, not recorded bidirectional Core interoperability (§7).
-- Payload bound: `MAX_MESSAGE_PAYLOAD = 32 MiB`. Core caps messages at 4 MiB; bitcoin-rs is deliberately looser so any protocol-maximal block fits. A peer that Core would disconnect for an oversized message may be accepted here; this is a bound difference, not a relay difference.
+- Experimental BIP324 v2 is present behind `--v2transport` (off by default), with key exchange, packet framing (capped at `MAX_PAYLOAD_LEN = 4,000,000` bytes per BIP324) and v1 fallback (`crates/p2p/src/transport.rs`, `bip324.rs`). Reference vectors and in-tree negotiation tests are implementation evidence, not recorded bidirectional Core interoperability (§7).
+- V1 payload bound: `MAX_MESSAGE_PAYLOAD = 32 MiB` (`crates/p2p/src/wire.rs`). Core caps v1 messages at 4 MiB; bitcoin-rs is deliberately looser so any protocol-maximal block fits. A peer that Core would disconnect for an oversized message may be accepted here; this is a bound difference, not a relay difference.
 - Network magic and default ports come from `bitcoin_rs_primitives::Network` and are asserted equal to Core's constants per network (mainnet 8333, testnet3 18333, testnet4 48333, signet 38333, regtest 18444).
 - Fork networks sharing a chain may override the message-start bytes with `--p2p-magic` (a bitcoin-rs extension; requires `--network mainnet` semantics and explicit `--connect` peers). Not a Core option; recorded as extension, not parity.
 

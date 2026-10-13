@@ -6,8 +6,6 @@ per-surface status lives in [../api/ecosystem-compat.toml](../api/ecosystem-comp
 the wire matrix lives in [p2p-compatibility.md](p2p-compatibility.md), and the
 RPC surface lives in `REGISTRY` (`crates/rpc/src/registry.rs`).
 
-Guiding rule: **the code can change; consensus must remain.**
-
 ## 1. Classification
 
 Classify every candidate BIP before implementation:
@@ -22,8 +20,11 @@ Classify every candidate BIP before implementation:
 
 ## 2. Adoption decision
 
-Record the decision in the existing issue or PR. Do not create a new tracking
-database or a mandatory feature-specific CI gate for a prototype:
+Record the decision in the existing issue or PR. External contributors can
+propose and prototype candidates via
+[Proposing and implementing BIPs](../../CONTRIBUTING.md#proposing-and-implementing-bips).
+Do not create a new tracking database or a mandatory feature-specific CI gate
+for a prototype:
 
 - Exact BIP version, status, or pinned draft commit; separate stable BIP
   requirements from experimental extension APIs.
@@ -109,7 +110,8 @@ Maintenance rules:
 - Implementation support, lifecycle promotion, and external verification are
   distinct claims. A support checkmark alone never establishes `Shipped` or
   `Externally Verified`.
-- Open PRs and issues are `Planned` in the matrix. Reserve `Experimental` for
+- Open PRs and active issues are `Planned` in the matrix; explicitly deferred or
+  rejected issues remain `Unsupported`. Reserve `Experimental` for
   implementations already in the merged tree that are default-off or draft-pinned.
 - Never publish an "X% of all BIPs supported" metric. There is no meaningful
   single denominator: many BIPs are wallet-only, informational, or inapplicable
@@ -133,7 +135,7 @@ in each issue:
   only with a real consumer, because #257 removed a speculative re-entry.
 - **#1491 BIP352 Silent Payments.** Optional, keyless tweak service over
   existing chain data. Wallet scan keys and per-user history never enter the
-  node. Class: wallet discovery. Stage: Research/Experimental (codec work
+  node. Class: wallet discovery. Stage: Research (codec work
   first). The upstream index-server specification is WIP; pin the commit under
   test and do not present provisional endpoints as a stable standard. The
   hosted remote-scanner models stay out of scope by default: they hold wallet
@@ -145,10 +147,11 @@ in each issue:
   negotiation tests; a live bidirectional Core 31.1 run recording v2 in both
   directions is the promotion evidence, and the P2P policy still records
   v1-only as the shipped transport default.
-- **#1501 BIP330 Erlay.** Backlog/watch. Class: P2P relay. Bitcoin Core's
-  implementation is incomplete (`DO NOT MERGE`), and a moving upstream design
-  makes a parallel reconciliation policy pure maintenance. Reopen on upstream
-  maturity plus measured benefit, not on feature parity.
+- **#1501 BIP330 Erlay.** Class: P2P relay. Stage: Deferred (backlog watch per
+  policy #1501). Bitcoin Core's implementation is incomplete (`DO NOT MERGE`),
+  and a moving upstream design makes a parallel reconciliation policy pure
+  maintenance. Reopen on upstream maturity plus measured benefit, not on
+  feature parity.
 - **#1514 snapshot bootstrap artifacts.** Class: application-layer/indexing.
   Stage: Research. Core v2 `dumptxoutset` export is the first reversible step;
   index sidecars never masquerade as Core format.

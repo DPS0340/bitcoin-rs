@@ -227,7 +227,8 @@ capabilities.
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for local
-verification commands, CI workflows, and crate architecture conventions.
+verification commands, CI workflows, crate architecture conventions, and how
+to [propose and implement BIPs](CONTRIBUTING.md#proposing-and-implementing-bips).
 
 ## Documentation
 

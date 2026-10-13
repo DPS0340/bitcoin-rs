@@ -14,7 +14,7 @@ In-tree tests and copied reference vectors never earn ✓. ✅ does not mean the
 policy's `Shipped` lifecycle stage or externally verified compatibility.
 Linked capability names lead to code or tests; notes link scope and evidence owners.
 
-## Consensus and script
+## Consensus, script, and mempool policy
 
 | BIP | Capability | Support | External evidence | Notes |
 | :-- | :-- | :--: | :--: | :-- |
@@ -25,7 +25,7 @@ Linked capability names lead to code or tests; notes link scope and evidence own
 | 65 | [CLTV](../crates/consensus/src/verify_block.rs) | ✅ | — | Core activation heights |
 | 66 | [Strict DER](../crates/consensus/src/verify_block.rs) | ✅ | — | Core activation heights |
 | 68/112/113 | [Relative locks / MTP](../crates/consensus/src/bip68.rs) | ✅ | — | [Block connection](../crates/chainstate/src/connect.rs); BIP9 activation |
-| 94 | [Timewarp protection](../crates/chain/tests/header_sync_roundtrip.rs) | ✅ | — | Testnet4 retarget timestamp floor |
+| 94 | [Timewarp protection](../crates/chain/src/header_sync.rs) | ✅ | — | Testnet4 BIP94 candidate-timestamp floor at retarget boundaries |
 | 141 | [Segwit validation](../crates/consensus/tests/witness_commitment_rules.rs) | ✅ | — | Commitments, weight, [sigops](../crates/consensus/tests/witness_sigop_activation.rs) |
 | 143 | [Segwit v0 sighash](../crates/consensus/tests/shared_sighash.rs) | ✅ | — | [Reference vectors](../crates/primitives/tests/bip_vectors.rs) |
 | 147 | [NULLDUMMY](../crates/script/src/eval.rs) | ✅ | — | Enforced with WITNESS flag |
@@ -43,12 +43,12 @@ Linked capability names lead to code or tests; notes link scope and evidence own
 | 130 | [Headers announcements](../crates/p2p/src/block_announce.rs) | ✅ | — | Up to 8 headers; [CORE-05 qualification pending](contracts/core-differential.md#core-05-proactive-block-announcements-across-a-live-reorg) |
 | 133 | [Fee filter](../crates/p2p/src/tx_policy/relay.rs) | ✅ | — | Per-peer inventory floor; rounded local refresh |
 | 144 | [Segwit relay](../crates/p2p/src/dispatch.rs) | ✅ | — | Witness block/transaction inventory preserves bytes |
-| 152 | [Compact blocks](../crates/p2p/src/compact_blocks.rs) | ✅ | ✓ | [Core 31.1 request/response scope](api/ecosystem-compat.toml); proactive announcements pending; reconstruction counts diagnostic |
+| 152 | [Compact blocks](../crates/p2p/src/compact_blocks.rs) | ✅ | ✓ | [Core 31.1 request/response scope](api/ecosystem-compat.toml); CORE-05 proactive-announcement qualification pending; reconstruction counts diagnostic |
 | 155 | [Address v2](../crates/p2p/src/wire.rs) | ◐ | — | Negotiation and IP receive path; getaddr sends legacy addr |
 | 157/158 | [Compact filters](https://github.com/gosuda/bitcoin-rs/pull/1554) | ☐ | — | Pending PR; optional blockfilterindex |
 | 159 | [Limited-network service](../crates/node/src/state_open.rs) | ✅ | — | Pruned nodes advertise NETWORK_LIMITED + WITNESS |
 | 324 | [v2 transport](../crates/p2p/src/transport.rs) | 🧪 | — | Opt-in; [vectors](../crates/p2p/tests/data/bip324/) and [negotiation tests](../crates/p2p/src/listener/v2_transport_tests.rs); bidirectional Core interop pending |
-| 330 | [Erlay](https://github.com/gosuda/bitcoin-rs/issues/1501) | ❌ | — | Backlog; sendtxrcncl ignored |
+| 330 | [Erlay](https://github.com/gosuda/bitcoin-rs/issues/1501) | ❌ | — | Backlog watch per policy #1501; sendtxrcncl ignored |
 | 339 | [Wtxid relay](../crates/p2p/src/peer.rs) | ✅ | — | Negotiation, announcements and getdata |
 | 35 | [Mempool request](../crates/p2p/src/dispatch.rs) | ❌ | — | Command decoded then ignored |
 
