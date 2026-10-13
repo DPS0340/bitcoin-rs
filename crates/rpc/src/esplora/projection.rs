@@ -122,13 +122,24 @@ pub(super) struct Projection<'a> {
     /// Request-scoped parent-transaction memo, keyed by txid. An Esplora
     /// response commonly renders several inputs that share one parent (and
     /// several transactions that share a parent or block), so resolving each
-    /// parent once per request removes repeated index lookups, stored-
-    /// transaction decodes, and block reads. It never outlives the request:
-    /// the memo is dropped with the projection, carries no cross-request
-    /// state, and is not consulted for the chain snapshot, which every
-    /// route still fences through the shared view (WF-02).
+    /// parent once per request removes repeated index lookups,
+    /// stored-transaction decodes, and block reads. It never outlives the
+    /// request: the memo is dropped with the projection, carries no
+    /// cross-request state, and is not consulted for the chain snapshot,
+    /// which every route still fences through the shared view (WF-02).
+    ///
+    /// The memo is entry-bounded: a request can name an unbounded number of
+    /// distinct parents, and retaining every decoded parent would let one
+    /// unauthenticated request pin arbitrarily much memory. Once the cap is
+    /// reached the memo stops growing and further parents resolve fresh,
+    /// which stays correct — only the retention is bounded.
     parents: std::cell::RefCell<hashbrown::HashMap<Txid, Option<Arc<Tx>>>>,
 }
+
+/// The most distinct parents one request memoizes. Past this the memo stops
+/// growing, so an adversarially large input list cannot pin unbounded
+/// decoded transactions while ordinary responses keep full reuse.
+pub(super) const PARENT_MEMO_LIMIT: usize = 64;
 
 impl<'a> Projection<'a> {
     pub(super) fn new(ctx: &'a Context) -> Self {
@@ -138,26 +149,39 @@ impl<'a> Projection<'a> {
         }
     }
 
-    /// Resolves the parent transaction once per request, memoized by txid.
+    /// Resolves a parent transaction once per request, memoized by txid.
     ///
     /// PRE: `txid` names a transaction this node may hold (mempool or the
     ///   transaction index).
     /// POST: the parent transaction, or `None` when neither source has it and
     ///   no error occurred; the first resolution's answer is reused for every
-    ///   later lookup of the same txid within this projection's lifetime.
-    /// INVARIANT: the memo is request-scoped and holds no chain authority —
-    ///   a caller that needs tip/generation correctness still fences through
-    ///   the shared view.
+    ///   later lookup of the same txid within this projection's lifetime, as
+    ///   long as the memo has room.
+    /// INVARIANT: the memo is request-scoped, holds no chain authority, and
+    ///   retains at most [`PARENT_MEMO_LIMIT`] parents — a caller that needs
+    ///   tip/generation correctness still fences through the shared view.
     fn parent_transaction(&self, txid: &Txid) -> Result<Option<Arc<Tx>>, Response> {
         if let Some(cached) = self.parents.borrow().get(txid) {
             return Ok(cached.clone());
         }
         let resolved = self.resolve_parent_transaction(txid)?;
-        self.parents.borrow_mut().insert(*txid, resolved.clone());
+        let mut memo = self.parents.borrow_mut();
+        // A full memo simply stops accepting entries: the answer is still
+        // correct and the request's retention stays bounded.
+        if memo.len() < PARENT_MEMO_LIMIT {
+            memo.insert(*txid, resolved.clone());
+        }
         Ok(resolved)
     }
 
-    /// The uncached resolution: mempool first, then the transaction index.
+    /// The number of parents currently retained by the request memo. Exposed
+    /// for tests that assert the bound holds under a large input list.
+    #[cfg(test)]
+    pub(super) fn parent_memo_len(&self) -> usize {
+        self.parents.borrow().len()
+    }
+
+    /// The uncached parent lookup: mempool first, then the transaction index.
     fn resolve_parent_transaction(&self, txid: &Txid) -> Result<Option<Arc<Tx>>, Response> {
         if let Some(transaction) = self.ctx.mempool.gateway.read().transaction_by_txid(txid) {
             return Ok(Some(transaction));
@@ -187,23 +211,31 @@ impl<'a> Projection<'a> {
         &self,
         txid: &Txid,
     ) -> Result<Option<(Tx, Option<Confirmation>)>, Response> {
-        if let Some(transaction) = self.ctx.mempool.gateway.read().transaction_by_txid(txid) {
+        // A batch route may render a transaction that is also another item's
+        // parent; going through the request memo means that parent is
+        // resolved once, not twice, within one response. A mempool hit is
+        // unconfirmed by definition, so it needs no confirmation lookup.
+        if self
+            .ctx
+            .mempool
+            .gateway
+            .read()
+            .transaction_by_txid(txid)
+            .is_some()
+        {
+            let Some(transaction) = self.parent_transaction(txid)? else {
+                return Ok(None);
+            };
             return Ok(Some(((*transaction).clone(), None)));
         }
-        let index = self
-            .ctx
-            .indexes
-            .esplora_tx_index
-            .as_ref()
-            .ok_or_else(|| service_unavailable("transaction lookup index is disabled"))?;
-        let transaction = index.transaction(txid).map_err(query_error)?;
-        transaction.map_or(Ok(None), |transaction| {
-            self.confirmation(txid).and_then(|confirmation| {
-                confirmation.map_or_else(
-                    || Err(service_unavailable("transaction confirmation unavailable")),
-                    |confirmation| Ok(Some((transaction, Some(confirmation)))),
-                )
-            })
+        let Some(transaction) = self.parent_transaction(txid)? else {
+            return Ok(None);
+        };
+        self.confirmation(txid).and_then(|confirmation| {
+            confirmation.map_or_else(
+                || Err(service_unavailable("transaction confirmation unavailable")),
+                |confirmation| Ok(Some(((*transaction).clone(), Some(confirmation)))),
+            )
         })
     }
 
@@ -330,10 +362,10 @@ impl<'a> Projection<'a> {
     }
 
     pub(super) fn prevout(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, Response> {
-        // Every input of the same parent transaction resolves from the one
+        // Every reference to the same parent resolves from the one
         // request-scoped lookup: a response that renders several inputs
-        // paying the same parent (or several transactions from one block)
-        // no longer repeats the index lookup, decode, and any block read.
+        // paying the same parent (or several transactions sharing one) no
+        // longer repeats the index lookup, decode, and any block read.
         Ok(self
             .parent_transaction(&outpoint.txid)?
             .and_then(|transaction| {

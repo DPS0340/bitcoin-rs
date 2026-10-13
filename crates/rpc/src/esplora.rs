@@ -2312,10 +2312,104 @@ mod tests {
             .transaction_value(&child, None)
             .expect("shared-parent prevouts must render");
         assert_eq!(rendered.vin.len(), 3, "all three inputs must render");
+        // Each input must render ITS OWN referenced output, not a reused
+        // first one: the parent's three outputs carry distinct values.
+        let values: Vec<u64> = rendered
+            .vin
+            .iter()
+            .map(|input| {
+                input
+                    .prevout
+                    .as_ref()
+                    .expect("every input must render its prevout")
+                    .value
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [500, 501, 502],
+            "each input must render the output it references"
+        );
         assert_eq!(
             calls.load(Ordering::Relaxed),
             1,
             "one projection must resolve the shared parent exactly once"
+        );
+    }
+
+    #[test]
+    fn parent_memo_is_bounded_for_adversarially_large_input_lists() {
+        // Issue #1569 review: one unauthenticated request can name arbitrarily
+        // many distinct parents, so the memo must not grow without limit. Past
+        // the cap it stops retaining, and every answer stays correct.
+        let mut ctx = Context::new();
+        // One parent per input, each a distinct txid.
+        let over_limit = crate::esplora::projection::PARENT_MEMO_LIMIT + 8;
+        let parents: Vec<Tx> = (0..over_limit)
+            .map(|index| {
+                transaction(
+                    None,
+                    TxOut {
+                        value: Amount::from_sat(u64::try_from(index).unwrap_or(u64::MAX) + 1),
+                        script_pubkey: vec![0x51].into(),
+                    },
+                )
+            })
+            .collect();
+        let mut child = transaction(
+            Some(OutPoint::new(parents[0].txid(), 0)),
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: vec![0x52].into(),
+            },
+        );
+        for parent in &parents[1..] {
+            child.inputs.push(TxIn {
+                previous_output: OutPoint::new(parent.txid(), 0),
+                script_sig: Vec::new().into(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            });
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        ctx.indexes.esplora_tx_index = Some(Arc::new(CountingTxIndex {
+            transactions: parents.clone(),
+            calls: Arc::clone(&calls),
+        }));
+
+        let projection = Projection::new(&ctx);
+        let rendered = projection
+            .transaction_value(&child, None)
+            .expect("a large input list must still render");
+        assert_eq!(
+            rendered.vin.len(),
+            parents.len(),
+            "every input must render despite the bound"
+        );
+        // The retained set never exceeds the cap, so the memo cannot pin more
+        // than that many decoded parents.
+        let retained = projection.parent_memo_len();
+        assert!(
+            retained <= crate::esplora::projection::PARENT_MEMO_LIMIT,
+            "the memo must stay bounded, saw {retained}"
+        );
+        // Every input still rendered its own output value, so correctness is
+        // independent of the bound.
+        let values: Vec<u64> = rendered
+            .vin
+            .iter()
+            .map(|input| {
+                input
+                    .prevout
+                    .as_ref()
+                    .expect("every input must render its prevout")
+                    .value
+            })
+            .collect();
+        let expected: Vec<u64> = (0..parents.len()).map(|i| i as u64 + 1).collect();
+        assert_eq!(
+            values, expected,
+            "bounded retention must not change answers"
         );
     }
 
