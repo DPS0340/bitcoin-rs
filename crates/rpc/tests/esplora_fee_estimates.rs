@@ -202,6 +202,23 @@ fn fee_estimates_come_from_one_coherent_mempool_view() {
     }
 }
 
+/// Stops and joins the oscillating writer even when an assertion unwinds, so
+/// a failing regression check cannot leave a thread spinning for the rest of
+/// the test binary.
+struct WriterGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[test]
 #[expect(clippy::expect_used, reason = "fixture invariants, not policy")]
 fn fee_estimates_never_mix_two_pool_revisions() {
@@ -227,11 +244,14 @@ fn fee_estimates_never_mix_two_pool_revisions() {
     let high_refs: Vec<&Tx> = highs.iter().collect();
     connect_block(&ctx, &high_refs, &high_txids, CONFIRM_HEIGHT);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer = {
+    let mut writer = WriterGuard {
+        stop: Arc::new(AtomicBool::new(false)),
+        handle: None,
+    };
+    {
         let ctx = Arc::clone(&ctx);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
+        let stop = Arc::clone(&writer.stop);
+        writer.handle = Some(std::thread::spawn(move || {
             let mut round = 0_u64;
             let mut live: Vec<Tx> = Vec::new();
             while !stop.load(Ordering::Relaxed) {
@@ -266,8 +286,8 @@ fn fee_estimates_never_mix_two_pool_revisions() {
                 drop(guard);
                 round = round.wrapping_add(1);
             }
-        })
-    };
+        }));
+    }
 
     let mut checked = 0_usize;
     for _ in 0..512 {
@@ -299,7 +319,7 @@ fn fee_estimates_never_mix_two_pool_revisions() {
         );
         checked += 1;
     }
-    stop.store(true, Ordering::Relaxed);
-    writer.join().expect("writer thread must join");
     assert!(checked > 0, "the fixture must answer at least once");
+    // `writer` drops here: it stops and joins the thread even on unwind.
+    drop(writer);
 }
