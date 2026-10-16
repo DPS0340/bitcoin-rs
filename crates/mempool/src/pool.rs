@@ -518,6 +518,9 @@ pub struct MempoolMiningSnapshot {
     /// moves it; in-pool prioritisation does not (it emits no mutation
     /// change). Template caches key on it.
     pub sequence: u64,
+    /// Pool fee-delta revision at capture. An in-pool prioritisation moves
+    /// this token without moving `sequence`, so template caches key on both.
+    pub fee_delta_sequence: u64,
     /// Entries in modified-priority order. `ancestors` positions and the
     /// order itself both refer to this vector.
     pub entries: Vec<SnapshotEntry>,
@@ -654,6 +657,16 @@ impl Mempool {
     #[must_use]
     pub const fn sequence_number(&self) -> u64 {
         self.mempool_sequence
+    }
+
+    /// Returns the current fee-delta revision: a counter advanced once per
+    /// in-pool prioritisation or overlay-clearing action. Those actions emit
+    /// no membership change, so `sequence_number` does not move for them and
+    /// the mining generation key reads both tokens. Reported by nothing on
+    /// the public mutation surface.
+    #[must_use]
+    pub const fn fee_delta_sequence_number(&self) -> u64 {
+        self.fee_delta_sequence
     }
 
     /// Returns the configured min-relay-fee rate in sat/kvB.
@@ -1341,6 +1354,7 @@ impl Mempool {
             .collect();
         MempoolMiningSnapshot {
             sequence: self.sequence_number(),
+            fee_delta_sequence: self.fee_delta_sequence_number(),
             entries,
         }
     }
@@ -1477,9 +1491,16 @@ impl Mempool {
     }
 
     /// Adds `fee_delta` satoshis to `txid`'s signed mining-only fee overlay.
-    pub fn prioritise(&mut self, txid: Txid, fee_delta: i64) -> Result<(), PrioritiseError> {
+    /// Returns the advanced fee-delta revision when the overlay moved, or
+    /// `None` when `fee_delta` is zero. This emits no membership change, so
+    /// the caller publishes the revision itself.
+    pub fn prioritise(
+        &mut self,
+        txid: Txid,
+        fee_delta: i64,
+    ) -> Result<Option<u64>, PrioritiseError> {
         if fee_delta == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let accumulated = self
             .fee_deltas
@@ -1495,8 +1516,9 @@ impl Mempool {
             self.fee_deltas.insert(txid, accumulated);
         }
 
+        let revision = self.fee_delta_sequence;
         let Some(id) = self.entry_id_by_txid(&txid) else {
-            return Ok(());
+            return Ok(Some(revision));
         };
         if let Some(entry) = self.entry_mut(id) {
             entry.fee_delta = accumulated;
@@ -1504,7 +1526,7 @@ impl Mempool {
 
         let affected = self.metadata_closure(&[id]);
         self.refresh_metadata(&affected);
-        Ok(())
+        Ok(Some(revision))
     }
 
     /// Returns every stored fee-delta overlay, including txids not in the pool.

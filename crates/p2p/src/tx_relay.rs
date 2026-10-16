@@ -802,6 +802,8 @@ mod tests {
     ) -> MutationEnvelope {
         MutationEnvelope {
             origin,
+            mempool_sequence: 1,
+            fee_delta_sequence: 0,
             result: bitcoin_rs_mempool::MutationResult {
                 changes: vec![bitcoin_rs_mempool::MutationChange { txid, outcome }],
                 sequence_base: 1,

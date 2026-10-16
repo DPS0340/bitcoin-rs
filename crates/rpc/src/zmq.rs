@@ -1177,8 +1177,8 @@ mod manifest_tests {
         );
         assert_eq!(
             *control.published_from.lock(),
-            vec![1],
-            "the mining leg wakes the coordinator with the mutation's sequence"
+            vec![(1, 0)],
+            "the mining leg wakes the coordinator with the commit's tokens"
         );
         assert_eq!(
             control.publish_count(),

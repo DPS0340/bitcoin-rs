@@ -51,13 +51,15 @@ state (`crates/mempool/src/orphan.rs`).
   affect the committed mutation. No gateway lock is held across an
   observer call, so an observer may re-enter the gateway: a nested call
   commits, enqueues, and returns immediately, and its publication
-  completes after the in-flight callback. The accepted-mutation mining
-  wake threads the last change's sequence into
+  completes after the in-flight callback. The mining wake threads the
+  membership sequence and the fee-delta revision the gateway captured
+  under the same write lock that committed the batch into
   `MempoolSequenceWake::publish_generation_from`, which builds the
-  generation key from `applied_tip` plus that sequence and never touches
-  the mempool read lock (`crates/mining/src/generation_signal.rs`); `node` attaches that
-  mining observer at gateway construction and the ZMQ sequence observer as
-  an extra named leg on the gateway's `CompositeObserver`.
+  generation key from `applied_tip` plus those two tokens and never
+  touches the mempool read lock (`crates/mining/src/generation_signal.rs`);
+  `node` attaches that mining observer at gateway construction and the ZMQ
+  sequence observer as an extra named leg on the gateway's
+  `CompositeObserver`.
 
 ### `MPL-02`: Atomic mutation records and sequence assignment
 
@@ -76,6 +78,20 @@ state (`crates/mempool/src/orphan.rs`).
   `MutationResult::sequence_of` returns the wrapped value for any
   in-range index. A sequence of `0` is a valid committed value; only an
   empty `MutationResult` carries no sequence.
+- `Mempool::prioritise` moves a separate fee-delta revision and emits no
+  membership change, so it returns the advanced revision and adds no
+  `MutationChange`. `MutationOutcome` stays `Accepted | Removed`; the
+  public mutation vocabulary carries no prioritisation variant. The
+  gateway publishes a prioritisation as a revision-only envelope: an
+  empty `MutationResult` plus the pool's membership sequence and fee-delta
+  revision captured under the commit write lock. Observers that consume
+  membership changes see an empty batch and act on nothing; the mining
+  wake reads both tokens from the envelope.
+- Proof: `crates/mempool/src/pool.rs::prioritise_reorders_priority_index`
+  checks the overlay reorder and
+  `crates/mempool/src/mutation.rs::sequence_of_only_returns_sequences_for_committed_changes`
+  plus `empty_mutation_has_no_sequence_at_any_index` pin the sequence
+  contract that a revision-only envelope preserves.
 
 ### `MPL-03`: ZeroMQ sequence event payload mapping
 
@@ -400,6 +416,19 @@ state (`crates/mempool/src/orphan.rs`).
   `publish_generation_from_does_not_take_mempool_lock`,
   `concurrent_publish_generation_paths_do_not_deadlock`,
   `long_poll_returns_quickly_on_mempool_sequence_wake`.
+- `crates/mempool/src/gateway.rs` (inline tests):
+  `prioritisation_publishes_a_revision_only_envelope` (two prioritisation
+  calls publish two revision-only envelopes carrying the live membership
+  sequence and the advanced revision, and a zero delta publishes nothing)
+  and
+  `prioritise_if_not_dust_publishes_only_when_it_applies_the_overlay` (a
+  pooled dust output is refused with no publication and no revision move).
+- `crates/mining/tests/prioritise_candidate.rs`:
+  `prioritisation_invalidates_the_cached_candidate_and_wakes_the_long_poll`
+  (a live service over a real tree and gateway: the prioritised candidate
+  leads, the identity changes, the long poll wakes) and
+  `a_prioritisation_wake_alone_releases_an_already_waiting_poll` (a waiting
+  poller returns only after the prioritisation's observer dispatch).
 - `crates/node/tests/tx_ingress_e2e.rs`:
   `accepted_peer_tx_is_admitted_and_relayed_excluding_the_source`,
   `below_min_relay_tx_is_rejected_recorded_and_never_relayed`

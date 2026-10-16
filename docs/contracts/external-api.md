@@ -392,6 +392,11 @@ index-server protocol compatibility claim.
   does not model; neither is emitted.
 - On signet, the template carries `signet` in `rules` (mandatory) and
   `signet_challenge`. Other networks omit `signet_challenge`.
+- A `longpollid` is the 64-hex big-endian tip hash followed by two
+  zero-padded 20-digit decimals: the mempool membership sequence and the
+  fee-delta revision. Fixed widths give bit-exact token boundaries. A
+  legacy one-token id (1 to 20 unpadded digits) still parses, with a
+  fee-delta revision of zero. Any other tail length is malformed.
   - Malformed `longpollid` values, including invalid UTF-8 split boundaries, are rejected without panicking.
 
 ### `API-12`: Mainnet template operational gates
@@ -1014,6 +1019,9 @@ evidence does not establish mainnet memory or throughput qualifications.
   - `crates/mining/src/coordinator/tests.rs` tests
     `template_projects_candidate_generation_and_deployment_flags`,
     `long_poll_round_trips_template_id`,
+    `multi_digit_tokens_round_trip_without_ambiguity`,
+    `legacy_single_token_ids_parse_with_a_zero_fee_delta`,
+    `malformed_long_poll_tail_lengths_are_rejected`,
     `long_poll_rejects_non_ascii_split_boundary_without_panicking`
   - `crates/node/tests/mining.rs` tests `template_does_not_echo_client_capabilities`,
     `signet_template_includes_challenge_and_signet_rule`

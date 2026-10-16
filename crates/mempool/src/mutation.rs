@@ -183,8 +183,28 @@ impl From<LocalOrigin> for AdmissionOrigin {
     }
 }
 
-/// What the gateway hands its observers: the committed result plus how the
-/// mutating transaction entered the node.
+/// What one committed mutation publishes to observers.
+///
+/// [`MempoolGateway`](crate::MempoolGateway) builds this under the pool write
+/// lock, so the decision is atomic with the mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitPublication {
+    /// The mutation committed no membership change and moved no revision:
+    /// publish nothing.
+    Nothing,
+    /// The mutation committed membership changes. An empty result means the
+    /// commit was a no-op, so nothing publishes, matching every other
+    /// mutation.
+    Membership(MutationResult),
+    /// The mutation moved only the pool's fee-delta revision: publish an
+    /// empty result plus the advanced revision. Prioritisation uses this; no
+    /// fabricated membership change enters the public vocabulary.
+    Revision,
+}
+
+/// What the gateway hands its observers: the committed result, how the
+/// mutating transaction entered the node, and the pool revision tokens
+/// captured under the same write lock.
 ///
 /// [`MempoolGateway`](crate::MempoolGateway) clones one [`MutationResult`] into the envelope for
 /// each committed non-empty batch that has an observer attached, enqueues
@@ -194,8 +214,20 @@ impl From<LocalOrigin> for AdmissionOrigin {
 pub struct MutationEnvelope {
     /// How the transaction entered the node.
     pub origin: AdmissionOrigin,
-    /// The committed mutation, in commit order.
+    /// The committed membership changes, in commit order. Empty for a
+    /// revision-only publication.
     pub result: MutationResult,
+    /// The pool's membership sequence at commit, captured under the same
+    /// write lock. For a non-empty `result` it equals the last change's
+    /// `sequence_of` value.
+    pub mempool_sequence: u64,
+    /// The pool's fee-delta revision at commit, captured under that same
+    /// write lock, so an observer never reads the pool for it.
+    ///
+    /// A mining-relevant token that advances on an in-pool prioritisation. It
+    /// is not a membership sequence and never appears in `getmempoolinfo` or
+    /// the ZMQ payloads.
+    pub fee_delta_sequence: u64,
 }
 
 #[cfg(test)]

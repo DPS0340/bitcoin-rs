@@ -190,6 +190,21 @@ pub(crate) enum AdmissionMode {
     PackageSubmit,
 }
 
+/// What one `prioritisetransaction` attempt did to the pool.
+///
+/// The three cases are distinct on the public surface: a dust rejection
+/// returns `false`, an applied overlay returns `true` even when it moved
+/// nothing (a zero or cancelling delta), and only a moved revision publishes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppliedPrioritise {
+    /// The overlay applied and advanced the pool's fee-delta revision.
+    Moved(u64),
+    /// The overlay applied but moved nothing: a zero or cancelling delta.
+    NoMove,
+    /// The guard refused the call before applying anything.
+    DustRejected,
+}
+
 #[allow(
     clippy::large_enum_variant,
     reason = "Admission stages keep their owned facts inline without an additional heap allocation."
@@ -357,7 +372,7 @@ fn witness_strippable_failure(error: &ConsensusError, prevouts: &[(OutPoint, TxO
         })
 }
 
-use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationResult};
+use crate::mutation::{AdmissionOrigin, CommitPublication, MutationEnvelope, MutationResult};
 use crate::orphan::RejectScope;
 use crate::pool::{MempoolError, PrioritiseError, PrioritisedTransaction};
 #[cfg(any(test, feature = "test-seam"))]
@@ -657,7 +672,7 @@ impl MempoolGateway {
                     pool.commit_pool_change(plan)
                         .map_err(RbfError::into_pool_error)
                 },
-                |result| Some(result),
+                |result| CommitPublication::Membership(result.clone()),
             );
             if !matches!(result, Err(MempoolError::StalePolicy)) {
                 return result;
@@ -687,7 +702,7 @@ impl MempoolGateway {
             let result = self.commit(
                 origin,
                 move |pool| pool.commit_pool_change(plan),
-                |result| Some(result),
+                |result| CommitPublication::Membership(result.clone()),
             );
             if !matches!(result, Err(RbfError::StalePlan)) {
                 return result;
@@ -781,8 +796,8 @@ impl MempoolGateway {
                     })
             },
             |outcome| match outcome {
-                AdmitOutcome::AlreadyKnown => None,
-                AdmitOutcome::Committed(result) => Some(result),
+                AdmitOutcome::AlreadyKnown => CommitPublication::Nothing,
+                AdmitOutcome::Committed(result) => CommitPublication::Membership(result.clone()),
             },
         )
     }
@@ -1075,7 +1090,7 @@ impl MempoolGateway {
                 }
                 Ok(pool.remove_for_reorg(&failing))
             },
-            |result| Some(result),
+            |result| CommitPublication::Membership(result.clone()),
         )
     }
 
@@ -1127,7 +1142,7 @@ impl MempoolGateway {
                 pool.commit_pool_change(plan)
                     .map_err(RbfError::into_pool_error)
             },
-            |result| Some(result),
+            |result| CommitPublication::Membership(result.clone()),
         )
     }
 
@@ -1139,43 +1154,77 @@ impl MempoolGateway {
         self.commit_infallible(origin, Mempool::clear)
     }
 
-    /// Commits `pool.prioritise`. Never publishes: prioritisation emits no
-    /// mutation change, so there is nothing to order.
+    /// Commits `pool.prioritise` through the same single publication owner
+    /// every other mutation uses. The overlay moves the pool's fee-delta
+    /// revision without emitting a membership change, so the published
+    /// envelope carries an empty `MutationResult` plus the advanced revision;
+    /// the mining observer wakes on that revision. A zero or cancelling delta
+    /// applies successfully and publishes nothing.
     pub fn prioritise(&self, txid: Txid, fee_delta: i64) -> Result<(), PrioritiseError> {
-        let mut pool = self.pool.write();
-        self.apply_prioritise(&mut pool, txid, fee_delta)
+        let outcome = self.commit(
+            AdmissionOrigin::Rpc,
+            |pool| self.apply_prioritise(pool, txid, fee_delta),
+            |outcome| match outcome {
+                AppliedPrioritise::Moved(_) => CommitPublication::Revision,
+                AppliedPrioritise::NoMove | AppliedPrioritise::DustRejected => {
+                    CommitPublication::Nothing
+                }
+            },
+        );
+        outcome.map(|_outcome| ())
     }
 
-    /// Atomically rejects pooled dust before applying a fee overlay.
+    /// Atomically rejects pooled dust before applying a fee overlay. The dust
+    /// check and the overlay application run inside the same `commit` write
+    /// guard, so a concurrent admission cannot add a pooled dust transaction
+    /// between them. A dust rejection commits nothing and publishes nothing,
+    /// and returns `false`; an applied overlay — including a zero delta —
+    /// returns `true`.
     pub fn prioritise_if_not_dust(
         &self,
         txid: Txid,
         fee_delta: i64,
         dust_relay_fee: u64,
     ) -> Result<bool, PrioritiseError> {
-        let mut pool = self.pool.write();
-        if let Some(entry) = pool.entry_by_txid(&txid)
-            && crate::standardness::tx_has_dust_outputs(&entry.tx, dust_relay_fee)
-        {
-            return Ok(false);
-        }
-        self.apply_prioritise(&mut pool, txid, fee_delta)?;
-        Ok(true)
+        let outcome = self.commit(
+            AdmissionOrigin::Rpc,
+            |pool| {
+                if let Some(entry) = pool.entry_by_txid(&txid)
+                    && crate::standardness::tx_has_dust_outputs(&entry.tx, dust_relay_fee)
+                {
+                    return Ok(AppliedPrioritise::DustRejected);
+                }
+                self.apply_prioritise(pool, txid, fee_delta)
+            },
+            |outcome| match outcome {
+                AppliedPrioritise::Moved(_) => CommitPublication::Revision,
+                AppliedPrioritise::NoMove | AppliedPrioritise::DustRejected => {
+                    CommitPublication::Nothing
+                }
+            },
+        );
+        outcome.map(|outcome| !matches!(outcome, AppliedPrioritise::DustRejected))
     }
 
     /// Applies the overlay and clears peer-reject evidence the new fee
-    /// ordering may have invalidated.
+    /// ordering may have invalidated. The returned outcome separates a dust
+    /// rejection, an applied overlay that moved nothing, and an applied
+    /// overlay that advanced the revision, so the commit owner can publish the
+    /// revision without a second pool read.
     fn apply_prioritise(
         &self,
         pool: &mut Mempool,
         txid: Txid,
         fee_delta: i64,
-    ) -> Result<(), PrioritiseError> {
-        pool.prioritise(txid, fee_delta)?;
-        if fee_delta != 0 {
+    ) -> Result<AppliedPrioritise, PrioritiseError> {
+        let moved = pool.prioritise(txid, fee_delta)?;
+        if moved.is_some() && fee_delta != 0 {
             self.lifecycle.lock().clear_rejects();
         }
-        Ok(())
+        Ok(match moved {
+            Some(revision) => AppliedPrioritise::Moved(revision),
+            None => AppliedPrioritise::NoMove,
+        })
     }
 
     /// Reads the stored fee-delta overlay map.
@@ -1186,31 +1235,46 @@ impl MempoolGateway {
 
     /// The single commit-and-publish path every publishing mutation flows
     /// through. A failed `mutate` returns before the publish mutex is taken
-    /// and means nothing was committed. A successful mutation publishes
-    /// every accepted/removed change from its prevalidated plan.
+    /// and means nothing was committed.
+    ///
+    /// `publication` decides, under the same write guard, what observers see:
+    /// `Nothing` to publish nothing, `Membership(result)` to publish that
+    /// membership batch when it is non-empty, or `Revision` to publish an
+    /// empty result plus the pool's advanced fee-delta revision. Either way
+    /// the envelope carries the membership sequence and fee-delta revision
+    /// captured under this one guard, so an observer never reads the pool for
+    /// them.
+    ///
     /// Successful mutations acquire the publish mutex before releasing the
     /// pool guard, then call observers only after releasing the pool guard.
     pub(crate) fn commit<T, E>(
         &self,
         origin: AdmissionOrigin,
         mutate: impl FnOnce(&mut Mempool) -> Result<T, E>,
-        mutation: impl FnOnce(&T) -> Option<&MutationResult>,
+        publication: impl FnOnce(&T) -> CommitPublication,
     ) -> Result<T, E> {
         let mut elected = false;
         let outcome = {
             let mut pool = self.pool.write();
             let outcome = mutate(&mut pool)?;
-            if let Some(result) = mutation(&outcome) {
-                self.update_admission_lifecycle(&pool, result);
-                if !result.changes.is_empty() && self.observer.is_some() {
-                    let mut publish = self.publish.lock();
-                    publish.queue.push_back(MutationEnvelope {
-                        origin,
-                        result: result.clone(),
-                    });
-                    elected = !publish.draining;
-                    publish.draining = true;
+            let envelope = match publication(&outcome) {
+                CommitPublication::Nothing => None,
+                CommitPublication::Membership(result) => {
+                    self.update_admission_lifecycle(&pool, &result);
+                    (!result.is_empty()).then_some(result)
                 }
+                CommitPublication::Revision => Some(MutationResult::empty()),
+            };
+            if let Some(result) = envelope {
+                self.enqueue_locked(
+                    &mut elected,
+                    MutationEnvelope {
+                        origin,
+                        result,
+                        mempool_sequence: pool.sequence_number(),
+                        fee_delta_sequence: pool.fee_delta_sequence_number(),
+                    },
+                );
             }
             outcome
         };
@@ -1218,6 +1282,19 @@ impl MempoolGateway {
             self.drain();
         }
         Ok(outcome)
+    }
+
+    /// Enqueues one envelope under the caller's held pool write guard and
+    /// elects this caller as the drainer when none exists. The FIFO order is
+    /// the commit order, because every call runs under the pool write guard.
+    fn enqueue_locked(&self, elected: &mut bool, envelope: MutationEnvelope) {
+        if self.observer.is_none() {
+            return;
+        }
+        let mut publish_state = self.publish.lock();
+        publish_state.queue.push_back(envelope);
+        *elected = !publish_state.draining;
+        publish_state.draining = true;
     }
 
     /// Finalizes peer-only holding/rejection while the exact admission state
@@ -1277,7 +1354,7 @@ impl MempoolGateway {
         let Ok(result) = self.commit(
             origin,
             |pool| Ok::<_, core::convert::Infallible>(mutate(pool)),
-            |result| Some(result),
+            |result| CommitPublication::Membership(result.clone()),
         );
         result
     }
@@ -1548,16 +1625,26 @@ mod tests {
         Hash256::from_le_bytes(txid.as_bytes())
     }
 
-    /// Records the txid and outcome of every change the observer sees.
+    /// Records the txid and outcome of every change the observer sees, plus
+    /// each envelope's revision pair.
     #[derive(Default)]
     struct RecordingObserver {
         seen: Mutex<Vec<(Hash256, MutationOutcome)>>,
         origins: Mutex<Vec<AdmissionOrigin>>,
+        /// Every envelope's `(mempool_sequence, fee_delta_sequence)`, in order.
+        revisions: Mutex<Vec<(u64, u64)>>,
+        /// Whether each envelope carried no membership change.
+        revision_only: Mutex<Vec<bool>>,
     }
 
     impl MempoolObserver for RecordingObserver {
         fn on_mutation(&self, envelope: &MutationEnvelope) {
             self.origins.lock().push(envelope.origin);
+            self.revisions
+                .lock()
+                .push((envelope.mempool_sequence, envelope.fee_delta_sequence));
+            let revision_only = envelope.result.is_empty();
+            self.revision_only.lock().push(revision_only);
             let mut seen = self.seen.lock();
             for change in &envelope.result.changes {
                 seen.push((change.txid, change.outcome));
@@ -1755,6 +1842,107 @@ mod tests {
         );
         assert!(gateway.read().contains_txid(&child_txid));
         assert_eq!(gateway.read().len(), 1);
+    }
+
+    #[test]
+    fn prioritisation_publishes_a_revision_only_envelope() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let resident = tx(80);
+        let resident_txid = resident.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&resident))
+            .expect("resident in");
+        observer.seen.lock().clear();
+        observer.revisions.lock().clear();
+        observer.revision_only.lock().clear();
+        let sequence_before = gateway.read().sequence_number();
+
+        // Two prioritisation calls move the fee-delta revision twice without
+        // touching membership: the observer must see two revision-only
+        // envelopes, each carrying the advanced token and the live sequence.
+        gateway.prioritise(resident_txid, 500).expect("fee delta");
+        gateway.prioritise(resident_txid, 250).expect("fee delta");
+
+        assert_eq!(
+            gateway.read().sequence_number(),
+            sequence_before,
+            "prioritisation must leave the membership sequence alone"
+        );
+        assert!(
+            observer.seen.lock().is_empty(),
+            "a prioritisation emits no membership change"
+        );
+        assert_eq!(
+            *observer.revision_only.lock(),
+            vec![true, true],
+            "both publications are revision-only"
+        );
+        assert_eq!(
+            *observer.revisions.lock(),
+            vec![(sequence_before, 1), (sequence_before, 2)],
+            "each envelope carries the live sequence and the advanced revision"
+        );
+
+        // A zero delta moves nothing and must publish nothing.
+        observer.revisions.lock().clear();
+        gateway.prioritise(resident_txid, 0).expect("no-op delta");
+        assert!(
+            observer.revisions.lock().is_empty(),
+            "a no-op prioritisation publishes nothing"
+        );
+    }
+
+    #[test]
+    fn prioritise_if_not_dust_publishes_only_when_it_applies_the_overlay() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        // A pooled dust transaction: one dust-valued output below the relay
+        // fee, so the guard must reject the overlay.
+        let mut dust = tx(81);
+        dust.outputs[0].value = Amount::from_sat(100);
+        let dust_txid = dust.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&dust))
+            .expect("dust in");
+        observer.revisions.lock().clear();
+
+        assert!(
+            !gateway
+                .prioritise_if_not_dust(dust_txid, 500, 10_000)
+                .expect("dust check"),
+            "a pooled dust output must be rejected"
+        );
+        assert!(
+            observer.revisions.lock().is_empty(),
+            "a rejected dust prioritisation publishes nothing"
+        );
+        assert_eq!(
+            gateway.read().fee_delta_sequence_number(),
+            0,
+            "a rejected prioritisation must not move the revision"
+        );
+
+        // The same call against a non-dust output applies and publishes.
+        let mut clean = tx(82);
+        clean.outputs[0].value = Amount::from_sat(1_000_000);
+        let clean_txid = clean.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&clean))
+            .expect("clean in");
+        observer.revisions.lock().clear();
+        assert!(
+            gateway
+                .prioritise_if_not_dust(clean_txid, 500, 10_000)
+                .expect("clean check"),
+            "a non-dust entry applies the overlay"
+        );
+        assert_eq!(
+            *observer.revisions.lock(),
+            vec![(gateway.read().sequence_number(), 1)],
+            "the applied overlay publishes one revision-only envelope"
+        );
+        assert_eq!(gateway.read().fee_delta_sequence_number(), 1);
     }
 
     #[test]

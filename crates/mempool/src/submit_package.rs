@@ -5,7 +5,8 @@ use crate::admission::{
 use crate::gateway::AdmissionMode;
 use crate::standardness::AcceptanceRejectReason;
 use crate::{
-    AdmissionChain, AdmissionOrigin, LocalOrigin, MempoolGateway, MutationResult, SubmitError,
+    AdmissionChain, AdmissionOrigin, CommitPublication, LocalOrigin, MempoolGateway,
+    MutationResult, SubmitError,
 };
 use alloc::vec::Vec;
 use bitcoin_rs_primitives::Tx;
@@ -193,7 +194,7 @@ impl MempoolGateway {
                         other => crate::AdmitError::Policy(other.into()),
                     })
                 },
-                |result| Some(result),
+                |result| CommitPublication::Membership(result.clone()),
             );
             match result {
                 Ok(result) => return Ok(result),

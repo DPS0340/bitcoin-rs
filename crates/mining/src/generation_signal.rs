@@ -41,10 +41,10 @@ impl MiningGenerationSignal {
         }
     }
 
-    /// Forwards one mempool-sequence wake.
-    pub fn publish_generation_from(&self, sequence: u64) {
+    /// Forwards one mempool-sequence wake carrying both captured tokens.
+    pub fn publish_generation_from(&self, mempool_sequence: u64, fee_delta_sequence: u64) {
         if let Some(wake) = self.sequence_wake.read().as_ref().and_then(Weak::upgrade) {
-            wake.publish_generation_from(sequence);
+            wake.publish_generation_from(mempool_sequence, fee_delta_sequence);
         } else {
             self.publish_generation();
         }
@@ -53,10 +53,10 @@ impl MiningGenerationSignal {
 
 impl MempoolObserver for MiningGenerationSignal {
     fn on_mutation(&self, envelope: &MutationEnvelope) {
-        let result = &envelope.result;
-        let wake_sequence = result
-            .sequence_of(result.changes.len().saturating_sub(1))
-            .unwrap_or(result.sequence_base);
-        self.publish_generation_from(wake_sequence);
+        // The envelope carries both pool tokens captured under the gateway's
+        // write lock, so this wake needs no pool read. A prioritisation
+        // publishes an empty result with the fee-delta revision advanced; a
+        // membership commit publishes both tokens as captured.
+        self.publish_generation_from(envelope.mempool_sequence, envelope.fee_delta_sequence);
     }
 }

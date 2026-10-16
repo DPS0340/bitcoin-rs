@@ -133,17 +133,30 @@ fn template_mines_to_tip_and_drains_mempool() -> Result<()> {
     assert_eq!(required_u64(&template, "sizelimit")?, 4_000_000);
     assert_eq!(required_u64(&template, "weightlimit")?, 4_000_000);
     let long_poll_id = required_str(&template, "longpollid")?;
-    assert!(
-        long_poll_id.len() > 64,
-        "longpollid carries tip hash and sequence"
+    assert_eq!(
+        long_poll_id.len(),
+        64 + 20 + 20,
+        "longpollid carries the tip hash and two zero-padded 20-digit tokens"
     );
     assert!(
         long_poll_id.starts_with(&seed_tip_hash.to_string_be()),
         "longpollid begins with the applied tip hash"
     );
-    long_poll_id[64..]
+    let mempool_sequence = long_poll_id[64..84]
         .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("longpollid suffix must be the mempool sequence"))?;
+        .map_err(|_| anyhow::anyhow!("longpollid membership token must be the mempool sequence"))?;
+    let fee_delta_sequence = long_poll_id[84..].parse::<u64>().map_err(|_| {
+        anyhow::anyhow!("longpollid fee-delta token must be the fee-delta revision")
+    })?;
+    assert_eq!(
+        mempool_sequence,
+        state.mempool().read().sequence_number(),
+        "the longpollid membership token is the pool's membership sequence"
+    );
+    assert_eq!(
+        fee_delta_sequence, 0,
+        "a template with no prioritisation carries a zero fee-delta token"
+    );
     let mutable = template
         .get("mutable")
         .and_then(|value| value.as_array())

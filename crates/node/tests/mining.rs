@@ -1491,7 +1491,7 @@ fn concurrent_publish_generation_paths_do_not_deadlock() -> anyhow::Result<()> {
     let seq_thread = thread::spawn(move || {
         let mut seq = 1_u64;
         while !stop_seq.load(Ordering::Relaxed) {
-            mining_seq.publish_generation_from(seq);
+            mining_seq.publish_generation_from(seq, 0);
             seq = seq.wrapping_add(1);
         }
     });
@@ -1522,7 +1522,7 @@ fn publish_generation_from_does_not_take_mempool_lock() -> anyhow::Result<()> {
 
     let (done_tx, done_rx) = bounded::<()>(1);
     let handle = thread::spawn(move || {
-        mining.publish_generation_from(1);
+        mining.publish_generation_from(1, 0);
         let _ = done_tx.send(());
     });
 
@@ -1576,7 +1576,7 @@ fn long_poll_returns_quickly_on_mempool_sequence_wake() -> anyhow::Result<()> {
     // Advance the mempool sequence and wake via the lock-free path.
     advance_mempool_sequence(&state)?;
     let seq = state.mempool().read().sequence_number();
-    mining.publish_generation_from(seq);
+    mining.publish_generation_from(seq, 0);
 
     let wake_start = std::time::Instant::now();
     let result = waiter

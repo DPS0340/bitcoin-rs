@@ -60,14 +60,19 @@ fn candidate_scalars_and_depends_match_selected_transactions() -> Result<(), Box
 
     assert_eq!(
         candidate.template_id,
-        TemplateId::new(&context.previous_block_hash, snapshot.sequence)
+        TemplateId::new(
+            &context.previous_block_hash,
+            snapshot.sequence,
+            snapshot.fee_delta_sequence,
+        )
     );
     assert_eq!(
         candidate.template_id.as_str(),
         format!(
-            "{}{}",
+            "{}{:020}{:020}",
             context.previous_block_hash.to_string_be(),
-            snapshot.sequence
+            snapshot.sequence,
+            snapshot.fee_delta_sequence,
         )
     );
     assert_eq!(candidate.previous_block_hash, context.previous_block_hash);

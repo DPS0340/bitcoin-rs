@@ -777,7 +777,7 @@ mod tests {
     fn sample_candidate() -> Candidate {
         let previous = Hash256::from_le_bytes(&[0x11; 32]);
         Candidate {
-            template_id: TemplateId::new(&previous, 9),
+            template_id: TemplateId::new(&previous, 9, 0),
             previous_block_hash: previous,
             height: 101,
             version: 0x2000_0000,

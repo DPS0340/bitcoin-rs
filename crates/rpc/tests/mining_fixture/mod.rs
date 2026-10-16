@@ -24,7 +24,7 @@ pub(crate) fn canned_template(
     let previous_block_hash = Hash256::default();
     BlockTemplate {
         candidate: Arc::new(Candidate {
-            template_id: TemplateId::new(&previous_block_hash, 0),
+            template_id: TemplateId::new(&previous_block_hash, 0, 0),
             previous_block_hash,
             height: 0,
             version: 0x2000_0000,

@@ -91,7 +91,9 @@ fn native_package_aggregates_cpfp_atomically_and_ignores_input_order() -> TestRe
         seen.0.lock().as_slice(),
         &[crate::MutationEnvelope {
             origin: AdmissionOrigin::Rpc,
-            result
+            mempool_sequence: result.sequence_of(0).map_or(1, |value| value + 1),
+            fee_delta_sequence: 0,
+            result,
         }]
     );
     assert!(

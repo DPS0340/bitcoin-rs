@@ -43,20 +43,28 @@ pub struct CandidateContext {
     pub max_sigops: u64,
 }
 
-/// Deterministic generation identity for a captured tip and mempool sequence.
+/// Deterministic generation identity for a captured tip and mempool revision.
 ///
-/// Matches Bitcoin Core's `longpollid` encoding: tip hash as big-endian hex
-/// concatenated with the decimal mempool sequence.
+/// The BIP22/BIP23 long-poll identity: the tip hash as big-endian hex, then
+/// the membership sequence and fee-delta revision as zero-padded 20-digit
+/// decimals. Fixed widths give the parser bit-exact boundaries, so `(12, 3)`
+/// and `(1, 23)` encode to different strings.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TemplateId(String);
 
 impl TemplateId {
-    /// Builds the identity for `previous_block_hash` and `mempool_sequence`.
+    /// Builds the identity for `previous_block_hash`, `mempool_sequence`, and
+    /// `fee_delta_sequence`. Both mempool tokens are zero-padded to a fixed
+    /// 20-digit width after the hash.
     #[must_use]
-    pub fn new(previous_block_hash: &Hash256, mempool_sequence: u64) -> Self {
+    pub fn new(
+        previous_block_hash: &Hash256,
+        mempool_sequence: u64,
+        fee_delta_sequence: u64,
+    ) -> Self {
         Self(format!(
-            "{}{mempool_sequence}",
-            previous_block_hash.to_string_be()
+            "{}{mempool_sequence:020}{fee_delta_sequence:020}",
+            previous_block_hash.to_string_be(),
         ))
     }
 
@@ -362,7 +370,11 @@ fn finish_candidate(
         .ok_or(MiningError::CandidateScalarOverflow { field: "weight" })?;
 
     Ok(Candidate {
-        template_id: TemplateId::new(&context.previous_block_hash, snapshot.sequence),
+        template_id: TemplateId::new(
+            &context.previous_block_hash,
+            snapshot.sequence,
+            snapshot.fee_delta_sequence,
+        ),
         previous_block_hash: context.previous_block_hash,
         height: context.height,
         version: context.version,

@@ -25,7 +25,7 @@ fn sample_candidate(
     segwit_active: bool,
 ) -> Candidate {
     Candidate {
-        template_id: TemplateId::new(&previous, sequence),
+        template_id: TemplateId::new(&previous, sequence, 0),
         previous_block_hash: previous,
         height: 1,
         version: 1,
@@ -177,13 +177,14 @@ fn long_poll_round_trips_template_id() {
     let key = GenerationKey {
         tip_hash: tip,
         mempool_sequence: 7,
+        fee_delta_sequence: 3,
     };
     let id = key.template_id();
     let Some(parsed) = parse_long_poll_id(id.as_str()) else {
         panic!("generated long-poll id did not parse");
     };
     assert_eq!(parsed, key);
-    assert_eq!(TemplateId::new(&tip, 7).as_str(), id.as_str());
+    assert_eq!(TemplateId::new(&tip, 7, 3).as_str(), id.as_str());
 }
 
 #[test]
@@ -194,4 +195,54 @@ fn long_poll_rejects_non_ascii_split_boundary_without_panicking() {
     let malformed = format!("{}é", "0".repeat(63));
     assert_eq!(malformed.len(), 65);
     assert!(parse_long_poll_id(&malformed).is_none());
+}
+
+#[test]
+fn multi_digit_tokens_round_trip_without_ambiguity() {
+    // Zero-padded fixed-width tokens: the pairs that collide under naive
+    // concatenation must encode to different strings and round-trip exactly.
+    let tip = Hash256::from_le_bytes(&[0x22; 32]);
+    let twelve_three = parse_long_poll_id(TemplateId::new(&tip, 12, 3).as_str())
+        .unwrap_or_else(|| panic!("(12, 3) must parse"));
+    let one_twenty_three = parse_long_poll_id(TemplateId::new(&tip, 1, 23).as_str())
+        .unwrap_or_else(|| panic!("(1, 23) must parse"));
+    assert_eq!(twelve_three.mempool_sequence, 12);
+    assert_eq!(twelve_three.fee_delta_sequence, 3);
+    assert_eq!(one_twenty_three.mempool_sequence, 1);
+    assert_eq!(one_twenty_three.fee_delta_sequence, 23);
+    assert_ne!(
+        TemplateId::new(&tip, 12, 3),
+        TemplateId::new(&tip, 1, 23),
+        "distinct generations must not collapse to one id"
+    );
+}
+
+#[test]
+fn legacy_single_token_ids_parse_with_a_zero_fee_delta() {
+    // A pre-upgrade holder sends `{hash}{sequence}` with an unpadded decimal
+    // sequence of 1..=20 digits. Every such id must parse, with a fee-delta of
+    // zero, so the upgrade does not break existing long polls.
+    let tip = Hash256::from_le_bytes(&[0x33; 32]);
+    let hash_hex = tip.to_string_be();
+    for sequence in [0_u64, 7, 12, 9_999, 1_000_000, u64::MAX] {
+        let legacy = format!("{hash_hex}{sequence}");
+        let parsed = parse_long_poll_id(&legacy)
+            .unwrap_or_else(|| panic!("legacy id for sequence {sequence} must parse"));
+        assert_eq!(parsed.tip_hash, tip);
+        assert_eq!(parsed.mempool_sequence, sequence);
+        assert_eq!(parsed.fee_delta_sequence, 0);
+    }
+}
+
+#[test]
+fn malformed_long_poll_tail_lengths_are_rejected() {
+    let tip = Hash256::from_le_bytes(&[0x44; 32]);
+    let hash_hex = tip.to_string_be();
+    for tail_len in [0_usize, 21, 39, 41] {
+        let malformed = format!("{hash_hex}{}", "1".repeat(tail_len));
+        assert!(
+            parse_long_poll_id(&malformed).is_none(),
+            "a {tail_len}-digit tail is not a canonical id"
+        );
+    }
 }

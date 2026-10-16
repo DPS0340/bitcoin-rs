@@ -55,20 +55,29 @@ const GENERATION_RACE: &str = "generation key changed during candidate assembly"
 /// Upper bound for a single long-poll wait slice while rechecking predicates.
 const LONG_POLL_SLICE: Duration = Duration::from_secs(1);
 
-/// Applied-tip hash plus mempool sequence that identify one candidate generation.
+/// Applied-tip hash plus both mempool revision tokens that identify one
+/// candidate generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GenerationKey {
     /// Applied tip hash in consensus little-endian storage order.
     tip_hash: Hash256,
-    /// Mempool sequence captured with the tip.
+    /// Mempool membership sequence captured with the tip.
     mempool_sequence: u64,
+    /// Mempool fee-delta revision captured with the tip. An in-pool
+    /// prioritisation moves this token and emits no membership change, so
+    /// without it a cached candidate survives a prioritisation.
+    fee_delta_sequence: u64,
 }
 
 impl GenerationKey {
     /// Opaque BIP22/BIP23 long-poll identity for this generation.
     #[must_use]
     fn template_id(self) -> TemplateId {
-        TemplateId::new(&self.tip_hash, self.mempool_sequence)
+        TemplateId::new(
+            &self.tip_hash,
+            self.mempool_sequence,
+            self.fee_delta_sequence,
+        )
     }
 }
 
@@ -130,16 +139,19 @@ impl CoordinatorState {
     }
 }
 
-/// Mempool-sequence wake that avoids the mempool read lock.
+/// Mempool wake that avoids the mempool read lock.
 ///
 /// The mempool observer fires under the gateway's publish mutex; taking the
 /// pool read lock from that path can deadlock or contend with an in-flight
 /// writer. Implementations build the generation key from `applied_tip` plus
-/// the caller-supplied sequence instead.
+/// the revision tokens the observer already captured, and never read the pool.
 pub trait MempoolSequenceWake: Send + Sync {
-    /// Publishes a generation key built from `applied_tip` and `sequence`
-    /// without taking the mempool read lock, then wakes all waiters.
-    fn publish_generation_from(&self, sequence: u64);
+    /// Publishes a generation key built from `applied_tip` and the pool's
+    /// `mempool_sequence` and `fee_delta_sequence` captured at commit, then
+    /// wakes all waiters. A prioritisation publishes with the membership
+    /// sequence unchanged and the fee-delta revision advanced, so the key
+    /// changes and both the cache and long polls follow.
+    fn publish_generation_from(&self, mempool_sequence: u64, fee_delta_sequence: u64);
 }
 
 /// Applied-chain tip the lifecycle reads instead of node state.
@@ -152,12 +164,20 @@ pub trait AppliedTipSource: Send + Sync {
 pub trait MempoolSnapshotSource: Send + Sync {
     /// Monotonic mutation sequence of the pool.
     fn current_sequence(&self) -> u64;
-    /// Captures the mining snapshot if the pool is still at `expected_sequence`.
+    /// Monotonic fee-delta revision of the pool. An in-pool prioritisation
+    /// moves this token without moving `current_sequence`.
+    fn current_fee_delta_sequence(&self) -> u64;
+    /// Captures the mining snapshot if the pool is still at both expected
+    /// tokens.
     ///
-    /// The comparison and the capture share one pool read lock: a snapshot is
-    /// only valid for the sequence it was taken at, so generation-key
+    /// The comparisons and the capture share one pool read lock: a snapshot is
+    /// only valid for the revision it was taken at, so generation-key
     /// coherence is checked and captured atomically.
-    fn mining_snapshot_at(&self, expected_sequence: u64) -> Option<MempoolMiningSnapshot>;
+    fn mining_snapshot_at(
+        &self,
+        expected_sequence: u64,
+        expected_fee_delta_sequence: u64,
+    ) -> Option<MempoolMiningSnapshot>;
     /// Captures the mining snapshot an explicit generate selection assembles from.
     ///
     /// Pool facts are captured under one read lock; `Ordered` selections
@@ -264,18 +284,20 @@ impl MiningService {
         self.publish_key(key);
     }
 
-    /// Publishes a generation key built from `applied_tip` and `sequence`
-    /// without taking the mempool read lock, then wakes all waiters.
+    /// Publishes a generation key built from `applied_tip` and the two pool
+    /// revision tokens captured at commit, without taking the mempool read
+    /// lock, then wakes all waiters.
     ///
-    /// The mempool observer calls this with the sequence the mutation already
-    /// produced, avoiding a reentrant pool read that can deadlock under the
-    /// gateway's publish mutex. Tip-move callers should use
-    /// [`Self::publish_generation`] instead, which captures the live sequence
+    /// The mempool observer calls this with the sequence and revision the
+    /// mutation already produced, avoiding a reentrant pool read that can
+    /// deadlock under the gateway's publish mutex. Tip-move callers should use
+    /// [`Self::publish_generation`] instead, which captures live pool tokens
     /// safely (no write lock is held on that path).
-    pub fn publish_generation_from(&self, sequence: u64) {
+    pub fn publish_generation_from(&self, mempool_sequence: u64, fee_delta_sequence: u64) {
         let key = GenerationKey {
             tip_hash: self.live_tip_hash(),
-            mempool_sequence: sequence,
+            mempool_sequence,
+            fee_delta_sequence,
         };
         self.publish_key(key);
     }
@@ -290,6 +312,7 @@ impl MiningService {
         GenerationKey {
             tip_hash: self.live_tip_hash(),
             mempool_sequence: self.mempool.current_sequence(),
+            fee_delta_sequence: self.mempool.current_fee_delta_sequence(),
         }
     }
 
@@ -576,7 +599,10 @@ impl MiningService {
         if tip.hash != key.tip_hash {
             return Err(generation_race());
         }
-        let Some(snapshot) = self.mempool.mining_snapshot_at(key.mempool_sequence) else {
+        let Some(snapshot) = self
+            .mempool
+            .mining_snapshot_at(key.mempool_sequence, key.fee_delta_sequence)
+        else {
             return Err(generation_race());
         };
         let context = self.candidate_context(&tip)?;
@@ -815,6 +841,7 @@ pub fn snapshot_for_selection(
             }
             Ok(MempoolMiningSnapshot {
                 sequence: full.sequence,
+                fee_delta_sequence: full.fee_delta_sequence,
                 entries: selected,
             })
         }
@@ -857,19 +884,35 @@ fn generation_race() -> MiningControlError {
 }
 
 /// Parses a BIP22/BIP23 long-poll id into its generation key.
+///
+/// The new format is the 64-hex tip hash followed by two zero-padded 20-digit
+/// decimal tokens, so the tail is exactly 40 characters and the boundary is
+/// bit-exact. A legacy id carries one unpadded decimal sequence of 1 to 20
+/// digits and no fee-delta token; it parses with a fee-delta of zero. Every
+/// other tail length is malformed.
 #[must_use]
 fn parse_long_poll_id(id: &str) -> Option<GenerationKey> {
     let hash_hex = id.get(..64)?;
-    let sequence = id.get(64..)?;
-    if sequence.is_empty() {
-        return None;
-    }
+    let tail = id.get(64..)?;
+    // Byte length and digit count coincide here: both decimal tokens and the
+    // legacy sequence are ASCII digits, and the length gates below reject a
+    // tail with non-digit bytes before any parse.
     let tip_hash = Hash256::from_str_be(hash_hex).ok()?;
-    let mempool_sequence = sequence.parse().ok()?;
-    Some(GenerationKey {
-        tip_hash,
-        mempool_sequence,
-    })
+    match tail.len() {
+        // Legacy one-token id: a 1..=20 digit membership sequence.
+        1..=20 => Some(GenerationKey {
+            tip_hash,
+            mempool_sequence: tail.parse().ok()?,
+            fee_delta_sequence: 0,
+        }),
+        // New two-token id: exactly two zero-padded 20-digit decimals.
+        40 => Some(GenerationKey {
+            tip_hash,
+            mempool_sequence: tail.get(..20)?.parse().ok()?,
+            fee_delta_sequence: tail.get(20..)?.parse().ok()?,
+        }),
+        _ => None,
+    }
 }
 
 /// Signet challenge and flag for `network`, or `None` off signet.

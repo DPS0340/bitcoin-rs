@@ -368,8 +368,9 @@ pub struct FakeMiningControl {
     pub fail: Mutex<Option<MiningControlError>>,
     /// `publish_generation` wake count.
     publishes: AtomicU64,
-    /// Every `publish_generation_from` sequence, in call order.
-    pub published_from: Mutex<Vec<u64>>,
+    /// Every `publish_generation_from` `(mempool_sequence, fee_delta_sequence)`
+    /// pair, in call order.
+    pub published_from: Mutex<Vec<(u64, u64)>>,
 }
 
 #[cfg(any(test, feature = "test-seam"))]
@@ -529,8 +530,10 @@ impl MiningControl for FakeMiningControl {
 
 #[cfg(any(test, feature = "test-seam"))]
 impl crate::coordinator::MempoolSequenceWake for FakeMiningControl {
-    fn publish_generation_from(&self, sequence: u64) {
-        self.published_from.lock().push(sequence);
+    fn publish_generation_from(&self, mempool_sequence: u64, fee_delta_sequence: u64) {
+        self.published_from
+            .lock()
+            .push((mempool_sequence, fee_delta_sequence));
     }
 }
 

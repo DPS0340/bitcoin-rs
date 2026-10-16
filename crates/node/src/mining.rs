@@ -232,9 +232,19 @@ impl MempoolSnapshotSource for MempoolAdapter {
         self.mempool.read().sequence_number()
     }
 
-    fn mining_snapshot_at(&self, expected_sequence: u64) -> Option<MempoolMiningSnapshot> {
+    fn current_fee_delta_sequence(&self) -> u64 {
+        self.mempool.read().fee_delta_sequence_number()
+    }
+
+    fn mining_snapshot_at(
+        &self,
+        expected_sequence: u64,
+        expected_fee_delta_sequence: u64,
+    ) -> Option<MempoolMiningSnapshot> {
         let mempool = self.mempool.read();
-        if mempool.sequence_number() != expected_sequence {
+        if mempool.sequence_number() != expected_sequence
+            || mempool.fee_delta_sequence_number() != expected_fee_delta_sequence
+        {
             return None;
         }
         Some(mempool.mining_snapshot())
@@ -341,8 +351,9 @@ impl ChainContextSource for ChainContextAdapter {
 }
 
 impl MempoolSequenceWake for MiningCoordinator {
-    fn publish_generation_from(&self, sequence: u64) {
-        self.service.publish_generation_from(sequence);
+    fn publish_generation_from(&self, mempool_sequence: u64, fee_delta_sequence: u64) {
+        self.service
+            .publish_generation_from(mempool_sequence, fee_delta_sequence);
     }
 }
 

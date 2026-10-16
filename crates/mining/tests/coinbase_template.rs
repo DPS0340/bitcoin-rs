@@ -54,7 +54,7 @@ fn empty_candidate_encodes_bip34_and_exact_subsidy() -> Result<(), Box<dyn Error
     );
     assert_eq!(
         candidate.template_id,
-        TemplateId::new(&context.previous_block_hash, 7)
+        TemplateId::new(&context.previous_block_hash, 7, 0)
     );
     Ok(())
 }
