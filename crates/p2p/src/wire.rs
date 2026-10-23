@@ -29,7 +29,7 @@ pub const MAX_MESSAGE_PAYLOAD: usize = 4_000_000;
 pub(crate) const MAX_WRITE_BURST: usize = 8;
 
 /// Maximum number of headers accepted in one `headers` message.
-const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
+pub const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
 
 /// Maximum block locator hashes accepted in one locator-based request.
 pub const MAX_LOCATOR_HASHES: usize = 101;
@@ -449,18 +449,20 @@ pub(crate) fn write_frame<W: Write + ?Sized>(
     Ok(frame.wire_len())
 }
 
-/// Writes encoded frames in one vectored pass and returns each frame's wire
-/// length, in order, so the writer can release the budget that admitted it.
+/// Writes encoded frames in one vectored pass.
+///
+/// The caller owns each frame's outbound charge and releases it by dropping
+/// the queued frame; this function reports no lengths for accounting.
 pub(crate) fn write_frames<W: Write + ?Sized>(
     writer: &mut W,
     frames: &[FramedMessage],
-) -> Result<Vec<usize>, PeerError> {
+) -> Result<(), PeerError> {
     let mut slices = Vec::with_capacity(frames.len().saturating_mul(2));
     for frame in frames {
         frame.push_slices(&mut slices);
     }
     write_all_vectored(writer, &mut slices)?;
-    Ok(frames.iter().map(FramedMessage::wire_len).collect())
+    Ok(())
 }
 
 /// Write a Bitcoin v1 network message.

@@ -3,7 +3,7 @@
 use super::{
     DerivedIndexQueryEngine, OutPoint, QueryBudget, ScriptHash, ScriptHistoryRecord,
     ScriptIndexRecord, ScriptIndexSnapshot, ScriptLiveScan, SpendingRecord, TipSnapshot, Tx,
-    TxIndexScanRow, TxIndexSnapshot, TxQueryError, Txid,
+    TxIndexScanRow, TxIndexSnapshot, TxQueryError, TxUnavailableCause, Txid,
 };
 
 impl DerivedIndexQueryEngine {
@@ -73,8 +73,8 @@ impl DerivedIndexQueryEngine {
         let mut outputs = Vec::new();
         for row in rows {
             let height = row.row.height();
+            let hash = self.resolve_hash_at_height(height, tip)?;
             let Some(positions) = Self::validated_positions(&row.value) else {
-                let hash = self.resolve_hash_at_height(height, tip)?;
                 let block = self.resolve_block(budget, height, hash)?;
                 for transaction in &block.txs {
                     Self::collect_funding_outputs(transaction, height, scripthash, &mut outputs)?;
@@ -86,7 +86,7 @@ impl DerivedIndexQueryEngine {
             let mut complete = true;
             for &position in positions {
                 let Some(transaction) =
-                    self.resolve_positioned_transaction(tip, budget, height, position)?
+                    self.resolve_positioned_transaction(budget, height, hash, position)?
                 else {
                     complete = false;
                     break;
@@ -101,7 +101,6 @@ impl DerivedIndexQueryEngine {
             }
 
             outputs.truncate(row_start);
-            let hash = self.resolve_hash_at_height(height, tip)?;
             let block = self.resolve_block(budget, height, hash)?;
             for transaction in &block.txs {
                 Self::collect_funding_outputs(transaction, height, scripthash, &mut outputs)?;
@@ -126,10 +125,11 @@ impl DerivedIndexQueryEngine {
                 continue;
             }
             last_height = Some(height);
+            let hash = self.resolve_hash_at_height(height, tip)?;
             if let Some(positions) = Self::validated_positions(&row.value) {
                 for &position in positions {
                     let Some(transaction) =
-                        self.resolve_positioned_transaction(tip, budget, height, position)?
+                        self.resolve_positioned_transaction(budget, height, hash, position)?
                     else {
                         break;
                     };
@@ -138,7 +138,6 @@ impl DerivedIndexQueryEngine {
                     }
                 }
             }
-            let hash = self.resolve_hash_at_height(height, tip)?;
             let block = self.resolve_block(budget, height, hash)?;
             for transaction in &block.txs {
                 if let Some(record) = Self::spending_input(transaction, height, outpoint)? {
@@ -178,7 +177,7 @@ impl DerivedIndexQueryEngine {
     ) -> Result<ScriptIndexSnapshot, TxQueryError> {
         if floor > 0 {
             return Err(TxQueryError::Unavailable(
-                format!("script history coverage starts at height {floor}; history cannot be proven complete").into(),
+                TxUnavailableCause::HistoryUnproven { floor },
             ));
         }
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
@@ -225,7 +224,7 @@ impl DerivedIndexQueryEngine {
     ) -> Result<Vec<ScriptHistoryRecord>, TxQueryError> {
         if floor > 0 {
             return Err(TxQueryError::Unavailable(
-                format!("script history coverage starts at height {floor}; history cannot be proven complete").into(),
+                TxUnavailableCause::HistoryUnproven { floor },
             ));
         }
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
@@ -256,7 +255,9 @@ impl DerivedIndexQueryEngine {
     ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
         let Some(utxo) = self.utxo.as_ref() else {
             return Err(TxQueryError::Unavailable(
-                "authoritative UTXO view is unavailable for ScriptLive".into(),
+                TxUnavailableCause::MissingAuthority(
+                    "authoritative UTXO view is unavailable for ScriptLive",
+                ),
             ));
         };
         let rows = Self::scan_live_rows(snapshot, budget, scripthash)?;
@@ -269,7 +270,9 @@ impl DerivedIndexQueryEngine {
                     // corruption or a failed transition. Returning an empty
                     // result would turn that into a false negative.
                     return Err(TxQueryError::Unavailable(
-                        "ScriptLive locator is absent from authoritative UTXO".into(),
+                        TxUnavailableCause::MissingAuthority(
+                            "ScriptLive locator is absent from authoritative UTXO",
+                        ),
                     ));
                 };
                 if ScriptHash::new(&entry.txout.script_pubkey) != scripthash {

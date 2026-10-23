@@ -8,7 +8,7 @@ use crate::{
     AdmissionChain, AdmissionOrigin, LocalOrigin, MempoolGateway, MutationResult, SubmitError,
 };
 use alloc::vec::Vec;
-use bitcoin_rs_primitives::Tx;
+use bitcoin_rs_primitives::{Tx, unix_time_secs};
 
 fn ordered(mut txs: Vec<Tx>) -> Result<Vec<Tx>, SubmitError> {
     if txs.is_empty() || txs.len() > crate::standardness::MAX_PACKAGE_COUNT {
@@ -51,10 +51,6 @@ impl MempoolGateway {
     /// accepting arbitrary input order. No replacement or capacity eviction;
     /// new members pay the aggregate relay/pressure floor. Resident and
     /// positively confirmed members contribute no fees. RPC/REST is unchanged.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep package capture, verification, stamp revalidation and atomic commit in one auditable owner"
-    )]
     pub fn submit_local_package(
         &self,
         txs: Vec<Tx>,
@@ -64,6 +60,22 @@ impl MempoolGateway {
         chain: &dyn AdmissionChain,
     ) -> Result<MutationResult, SubmitError> {
         let txs = ordered(txs)?;
+        self.submit_package_with_times(&txs, origin, max_rate, |_| time, chain)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep package capture, verification, stamp revalidation and atomic commit in one auditable owner"
+    )]
+    pub(crate) fn submit_package_with_times(
+        &self,
+        txs: &[Tx],
+        origin: LocalOrigin,
+        max_rate: Option<u64>,
+        time: impl Fn(&Tx) -> u64,
+        chain: &dyn AdmissionChain,
+    ) -> Result<MutationResult, SubmitError> {
+        crate::package::check_structure(txs)?;
         let origin = AdmissionOrigin::from(origin);
         'attempt: for _ in 0..MAX_ADMISSION_RETRIES {
             let Some(generation) = self.stable_generation() else {
@@ -98,18 +110,21 @@ impl MempoolGateway {
                     .collect();
                 (pending, sequence, pool.policy_stamp(), inputs)
             };
-            let Some(requests) = batch_requests(
+            let Some(mut requests) = batch_requests(
                 &pending,
                 inputs,
                 chain,
                 max_rate,
-                time,
+                0,
                 origin,
                 (generation, sequence),
                 AdmissionMode::PackageSubmit,
             ) else {
                 continue;
             };
+            for request in &mut requests {
+                request.time = time(&request.tx);
+            }
             // Positive confirmed membership is a chain fact, so revalidate its
             // generation and policy stamp just like both acceptance and refusal.
             let pending: Vec<_> = requests
@@ -147,7 +162,11 @@ impl MempoolGateway {
                     .collect();
                 let entries = crate::package::package_entries(&requests, &prepared);
                 let checks = crate::package::capture_package_checks(&pool, &pending, &entries);
-                (prepared, checks, pool.prepare_package(entries))
+                (
+                    prepared,
+                    checks,
+                    pool.prepare_package(entries, unix_time_secs()),
+                )
             };
             // Unlike a single preview, even one new package member must use
             // aggregate-package policy, including ephemeral-spend checks.
@@ -159,6 +178,7 @@ impl MempoolGateway {
                 Some(checks),
                 aggregate_error,
                 AdmissionMode::PackageSubmit,
+                self.script_cache(),
             );
             let verdict = facts
                 .package_error
@@ -174,6 +194,13 @@ impl MempoolGateway {
                         })
                     })
                 });
+            // Validated keys are carried out before the writer runs; the
+            // atomic commit below decides whether any of them is inserted,
+            // all or nothing, outside the pool write lock.
+            let cache_keys: Vec<_> = prepared
+                .iter()
+                .filter_map(|job| job.script_cache_key)
+                .collect();
             let result = self.commit(
                 origin,
                 |pool| {
@@ -196,7 +223,19 @@ impl MempoolGateway {
                 |result| Some(result),
             );
             match result {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    if let Some(cache) = self.script_cache() {
+                        for (wtxid, flags) in cache_keys {
+                            cache.insert(wtxid, flags);
+                        }
+                    }
+                    // Only the newly submitted members: residents filtered out
+                    // of `pending` above were never admitted here, and expiry
+                    // must not fail the package over them.
+                    let admitted: Vec<_> = pending.iter().map(Tx::txid).collect();
+                    self.check_admitted_residency(origin, AdmissionFence::Stable, &admitted)?;
+                    return Ok(result);
+                }
                 Err(crate::AdmitError::GenerationChanged | crate::AdmitError::MempoolChanged) => {
                     continue 'attempt;
                 }

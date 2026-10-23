@@ -21,6 +21,10 @@ use bitcoin_rs_chainstate::recovery::{
     InitialChainstate, ResumeSource, STALE_RESTORE_ERROR_THRESHOLD, open_journal_dir,
     prepare_initial_chainstate,
 };
+use bitcoin_rs_chainstate::verify::{
+    CheckLevel, STARTUP_VERIFY_DEPTH, VerifyOutcome, VerifyRequest, verify_recent_blocks,
+};
+use bitcoin_rs_consensus::{ScriptExecutionCache, ValidationEngine};
 use bitcoin_rs_index::block_log::BlockLog;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolLimits;
@@ -31,20 +35,108 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+/// Checks the newest applied blocks, bodies through undo records plus
+/// header-body binding, and fails the open on damage. Startup checks strictly
+/// more than the RPC levels, which stop at Core's context-free scope. A window
+/// that reaches history the node does not hold (pruned, or under a snapshot
+/// base) is not damage and the open continues.
+fn verify_startup_window(
+    chainstate: &bitcoin_rs_chainstate::Chainstate,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let request = VerifyRequest {
+        level: CheckLevel::CheckUndoAndCommitments,
+        depth: Some(STARTUP_VERIFY_DEPTH),
+        cancellation: None,
+    };
+    match verify_recent_blocks(chainstate, request) {
+        Ok(VerifyOutcome::Passed { blocks }) => {
+            tracing::debug!(blocks, "startup verification passed");
+            Ok(())
+        }
+        Ok(VerifyOutcome::SkippedNoBlockData { height }) => {
+            tracing::info!(
+                height,
+                "startup verification skipped blocks this node does not hold"
+            );
+            Ok(())
+        }
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "startup verification of the last {STARTUP_VERIFY_DEPTH} applied blocks failed. \
+             Verification repairs nothing, but recovery earlier in this startup may already \
+             have changed the data directory. Restore it from a backup, or remove or quarantine \
+             {}, {}, {}, and {}, then resync.",
+            data_dir.join("blocks").display(),
+            data_dir.join("chainstate").display(),
+            data_dir.join("chainstate-checkpoints").display(),
+            data_dir.join("txindex").display(),
+        ))),
+    }
+}
+
 impl NodeState {
     /// Opens (or creates) the node's data directory and configured storage
     /// backend.
     /// Derived-index workers are constructed dormant (`Opening`) and started
     /// by [`Self::start_index_workers`] once crash recovery has made the
     /// applied tip authoritative; `start_node` performs both steps.
-    #[expect(clippy::too_many_lines)]
     pub fn open(
         config: NodeConfig,
         mempool_observer: Option<&Arc<dyn bitcoin_rs_mempool::MempoolObserver>>,
     ) -> Result<Self> {
+        Self::open_inner(config, mempool_observer, |store| store)
+    }
+
+    /// Test seam: opens the node with the real body store wrapped by `wrap`.
+    ///
+    /// The transform applies exactly once, at the existing
+    /// `storage.block_body_store()` construction, before every consumer
+    /// (`ChainstateParts` and the derived-index body source), so the wrapped
+    /// store stays the single authoritative body store on the real disk
+    /// backend. Production [`Self::open`] passes the identity transform: no
+    /// configuration knob, global hook, or runtime branch exists on the
+    /// production path. The closure runs synchronously during open, so it
+    /// needs no `Send` bound.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn open_with_body_store<W>(
+        config: NodeConfig,
+        mempool_observer: Option<&Arc<dyn bitcoin_rs_mempool::MempoolObserver>>,
+        wrap: W,
+    ) -> Result<Self>
+    where
+        W: FnOnce(
+            Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
+        ) -> Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
+    {
+        Self::open_inner(config, mempool_observer, wrap)
+    }
+
+    /// Shared open implementation behind [`Self::open`] and the test-seam
+    /// `open_with_body_store`. The staged-tip hook, startup wiring, and
+    /// data-directory guard below are unchanged by the seam.
+    #[expect(clippy::too_many_lines)]
+    fn open_inner<W>(
+        config: NodeConfig,
+        mempool_observer: Option<&Arc<dyn bitcoin_rs_mempool::MempoolObserver>>,
+        wrap: W,
+    ) -> Result<Self>
+    where
+        W: FnOnce(
+            Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
+        ) -> Arc<dyn bitcoin_rs_storage::block_body::BlockBodyStore>,
+    {
         config.validate()?;
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
+        // Take the directory before it can change: the lock gates the schema
+        // check and the epoch, so a second node fails without touching any
+        // datadir state (Core `LockDirectory`, `bitcoin-core/src/init.cpp:
+        // 1254-1269`). Every store opened below carries the lock, so it is
+        // released only when the last handle to any of them is gone, however
+        // a consumer retains one.
+        let data_dir_guard: bitcoin_rs_storage::StoreGuard = Arc::new(
+            super::data_dir_lock::DataDirLock::acquire(&config.data_dir)?,
+        );
         // Allocate the process epoch before anything else can consume one:
         // durable, strictly greater than every earlier run of this data dir.
         let epoch = initialize_data_dir(&config.data_dir)?;
@@ -59,11 +151,12 @@ impl NodeState {
         );
         let chainstate_cache_bytes = cache_shares[0].bytes;
         let txindex_cache_bytes = cache_shares[1].bytes;
-        let (storage, block_files) = NodeStorage::open(&config, chainstate_cache_bytes)?;
+        let (storage, block_files) =
+            NodeStorage::open(&config, chainstate_cache_bytes, &data_dir_guard)?;
         let undo_store = storage.undo_store();
         let durable_head = storage.durable_head();
 
-        let block_body_store = storage.block_body_store();
+        let block_body_store = wrap(storage.block_body_store());
 
         let zmq_endpoints = &config.notifications.zmq;
         #[cfg(feature = "zmq")]
@@ -184,6 +277,12 @@ impl NodeState {
         let utxo = Arc::new(utxo_set);
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+        // One node-owned script-execution cache, native only: the mempool
+        // gateway fills it after admission and commit connects consult it. A
+        // kernel-engine node holds none, so the kernel oracle stays
+        // authoritative on both paths.
+        let script_cache = (config.validation.engine == ValidationEngine::Native)
+            .then(|| Arc::new(ScriptExecutionCache::new()));
         // Owner-local fee-estimator history: adopt the persisted
         // confirmation history before any admission can run. A corrupt or
         // unknown-version file degrades to insufficient data (docs/policies/db-migration.md).
@@ -210,6 +309,7 @@ impl NodeState {
             assume_valid_height: config.validation.assume_valid_height,
             validation_mode: config.validation.mode,
             validation_engine: config.validation.engine,
+            script_cache: script_cache.clone(),
             journal,
             capture_rawtx: false,
             capture_block_bytes: false,
@@ -218,7 +318,7 @@ impl NodeState {
             role: bitcoin_rs_chainstate::ChainstateRole::Ordinary,
         });
         let derived_index_open_spec =
-            build_derived_index_open_spec(&config, txindex_cache_bytes, epoch)?;
+            build_derived_index_open_spec(&config, txindex_cache_bytes, epoch, &data_dir_guard)?;
         let derived_index_parts = match derived_index_open_spec {
             Some(mut spec) => {
                 spec.utxo = Some(bitcoin_rs_utxo::UtxoReader::new(Arc::clone(&utxo)));
@@ -228,11 +328,6 @@ impl NodeState {
                     Arc::new(bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx));
                 let body_source: Arc<dyn BlockBodySource> =
                     Arc::new(StoredBlockBodySource::new(Arc::clone(&block_body_store)));
-                let block_source = bitcoin_rs_index::runtime::IndexBlockSource::new(
-                    bitcoin_rs_index::BlockLogReader::from(Arc::clone(&blocks)),
-                )
-                .with_block_body_source(Arc::clone(&body_source))
-                .with_block_tree(chainstate.block_tree_reader());
                 let lifecycle: Arc<
                     arc_swap::ArcSwap<bitcoin_rs_index::runtime::DerivedIndexLifecycle>,
                 > = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -247,7 +342,6 @@ impl NodeState {
                     TxIndexSpawn {
                         spec,
                         generation,
-                        block_source,
                         body_source,
                         wake_rx,
                         recovery_reporter: Arc::clone(&recovery_reporter),
@@ -336,32 +430,29 @@ impl NodeState {
         // path and the gateway can fire it before `run` builds the
         // coordinator; the coordinator attaches itself once constructed.
         let mining_generation = Arc::new(crate::mining::MiningGenerationSignal::new());
+        let staged_mining = Arc::clone(&mining_generation);
+        let staged_ibd = chainstate.ibd_latch();
+        let staged_network = config.network;
+        chainstate
+            .set_tip_staged(Arc::new(move |tip, block| {
+                if !staged_ibd.is_active(bitcoin_rs_primitives::unix_time_secs(), staged_network) {
+                    staged_mining.stage_tip(tip, block);
+                }
+            }))
+            .map_err(|_| anyhow::anyhow!("staged-tip preparation hook already installed"))?;
         // Construct the pool's one gateway here. Mempool owns fan-out: mining
         // occupies the observer slot, and ZMQ sequence (or a test observer)
         // attaches as an extra named leg. Admission/relay legs attach after
         // construction.
         let mempool_gateway = {
-            let publisher = Arc::clone(&zmq_publisher);
             let cloned_mining = Arc::clone(&mining_generation);
             let mining_leg: Arc<dyn bitcoin_rs_mempool::MempoolObserver> = cloned_mining;
-            let gateway = Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
+            Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
                 Arc::clone(&mempool),
                 Some(mining_leg),
                 config.validation.engine,
-            ));
-            if publisher.wants_notifications() {
-                gateway
-                    .attach_observer_leg(
-                        "sequence",
-                        Arc::new(bitcoin_rs_rpc::zmq::MempoolSequenceObserver::new(publisher)),
-                    )
-                    .map_err(anyhow::Error::msg)?;
-            } else if let Some(observer) = mempool_observer.cloned() {
-                gateway
-                    .attach_observer_leg("test", observer)
-                    .map_err(anyhow::Error::msg)?;
-            }
-            gateway
+                script_cache,
+            ))
         };
         // Construct followers before Chainstate so capture policy has one owner.
         let (block_announce_queue, block_announce_rx) = bitcoin_rs_p2p::BlockAnnounceQueue::new();
@@ -409,6 +500,94 @@ impl NodeState {
             Err(error) => return Err(anyhow::Error::new(error)),
         }
         let chainstate = Arc::new(chainstate);
+        // Authoritative recovery is settled. No RPC/P2P admission or external
+        // mempool observer is exposed until revalidation has finished.
+        if config.persist_mempool {
+            let started = std::time::Instant::now();
+            let deadline = started
+                .checked_add(std::time::Duration::from_secs(
+                    config.mempool_snapshot_restore_timeout_secs,
+                ))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mempool snapshot restore timeout exceeds the platform clock range"
+                    )
+                })?;
+            let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
+                chainstate.utxo_reader(),
+                chainstate.applied_tip_reader(),
+                chainstate.block_tree_reader(),
+                config.network,
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            match bitcoin_rs_mempool::snapshot::restore(
+                &config.data_dir,
+                &mempool_gateway,
+                config.network,
+                &chain,
+                now,
+                config.mempool_snapshot_max_bytes,
+                deadline,
+            ) {
+                Ok(Some(report)) => {
+                    if report.limited != 0 {
+                        tracing::warn!(
+                            limited = report.limited,
+                            package_attempts = report.package_attempts,
+                            "mempool snapshot candidates not restored because bounded subset search did not complete"
+                        );
+                    }
+                    if report.timed_out {
+                        tracing::warn!(
+                            candidates = report.candidates,
+                            restored = report.restored,
+                            skipped = report.skipped,
+                            timeout_secs = config.mempool_snapshot_restore_timeout_secs,
+                            "mempool snapshot restore deadline expired; consider raising --mempool-snapshot-restore-timeout-secs"
+                        );
+                    }
+                    tracing::info!(
+                        candidates = report.candidates,
+                        restored = report.restored,
+                        skipped = report.skipped,
+                        timed_out = report.timed_out,
+                        limited = report.limited,
+                        package_attempts = report.package_attempts,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        status = if report.skipped == 0 && !report.timed_out {
+                            "restored"
+                        } else {
+                            "partially_restored"
+                        },
+                        "mempool snapshot revalidation finished"
+                    );
+                }
+                Ok(None) => tracing::info!(
+                    status = "missing",
+                    "no mempool snapshot; starting with an empty pool"
+                ),
+                Err(error) => tracing::warn!(%error, status = "rejected",
+                    "mempool snapshot rejected; leaving the file in place and starting with an empty pool"),
+            }
+        } else {
+            tracing::info!(status = "disabled", "mempool snapshot persistence disabled");
+        }
+        if zmq_publisher.wants_notifications() {
+            mempool_gateway
+                .attach_observer_leg(
+                    "sequence",
+                    Arc::new(bitcoin_rs_rpc::zmq::MempoolSequenceObserver::new(
+                        Arc::clone(&zmq_publisher),
+                    )),
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else if let Some(observer) = mempool_observer.cloned() {
+            mempool_gateway
+                .attach_observer_leg("test", observer)
+                .map_err(anyhow::Error::msg)?;
+        }
         // One chain-owned latch for the whole process: the chainstate builds
         // it once, and the block-download executor, the RPC context, and the
         // P2P listener all hold this same `Arc`, so `initialblockdownload`,
@@ -419,7 +598,7 @@ impl NodeState {
             bitcoin_rs_chainstate::AssumeUtxoManager::open(
                 config.network,
                 Arc::clone(&chainstate),
-                Some(config.data_dir.clone()),
+                config.data_dir.clone(),
             )
             .map_err(|err| anyhow::anyhow!("assumeutxo open failed: {err}"))?,
         );
@@ -460,6 +639,12 @@ impl NodeState {
             config.data_dir.clone(),
             config.network,
         ));
+        // Recovery and snapshot activation have settled the applied tip, and
+        // nothing serves yet. Refuse to build on recent blocks whose bodies or
+        // undo records are damaged: every block added on top makes the damage
+        // harder to find. Nothing is repaired or deleted here; the operator
+        // decides.
+        verify_startup_window(&chainstate, &config.data_dir)?;
         Ok(Self {
             config,
             #[cfg(test)]

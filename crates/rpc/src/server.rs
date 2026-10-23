@@ -23,6 +23,19 @@ const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 
+/// How long a wrong-credential answer waits before it is written, Core's
+/// brute-force deterrent (`httprpc.cpp:215-225`).
+const WRONG_CREDENTIALS_DELAY: Duration = Duration::from_millis(250);
+
+/// Most declared body bytes the unauthorized path reads after its answer.
+/// Bytes past this bound stay unread, so a peer that sends more may see a
+/// reset instead of a clean close.
+const MAX_DRAIN_BYTES: usize = 64 * 1_024;
+
+/// How long the drain may keep reading before the connection is closed
+/// under the peer.
+const DRAIN_BUDGET: Duration = Duration::from_secs(1);
+
 const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(100);
 
 const PUBLIC_ESPLORA_METHODS: &[&str] = &["GET", "POST", "OPTIONS"];
@@ -90,24 +103,48 @@ impl RpcServer {
         self,
         shutdown: impl Into<bitcoin_rs_chain::LatchReader>,
     ) -> io::Result<()> {
-        let shutdown = shutdown.into();
+        self.serve_accept_loop(&shutdown.into(), TcpListener::accept)
+    }
+
+    fn serve_accept_loop(
+        self,
+        shutdown: &bitcoin_rs_chain::LatchReader,
+        mut accept: impl FnMut(&TcpListener) -> io::Result<(TcpStream, SocketAddr)>,
+    ) -> io::Result<()> {
         let _stop = RpcStop(Arc::clone(&self.handler));
         self.handler
             .configure_blocking_admission(per_source_limit(self.max_connections));
         self.listener.set_nonblocking(true)?;
         let active = Arc::new(Mutex::new(ActiveConnections::default()));
         while !shutdown.is_triggered() {
-            match self.listener.accept() {
+            match accept(&self.listener) {
                 Ok((stream, addr)) => {
-                    stream.set_nonblocking(false)?;
-                    if let Err(error) = self.handle_accept(&active, stream, addr.ip()) {
+                    if let Err(error) = stream
+                        .set_nonblocking(false)
+                        .and_then(|()| self.handle_accept(&active, stream, addr.ip()))
+                    {
                         debug!(%error, "rpc connection setup failed");
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(POLL_INTERVAL);
                 }
-                Err(error) => return Err(error),
+                Err(error) => match error.kind() {
+                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {
+                        debug!(%error, "rpc accept interrupted or connection aborted");
+                    }
+                    io::ErrorKind::InvalidInput | io::ErrorKind::NotConnected => return Err(error),
+                    _ => {
+                        // Resource exhaustion (including EMFILE/ENFILE) and
+                        // pending network errors need not invalidate the listener.
+                        // Linux may report EOPNOTSUPP (Unsupported) for a new
+                        // connection, so that kind must also remain retryable.
+                        // Back off unknown OS errors too, avoiding a busy loop,
+                        // and recheck shutdown before the next accept attempt.
+                        warn!(%error, "rpc accept failed; retrying after backoff");
+                        thread::sleep(POLL_INTERVAL);
+                    }
+                },
             }
         }
         // Drop cancels the new blocking RPC capabilities even when only this
@@ -284,10 +321,10 @@ fn serve_connection(
             return Ok(());
         }
         // Waiting for the next request keeps the configured idle timeout;
-        // `read_request` starts the head budget at the request's first byte.
+        // `read_request_head` starts the head budget at the request's first byte.
         reader.get_mut().reset_deadline(idle_timeout);
-        let request = match read_request(&mut reader, REQUEST_HEAD_TIMEOUT, REQUEST_BODY_TIMEOUT) {
-            Ok(Some(request)) => request,
+        let head = match read_request_head(&mut reader, REQUEST_HEAD_TIMEOUT) {
+            Ok(Some(head)) => head,
             Ok(None) => return Ok(()),
             Err(RequestReadError::RestBodyTooLarge) => {
                 let response = if rest_enabled {
@@ -320,6 +357,45 @@ fn serve_connection(
                 return Err(error);
             }
         };
+        // Authentication runs from the head alone, before any body byte is
+        // read: a 16 MiB declared body without credentials gets its 401 at
+        // once instead of after its upload (Core `httprpc.cpp` checks inside
+        // the handler, after libevent has buffered the whole body). REST and
+        // Esplora stay unauthenticated, and framing errors keep the 400
+        // answer, so only the JSON-RPC route defers its body.
+        if authenticate_json_rpc_head(auth, &mut reader, &head)? {
+            return Ok(());
+        }
+        let request = match read_request_body(&mut reader, REQUEST_BODY_TIMEOUT, head) {
+            Ok(request) => request,
+            Err(RequestReadError::RestBodyTooLarge) => {
+                let response = if rest_enabled {
+                    crate::rest::getutxos_body_too_large()
+                } else {
+                    crate::rest::not_found()
+                };
+                write_response(
+                    reader.get_mut().socket_mut(),
+                    &response,
+                    false,
+                    CorsPolicy::Disabled,
+                )?;
+                return Ok(());
+            }
+            Err(RequestReadError::Io(error)) => {
+                let rpc_error = RpcError::InvalidRequest("malformed http request");
+                let response =
+                    JsonRpcVersion::Legacy.error_response(&rpc_error, &Value::new_null());
+                write_json(
+                    reader.get_mut().socket_mut(),
+                    400,
+                    "Bad Request",
+                    &response,
+                    false,
+                )?;
+                return Err(error);
+            }
+        };
         if handler.is_stopping() {
             return Ok(());
         }
@@ -327,7 +403,6 @@ fn serve_connection(
         if dispatch_http_request(
             reader.get_mut().socket_mut(),
             &request,
-            auth,
             handler,
             rest_enabled,
         )? {
@@ -339,10 +414,82 @@ fn serve_connection(
     }
 }
 
+/// Answers the unauthenticated head of a JSON-RPC request and reports that
+/// the connection is finished.
+///
+/// The 401 carries Core's challenge, content type, an empty body, and no
+/// `Date`; the connection is closed either way, so a client cannot hold the
+/// worker with pipelined requests it never authenticated for.
+fn authenticate_json_rpc_head(
+    auth: &Auth,
+    reader: &mut BufReader<RequestDeadlineStream>,
+    head: &RequestHead,
+) -> io::Result<bool> {
+    if classify(&head.method, &head.path) != HttpRoute::JsonRpc
+        || auth.validate_header(head.authorization.as_deref())
+    {
+        return Ok(false);
+    }
+    reject_unauthenticated_json_rpc(reader, head)?;
+    Ok(true)
+}
+
+fn reject_unauthenticated_json_rpc(
+    reader: &mut BufReader<RequestDeadlineStream>,
+    head: &RequestHead,
+) -> io::Result<()> {
+    // Present but wrong credentials are slowed before the answer, Core's
+    // brute-force deterrent (`httprpc.cpp:215-225`). Absent credentials
+    // answer at once: there is no secret to slow down.
+    if head.authorization.is_some() {
+        thread::sleep(WRONG_CREDENTIALS_DELAY);
+    }
+    write_unauthorized(reader.get_mut().socket_mut())?;
+    // No declared body means no peer bytes can belong to this request: close
+    // at once instead of holding a bounded-pool worker up to DRAIN_BUDGET.
+    // Otherwise discard only the declared body through the buffered reader,
+    // so a well-behaved client sees a clean close instead of a reset.
+    if head.content_length == 0 {
+        return Ok(());
+    }
+    drain_request(reader, head.content_length);
+    Ok(())
+}
+
+/// Writes the Core-shaped 401: a challenge, an empty HTML-typed body, and a
+/// close. No `Date` is emitted, and no JSON body is serialized.
+fn write_unauthorized(stream: &mut TcpStream) -> io::Result<()> {
+    let header = "HTTP/1.1 401 Unauthorized\r\n\
+                  WWW-Authenticate: Basic realm=\"jsonrpc\"\r\n\
+                  Content-Type: text/html; charset=ISO-8859-1\r\n\
+                  Content-Length: 0\r\n\
+                  Connection: close\r\n\r\n";
+    stream.write_all(header.as_bytes())?;
+    stream.flush()?;
+    stream.shutdown(std::net::Shutdown::Write)
+}
+
+/// Reads and discards the declared body bytes the peer announced, up to
+/// [`MAX_DRAIN_BYTES`] and for at most [`DRAIN_BUDGET`], then returns at EOF
+/// or on the first read failure. Reads go through the buffered reader, so
+/// body bytes already buffered past the head count toward the declared
+/// length and a fully buffered body costs no wait. The peer then sees a
+/// clean close rather than a reset for the bytes it already put on the wire.
+fn drain_request(reader: &mut BufReader<RequestDeadlineStream>, declared: usize) {
+    reader.get_mut().reset_deadline(DRAIN_BUDGET);
+    let mut remaining = declared.min(MAX_DRAIN_BYTES);
+    let mut chunk = [0_u8; BODY_READ_CHUNK];
+    while remaining > 0 {
+        match reader.read(&mut chunk[..remaining.min(BODY_READ_CHUNK)]) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => remaining = remaining.saturating_sub(read),
+        }
+    }
+}
+
 fn dispatch_http_request(
     stream: &mut TcpStream,
     request: &HttpRequest,
-    auth: &Auth,
     handler: &Handler,
     rest_enabled: bool,
 ) -> io::Result<bool> {
@@ -384,11 +531,10 @@ fn dispatch_http_request(
         HttpRoute::NotFound => {
             write_not_found(stream, keep_alive)?;
         }
+        // The head gate already answered every unauthenticated JSON-RPC
+        // request before its body was read; whatever survives it is
+        // authorized.
         HttpRoute::JsonRpc => {
-            if !auth.validate_header(request.authorization.as_deref()) {
-                write_status(stream, 401, "Unauthorized", b"unauthorized", false)?;
-                return Ok(true);
-            }
             let response = handle_json(handler, &request.body);
             let keep_alive = keep_alive && !response.close;
             if let Some(body) = response.body.as_ref() {
@@ -404,10 +550,11 @@ fn dispatch_http_request(
     Ok(false)
 }
 
+// Authorization lives on the head, which the authentication gate consumes
+// before `read_request_body` runs; the completed request carries no copy.
 struct HttpRequest {
     method: String,
     path: String,
-    authorization: Option<String>,
     keep_alive: bool,
     body: Vec<u8>,
 }
@@ -492,11 +639,22 @@ impl From<io::Error> for RequestReadError {
     }
 }
 
-fn read_request(
+/// The parts of a request the head carries: everything the routing and the
+/// authentication gate need, before any body byte is read.
+struct RequestHead {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    keep_alive: bool,
+    /// `POST` without a `Content-Length` never reaches this struct: it is a
+    /// framing error at the head.
+    content_length: usize,
+}
+
+fn read_request_head(
     reader: &mut BufReader<RequestDeadlineStream>,
     head_timeout: Duration,
-    body_timeout: Duration,
-) -> Result<Option<HttpRequest>, RequestReadError> {
+) -> Result<Option<RequestHead>, RequestReadError> {
     if reader.fill_buf()?.is_empty() {
         return Ok(None);
     }
@@ -560,16 +718,31 @@ fn read_request(
     {
         return Err(RequestReadError::RestBodyTooLarge);
     }
-    reader.get_mut().reset_deadline(body_timeout);
-    let mut body = Vec::new();
-    read_body(reader, content_length, &mut body)?;
-    Ok(Some(HttpRequest {
+    Ok(Some(RequestHead {
         method: method.to_owned(),
         path: path.to_owned(),
         authorization,
         keep_alive,
-        body,
+        content_length,
     }))
+}
+
+/// Reads the body the authenticated head declared. `read_request_body` runs
+/// only after `authenticate_json_rpc_head` let the head through.
+fn read_request_body(
+    reader: &mut BufReader<RequestDeadlineStream>,
+    body_timeout: Duration,
+    head: RequestHead,
+) -> Result<HttpRequest, RequestReadError> {
+    reader.get_mut().reset_deadline(body_timeout);
+    let mut body = Vec::new();
+    read_body(reader, head.content_length, &mut body)?;
+    Ok(HttpRequest {
+        method: head.method,
+        path: head.path,
+        keep_alive: head.keep_alive,
+        body,
+    })
 }
 
 const BODY_READ_CHUNK: usize = 8 * 1_024;

@@ -4,6 +4,8 @@
 
 The repository development toolchain is `stable`; the workspace MSRV is Rust `1.99.0`. See [policies/source-compatibility.md](policies/source-compatibility.md).
 
+The default build compiles bundled ZeroMQ from source, so it needs C and C++ compilers plus `ar` (`build-essential` on Debian/Ubuntu); no system ZeroMQ headers, `pkg-config`, `cmake`, or `libsodium` are needed. A C compiler stays required without the `zmq` feature (vendored secp256k1 and mimalloc).
+
 The default binary is kernel-free. Building the optional `kernel` lane also needs CMake and Boost on Debian/Ubuntu:
 
 ```sh
@@ -52,6 +54,48 @@ export BITCOIN_RS_STORAGE_BACKEND=fjall
 
 RocksDB is a non-default backend used as a shipped alternative and comparison engine.
 
+## Mempool persistence
+
+Mempool persistence is on by default. Clean shutdown saves eligible mempool transactions to
+`mempool-snapshot.dat` in the node data directory. Startup rechecks those
+candidates against recovered Chainstate and current policy before serving
+requests. Admission ages and operator fee deltas are retained; membership,
+derived fees and dependencies are recomputed. Startup logs distinguish no
+file, full/partial restore and a rejected file.
+
+To start with a fresh pool while preserving the snapshot, set
+`--persist-mempool=false`, `BITCOIN_RS_PERSIST_MEMPOOL=false`, or
+`persist_mempool = false` in TOML. This disables saving as well. A corrupt,
+unknown-version or wrong-network ordinary snapshot is preserved at startup
+and moved intact into a unique `mempool-snapshot-rejected-*` directory when
+the next clean shutdown publishes a fresh snapshot. Snapshots are bounded
+by a byte budget, defaulting to 64 MiB. Raise it with
+`--mempool-snapshot-max-mb=256`, `BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB=256`, or
+TOML `mempool_snapshot_max_mb = 256`. There is no separate 100,000-transaction
+cap. Choose enough space for serialized transactions and metadata to preserve
+the entire live pool; the same budget applies on read. Raising it also raises
+the possible memory and I/O cost. Larger pools save complete connected
+families until the first family does not fit and log saved/omitted counts; all operator fee deltas
+are retained, or saving fails if those overlays alone exceed the bound.
+Restore excludes candidates older than fourteen days and runs within a cooperative
+timeout, defaulting to at least 60 seconds and scaling dynamically with the configured byte budget
+(`max(60, mempool_snapshot_max_mb)`). Raise it with `--mempool-snapshot-restore-timeout-secs=180`,
+`BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS=180`, or TOML
+`mempool_snapshot_restore_timeout_secs = 180`. Multi-generational CPFP packages (e.g.
+grandparent, parent, child) are restored atomically in topological order within package
+standardness limits. Candidate records persist precomputed BIP16/BIP141 SigOp costs
+(version 2 format), validated upfront against standardness limits before script execution.
+Note that mempool persistence is an operational optimization for clean shutdowns;
+abrupt termination (power loss, crash, kill) does not record a snapshot.
+Locally submitted transactions awaiting initial broadcast retain that status
+across restart if re-admitted. The existing P2P relay worker retries them in
+bounded batches, including after absent peers or queue saturation. A successful
+getdata body response completes initial broadcast; `getmempoolentry.unbroadcast`
+and `getmempoolinfo.unbroadcastcount` report pending status. Other restored
+transactions are not automatically announced.
+Power-loss preservation and Core `savemempool`/`importmempool` compatibility
+are not provided by this initial implementation.
+
 ## Start the node
 
 ```sh
@@ -70,6 +114,7 @@ Important defaults:
 | RPC authentication | Fresh `.cookie` in the data directory (mode `0600` on Unix) |
 | dbcache | 450 MiB |
 | pruning | off |
+| mempool persistence | on |
 | txindex | off |
 | scriptindex | off |
 | fast sync | off |
@@ -126,12 +171,16 @@ Example regtest startup:
 ```sh
 ./target/release/bitcoin-rs \
   --network regtest \
+  --p2p-listen 127.0.0.1:18444 \
+  --dns-seeds-enabled=false \
   --scriptindex \
   --data-dir .bitcoin-rs-regtest \
   --rpc-bind 127.0.0.1:18443
 ```
 
 The wallet-facing contract is [contracts/wallet-facing.md](contracts/wallet-facing.md).
+
+A Compose example runs the upstream mempool explorer against these endpoints: [btc-mempool-explorer](../tools/btc-mempool-explorer/README.md).
 
 ### REST
 
@@ -188,7 +237,7 @@ cargo build --release -p bitcoin-rs --features kernel
 ./target/release/bitcoin-rs --data-dir .bitcoin-rs --validation-engine kernel
 ```
 
-Direct `bitcoin-rs-consensus` library callers have no config file, environment, or CLI to set: `kernel::BlockParse::parse(raw, engine)`, `kernel::verify_tx_scripts(tx, spent, flags, engine)`, and `verify_transaction(..., engine)` take a `bitcoin_rs_consensus::ValidationEngine` value at each call. A binary embedder that wants one setting should resolve `ValidationEngine` itself and pass it down exactly as `bitcoin-rs-node` does.
+Direct `bitcoin-rs-consensus` library callers have no config file, environment, or CLI to set: `kernel::BlockParse::parse(raw, engine)` takes a `bitcoin_rs_consensus::ValidationEngine` value, while `kernel::verify_tx_scripts(tx, spent, flags, engine, signature_cache)` and `verify_transaction(..., engine, signature_cache)` take both the engine and a trailing `Option<&bitcoin_rs_script::SignatureCache>`. Pass `None` for uncached calls, or `Some(&cache)` for serial native reuse across multiple passes over the same transaction. When `ValidationEngine::Kernel` is selected, kernel verification ignores the signature cache while running all standard checks, and its behavior is unchanged. Lower-level callers using `PreparedTransaction::verify_input(input_index, flags, signature_cache)` also pass the optional cache reference per call without storing it inside the prepared transaction, keeping `PreparedTransaction` shareable across parallel input checks during block verification. A binary embedder that wants one setting should resolve `ValidationEngine` itself and pass it down exactly as `bitcoin-rs-node` does.
 
 ## Operator migration: validation engine
 
@@ -204,3 +253,5 @@ Direct `bitcoin-rs-consensus` library callers have no config file, environment, 
 - [README.md](README.md): documentation index and release gates
 - [contracts/](contracts/): normative contracts
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): development workflow
+- [Snapshot inspector](../tools/snapshot/README.md): inspect and verify Core snapshot files without starting a node
+- [Validation tooling](validation-tooling.md): evidence lanes behind the interfaces above

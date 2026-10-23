@@ -130,7 +130,9 @@ mod tests {
         CHAIN_PAGE, address_transaction_summary, block_txs, fee_rate_sat_per_vbyte, history,
         outspend, summary,
     };
-    use crate::context::{Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError};
+    use crate::context::{
+        Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError, TxUnavailableCause,
+    };
     use crate::handlers::Handler;
     use crate::rest::Response;
 
@@ -2174,7 +2176,7 @@ mod tests {
         );
         {
             let mut pool = context.mempool.gateway.pool().write();
-            pool.remove_for_block(&[funder.as_ref()], &[funder_txid], 42);
+            pool.remove_for_block(&[funder.as_ref()], &[funder_txid], 42, 1);
             assert!(!pool.contains_txid(&funder_txid));
             pool.insert_entry(MempoolEntry::new(Arc::new(spender), 100, 1_000, 2, 0, 0))
                 .expect("seed spender");
@@ -2945,7 +2947,12 @@ mod tests {
         ctx.chain.applied_tip.store(Some(tip));
         for (error, status) in [
             (Some(TxQueryError::Retry), 503),
-            (Some(TxQueryError::Unavailable("pruned".into())), 503),
+            (
+                Some(TxQueryError::Unavailable(TxUnavailableCause::Other(
+                    "pruned".into(),
+                ))),
+                503,
+            ),
             (Some(TxQueryError::Storage("corrupt".into())), 500),
         ] {
             ctx.indexes.esplora_tx_index = Some(Arc::new(FailingParentIndex {
